@@ -13,11 +13,38 @@ class StockIntelligenceView extends StatelessWidget {
   });
 
   final List<StockInsight> stocks;
-  final String selectedTicker;
+  final String? selectedTicker;
   final ValueChanged<String> onSelectTicker;
 
   @override
   Widget build(BuildContext context) {
+    if (stocks.isEmpty) {
+      return SingleChildScrollView(
+        padding: const EdgeInsets.fromLTRB(24, 18, 24, 28),
+        child: const Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            ViewHeader(
+              eyebrow: 'Stock Intelligence',
+              title: 'Explanation follows the board once the board has names to explain.',
+              subtitle:
+                  'This view is ready, but the repository has not returned any ranked opportunities for the current snapshot yet.',
+              trailing: TonePill(
+                label: 'Awaiting ranked stocks',
+                tone: SignalTone.neutral,
+              ),
+            ),
+            EmptyStateCard(
+              icon: Icons.insights_rounded,
+              title: 'No stock intelligence yet.',
+              message:
+                  'Connect a stock feed or refresh into a richer snapshot to inspect thesis support, fragility, options signals, and invalidation rules here.',
+            ),
+          ],
+        ),
+      );
+    }
+
     final selected = stocks.firstWhere(
       (stock) => stock.ticker == selectedTicker,
       orElse: () => stocks.first,

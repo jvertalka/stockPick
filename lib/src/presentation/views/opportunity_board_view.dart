@@ -16,6 +16,7 @@ class OpportunityBoardView extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final hasStocks = stocks.isNotEmpty;
     final topIdeas = stocks.take(3).map((stock) => stock.ticker).join(' | ');
 
     return SingleChildScrollView(
@@ -29,36 +30,45 @@ class OpportunityBoardView extends StatelessWidget {
             subtitle:
                 'Each name is ranked inside the current market regime, then stress-tested for crowding, fragility, and thesis invalidation.',
             trailing: TonePill(
-              label: 'Top board: $topIdeas',
-              tone: SignalTone.positive,
+              label: hasStocks ? 'Top board: $topIdeas' : 'Awaiting ranked stocks',
+              tone: hasStocks ? SignalTone.positive : SignalTone.neutral,
             ),
           ),
-          InsightCard(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  'Board read',
-                  style: Theme.of(context).textTheme.headlineMedium,
-                ),
-                const SizedBox(height: 12),
-                Text(
-                  'The current board favors quality growth with healthy internal sponsorship. Semiconductors offer the most raw upside, cybersecurity offers a cleaner balance of upside and fragility, and defensive growth remains useful if the tape loses confidence.',
-                  style: Theme.of(context).textTheme.bodyLarge,
-                ),
-              ],
-            ),
-          ),
-          const SizedBox(height: 18),
-          ...stocks.map(
-            (stock) => Padding(
-              padding: const EdgeInsets.only(bottom: 16),
-              child: _OpportunityCard(
-                stock: stock,
-                onOpen: () => onOpenStock(stock.ticker),
+          if (!hasStocks)
+            const EmptyStateCard(
+              icon: Icons.query_stats_rounded,
+              title: 'No ranked opportunities yet.',
+              message:
+                  'This board will populate after stock signals arrive and the engine has enough data to score them for the current regime.',
+            )
+          else ...[
+            InsightCard(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    'Board read',
+                    style: Theme.of(context).textTheme.headlineMedium,
+                  ),
+                  const SizedBox(height: 12),
+                  Text(
+                    'The current board favors quality growth with healthy internal sponsorship. Semiconductors offer the most raw upside, cybersecurity offers a cleaner balance of upside and fragility, and defensive growth remains useful if the tape loses confidence.',
+                    style: Theme.of(context).textTheme.bodyLarge,
+                  ),
+                ],
               ),
             ),
-          ),
+            const SizedBox(height: 18),
+            ...stocks.map(
+              (stock) => Padding(
+                padding: const EdgeInsets.only(bottom: 16),
+                child: _OpportunityCard(
+                  stock: stock,
+                  onOpen: () => onOpenStock(stock.ticker),
+                ),
+              ),
+            ),
+          ],
         ],
       ),
     );

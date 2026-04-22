@@ -11,6 +11,33 @@ class SellAlertsView extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    if (alerts.isEmpty) {
+      return SingleChildScrollView(
+        padding: const EdgeInsets.fromLTRB(24, 18, 24, 28),
+        child: const Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            ViewHeader(
+              eyebrow: 'Sell Alerts',
+              title: 'Clusters of deterioration matter more than one indicator.',
+              subtitle:
+                  'This board stays quiet until enough evidence accumulates to justify trimming, de-risking, or exiting.',
+              trailing: TonePill(
+                label: '0 active alerts',
+                tone: SignalTone.neutral,
+              ),
+            ),
+            EmptyStateCard(
+              icon: Icons.warning_amber_rounded,
+              title: 'No sell alerts yet.',
+              message:
+                  'That usually means the current snapshot has not produced a strong enough deterioration cluster to escalate.',
+            ),
+          ],
+        ),
+      );
+    }
+
     final trimCount = alerts
         .where((alert) => alert.action == RecommendationAction.trim)
         .length;

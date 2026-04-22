@@ -54,31 +54,45 @@ class HomeShell extends StatefulWidget {
 
 class _HomeShellState extends State<HomeShell> {
   AppView _selectedView = AppView.marketRadar;
-  late String _selectedTicker;
-  ScenarioType _selectedScenario = ScenarioType.creditWidening;
+  String? _selectedTicker;
+  ScenarioType? _selectedScenario;
 
   MarketIntelligenceSnapshot get _snapshot => widget.state.snapshot;
 
   @override
   void initState() {
     super.initState();
-    _selectedTicker = _snapshot.opportunities.first.ticker;
-    _selectedScenario = _snapshot.scenarios.first.type;
+    _selectedTicker = _defaultTicker();
+    _selectedScenario = _defaultScenario();
   }
 
   @override
   void didUpdateWidget(covariant HomeShell oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (!_snapshot.opportunities.any(
-      (stock) => stock.ticker == _selectedTicker,
-    )) {
-      _selectedTicker = _snapshot.opportunities.first.ticker;
+    if (_selectedTicker == null ||
+        !_snapshot.opportunities.any((stock) => stock.ticker == _selectedTicker)) {
+      _selectedTicker = _defaultTicker();
     }
-    if (!_snapshot.scenarios.any(
-      (scenario) => scenario.type == _selectedScenario,
-    )) {
-      _selectedScenario = _snapshot.scenarios.first.type;
+    if (_selectedScenario == null ||
+        !_snapshot.scenarios.any(
+          (scenario) => scenario.type == _selectedScenario,
+        )) {
+      _selectedScenario = _defaultScenario();
     }
+  }
+
+  String? _defaultTicker() {
+    if (_snapshot.opportunities.isEmpty) {
+      return null;
+    }
+    return _snapshot.opportunities.first.ticker;
+  }
+
+  ScenarioType? _defaultScenario() {
+    if (_snapshot.scenarios.isEmpty) {
+      return null;
+    }
+    return _snapshot.scenarios.first.type;
   }
 
   @override

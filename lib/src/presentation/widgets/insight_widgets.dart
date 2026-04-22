@@ -89,6 +89,47 @@ class InsightCard extends StatelessWidget {
   }
 }
 
+class EmptyStateCard extends StatelessWidget {
+  const EmptyStateCard({
+    super.key,
+    required this.icon,
+    required this.title,
+    required this.message,
+  });
+
+  final IconData icon;
+  final String title;
+  final String message;
+
+  @override
+  Widget build(BuildContext context) {
+    return InsightCard(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Container(
+            width: 56,
+            height: 56,
+            decoration: BoxDecoration(
+              color: AppTheme.sky.withValues(alpha: 0.14),
+              borderRadius: BorderRadius.circular(18),
+              border: Border.all(color: AppTheme.sky.withValues(alpha: 0.28)),
+            ),
+            child: Icon(
+              icon,
+              color: AppTheme.sky,
+            ),
+          ),
+          const SizedBox(height: 18),
+          Text(title, style: Theme.of(context).textTheme.headlineMedium),
+          const SizedBox(height: 10),
+          Text(message, style: Theme.of(context).textTheme.bodyLarge),
+        ],
+      ),
+    );
+  }
+}
+
 class TonePill extends StatelessWidget {
   const TonePill({super.key, required this.label, required this.tone});
 

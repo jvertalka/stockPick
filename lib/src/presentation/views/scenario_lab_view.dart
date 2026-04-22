@@ -13,11 +13,38 @@ class ScenarioLabView extends StatelessWidget {
   });
 
   final List<ScenarioOutcome> scenarios;
-  final ScenarioType selectedScenario;
+  final ScenarioType? selectedScenario;
   final ValueChanged<ScenarioType> onSelectScenario;
 
   @override
   Widget build(BuildContext context) {
+    if (scenarios.isEmpty) {
+      return SingleChildScrollView(
+        padding: const EdgeInsets.fromLTRB(24, 18, 24, 28),
+        child: const Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            ViewHeader(
+              eyebrow: 'Scenario Lab',
+              title: 'Stress testing comes online once the current board exists.',
+              subtitle:
+                  'Scenario re-ranking depends on a populated opportunity set, so this view stays in standby until the repository can produce one.',
+              trailing: TonePill(
+                label: 'Awaiting scenarios',
+                tone: SignalTone.neutral,
+              ),
+            ),
+            EmptyStateCard(
+              icon: Icons.science_rounded,
+              title: 'No scenario outputs yet.',
+              message:
+                  'The lab will populate after the engine can score stocks and translate them into scenario-specific deltas.',
+            ),
+          ],
+        ),
+      );
+    }
+
     final scenario = scenarios.firstWhere(
       (item) => item.type == selectedScenario,
       orElse: () => scenarios.first,
