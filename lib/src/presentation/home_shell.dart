@@ -37,9 +37,16 @@ extension AppViewMeta on AppView {
 }
 
 class HomeShell extends StatefulWidget {
-  const HomeShell({super.key, required this.state});
+  const HomeShell({
+    super.key,
+    required this.state,
+    required this.onRefresh,
+    this.isRefreshing = false,
+  });
 
   final IntelligenceAppState state;
+  final Future<void> Function() onRefresh;
+  final bool isRefreshing;
 
   @override
   State<HomeShell> createState() => _HomeShellState();
@@ -57,6 +64,21 @@ class _HomeShellState extends State<HomeShell> {
     super.initState();
     _selectedTicker = _snapshot.opportunities.first.ticker;
     _selectedScenario = _snapshot.scenarios.first.type;
+  }
+
+  @override
+  void didUpdateWidget(covariant HomeShell oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (!_snapshot.opportunities.any(
+      (stock) => stock.ticker == _selectedTicker,
+    )) {
+      _selectedTicker = _snapshot.opportunities.first.ticker;
+    }
+    if (!_snapshot.scenarios.any(
+      (scenario) => scenario.type == _selectedScenario,
+    )) {
+      _selectedScenario = _snapshot.scenarios.first.type;
+    }
   }
 
   @override
@@ -79,7 +101,11 @@ class _HomeShellState extends State<HomeShell> {
                     Expanded(
                       child: Column(
                         children: [
-                          _TopBanner(state: widget.state),
+                          _TopBanner(
+                            state: widget.state,
+                            onRefresh: widget.onRefresh,
+                            isRefreshing: widget.isRefreshing,
+                          ),
                           const Divider(height: 1),
                           Expanded(
                             child: AnimatedSwitcher(
@@ -97,7 +123,11 @@ class _HomeShellState extends State<HomeShell> {
                 )
               : Column(
                   children: [
-                    _TopBanner(state: widget.state),
+                    _TopBanner(
+                      state: widget.state,
+                      onRefresh: widget.onRefresh,
+                      isRefreshing: widget.isRefreshing,
+                    ),
                     const Divider(height: 1),
                     Expanded(
                       child: AnimatedSwitcher(
@@ -238,9 +268,15 @@ class _DesktopRail extends StatelessWidget {
 }
 
 class _TopBanner extends StatelessWidget {
-  const _TopBanner({required this.state});
+  const _TopBanner({
+    required this.state,
+    required this.onRefresh,
+    required this.isRefreshing,
+  });
 
   final IntelligenceAppState state;
+  final Future<void> Function() onRefresh;
+  final bool isRefreshing;
 
   @override
   Widget build(BuildContext context) {
@@ -254,7 +290,11 @@ class _TopBanner extends StatelessWidget {
               children: [
                 _BrandBlock(snapshot: state.snapshot),
                 const SizedBox(height: 16),
-                _StatusChips(state: state),
+                _StatusChips(
+                  state: state,
+                  onRefresh: onRefresh,
+                  isRefreshing: isRefreshing,
+                ),
               ],
             )
           : Row(
@@ -264,7 +304,11 @@ class _TopBanner extends StatelessWidget {
                 Flexible(
                   child: Align(
                     alignment: Alignment.centerRight,
-                    child: _StatusChips(state: state),
+                    child: _StatusChips(
+                      state: state,
+                      onRefresh: onRefresh,
+                      isRefreshing: isRefreshing,
+                    ),
                   ),
                 ),
               ],
@@ -300,9 +344,15 @@ class _BrandBlock extends StatelessWidget {
 }
 
 class _StatusChips extends StatelessWidget {
-  const _StatusChips({required this.state});
+  const _StatusChips({
+    required this.state,
+    required this.onRefresh,
+    required this.isRefreshing,
+  });
 
   final IntelligenceAppState state;
+  final Future<void> Function() onRefresh;
+  final bool isRefreshing;
 
   @override
   Widget build(BuildContext context) {
@@ -328,8 +378,23 @@ class _StatusChips extends StatelessWidget {
           tone: SignalTone.neutral,
         ),
         TonePill(
+          label: 'Synced ${formatAsOf(state.dataStatus.lastRefresh)}',
+          tone: SignalTone.neutral,
+        ),
+        TonePill(
           label: 'As of ${formatAsOf(state.snapshot.asOf)}',
           tone: SignalTone.neutral,
+        ),
+        FilledButton.icon(
+          onPressed: isRefreshing ? null : onRefresh,
+          icon: isRefreshing
+              ? const SizedBox(
+                  width: 16,
+                  height: 16,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                )
+              : const Icon(Icons.refresh_rounded),
+          label: Text(isRefreshing ? 'Refreshing' : 'Refresh'),
         ),
       ],
     );

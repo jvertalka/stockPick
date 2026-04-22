@@ -1,10 +1,15 @@
 import 'dart:ui';
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import 'package:finance_app/finance_oracle_app.dart';
 
 void main() {
+  setUp(() {
+    SharedPreferences.setMockInitialValues({});
+  });
+
   testWidgets('renders the cross-platform market dashboard', (tester) async {
     await tester.binding.setSurfaceSize(const Size(1280, 960));
     addTearDown(() => tester.binding.setSurfaceSize(null));

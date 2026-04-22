@@ -22,7 +22,10 @@ The app now runs through a structured fixture repository and a deterministic int
 
 - raw market, sector, stock, and options-like inputs live in a repository layer
 - a rules-based engine derives regimes, stock rankings, sell alerts, and scenarios
+- a point-in-time snapshot archive now stores repository states locally
 - a fixture walk-forward validation pass reports hit rate, alpha, and drawdown stats
+- the research harness now surfaces chronological train/test splits and per-window breakdowns
+- the shell can manually refresh the repository and surfaces feed refresh cadence
 
 This is a better foundation than a handwritten final snapshot, but it is still not a live or trained system yet.
 
@@ -36,7 +39,7 @@ flutter run
 ## Next build steps
 
 - replace the fixture repository with live market, fundamental, and options adapters
-- persist point-in-time snapshots so validation can be leakage-safe
+- upgrade the local snapshot archive into a true vendor-backed point-in-time history
 - add a research harness for backtests, calibration, and slippage-aware evaluation
 - add persisted watchlists, action history, sync, and notification delivery
 

@@ -6,11 +6,25 @@ import 'src/models/intelligence_app_state.dart';
 import 'src/presentation/home_shell.dart';
 import 'src/theme/app_theme.dart';
 
-class FinanceOracleApp extends StatelessWidget {
+class FinanceOracleApp extends StatefulWidget {
   const FinanceOracleApp({super.key, MarketIntelligenceRepository? repository})
     : _repository = repository ?? const _DefaultRepository();
 
   final MarketIntelligenceRepository _repository;
+
+  @override
+  State<FinanceOracleApp> createState() => _FinanceOracleAppState();
+}
+
+class _FinanceOracleAppState extends State<FinanceOracleApp> {
+  late Future<IntelligenceAppState> _stateFuture;
+  bool _isRefreshing = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _stateFuture = widget._repository.loadState();
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -19,9 +33,9 @@ class FinanceOracleApp extends StatelessWidget {
       debugShowCheckedModeBanner: false,
       theme: AppTheme.build(),
       home: FutureBuilder<IntelligenceAppState>(
-        future: _repository.loadState(),
+        future: _stateFuture,
         builder: (context, snapshot) {
-          if (snapshot.hasError) {
+          if (snapshot.hasError && !snapshot.hasData) {
             return _StatusScaffold(
               title: 'Unable to load the intelligence layer',
               body:
@@ -38,10 +52,38 @@ class FinanceOracleApp extends StatelessWidget {
             );
           }
 
-          return HomeShell(state: snapshot.data!);
+          return HomeShell(
+            state: snapshot.data!,
+            isRefreshing: _isRefreshing,
+            onRefresh: _refreshState,
+          );
         },
       ),
     );
+  }
+
+  Future<void> _refreshState() async {
+    if (_isRefreshing) {
+      return;
+    }
+
+    setState(() {
+      _isRefreshing = true;
+    });
+    final future = widget._repository.refreshState();
+    setState(() {
+      _stateFuture = future;
+    });
+
+    try {
+      await future;
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isRefreshing = false;
+        });
+      }
+    }
   }
 }
 
@@ -101,5 +143,10 @@ class _DefaultRepository implements MarketIntelligenceRepository {
   @override
   Future<IntelligenceAppState> loadState() {
     return FixtureMarketRepository().loadState();
+  }
+
+  @override
+  Future<IntelligenceAppState> refreshState() {
+    return loadState();
   }
 }

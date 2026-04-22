@@ -1,60 +1,88 @@
 import '../engine/market_intelligence_engine.dart';
 import '../engine/validation_engine.dart';
 import '../models/intelligence_app_state.dart';
+import 'market_snapshot_archive.dart';
 import 'market_intelligence_repository.dart';
 import 'raw_market_data.dart';
 
 class FixtureMarketRepository implements MarketIntelligenceRepository {
-  FixtureMarketRepository({MarketIntelligenceEngine? engine})
-    : _engine = engine ?? MarketIntelligenceEngine(),
-      _validationEngine = ValidationEngine(
-        engine: engine ?? MarketIntelligenceEngine(),
-      );
+  FixtureMarketRepository({
+    MarketIntelligenceEngine? engine,
+    MarketSnapshotArchive? archive,
+  }) : _engine = engine ?? MarketIntelligenceEngine(),
+       _archive = archive ?? SharedPreferencesMarketSnapshotArchive(),
+       _validationEngine = ValidationEngine(
+         engine: engine ?? MarketIntelligenceEngine(),
+       );
 
   final MarketIntelligenceEngine _engine;
+  final MarketSnapshotArchive _archive;
   final ValidationEngine _validationEngine;
 
   @override
   Future<IntelligenceAppState> loadState() async {
+    final syncTime = DateTime.now();
     final currentState = _currentMarketState();
     final evaluation = _engine.evaluate(currentState);
-    final validation = _validationEngine.validate(_validationWindows());
+    final archiveSummary = await _archive.saveSnapshot(
+      currentState,
+      source: 'fixture-research-repository',
+    );
+    final validation = _validationEngine.validate(
+      _validationWindows(),
+      archivedSnapshotCount: archiveSummary.snapshotCount,
+    );
 
     return IntelligenceAppState(
       snapshot: evaluation.snapshot,
       dataStatus: DataStatusReport(
         title: 'Fixture research repository',
         summary:
-            'The app is now driven by a structured local repository of market, sector, stock, and options-like inputs. These are still fixtures, but the UI no longer consumes a handwritten final answer.',
-        lastRefresh: currentState.asOf,
-        feeds: const [
+            'The app is now driven by a structured local repository of market, sector, stock, and options-like inputs. These are still fixtures, but they now flow through a point-in-time archive path with explicit refresh cadence metadata.',
+        lastRefresh: syncTime,
+        archiveSummary: archiveSummary.summaryText,
+        archiveSnapshotCount: archiveSummary.snapshotCount,
+        latestArchive: archiveSummary.latestSnapshotAsOf,
+        feeds: [
           DataFeedStatus(
             name: 'Market and breadth',
             availability: FeedAvailability.fixture,
+            refreshCadence: FeedRefreshCadence.intraday,
             detail:
                 'Regime, breadth, and sector participation are coming from local fixture inputs.',
+            lastUpdated: currentState.asOf,
           ),
           DataFeedStatus(
             name: 'Fundamentals and revisions',
             availability: FeedAvailability.fixture,
+            refreshCadence: FeedRefreshCadence.daily,
             detail:
                 'Stock-level revisions, profitability, and balance-sheet features are fixture-backed.',
+            lastUpdated: currentState.asOf,
           ),
           DataFeedStatus(
             name: 'Options and volatility',
             availability: FeedAvailability.fixture,
+            refreshCadence: FeedRefreshCadence.intraday,
             detail:
                 'IV rank, skew, event premium, and downside protection are fixture inputs.',
+            lastUpdated: currentState.asOf,
           ),
           DataFeedStatus(
             name: 'Point-in-time archive',
-            availability: FeedAvailability.planned,
-            detail:
-                'Historical point-in-time data storage still needs to be built for honest research.',
+            availability: archiveSummary.hasSnapshots
+                ? FeedAvailability.connected
+                : FeedAvailability.missing,
+            refreshCadence: FeedRefreshCadence.onDemand,
+            detail: archiveSummary.hasSnapshots
+                ? 'Snapshots are now serialized into a local archive so the repository can start preserving what the app knew at a point in time.'
+                : 'Snapshot persistence is wired, but no snapshots have been archived yet.',
+            lastUpdated: archiveSummary.latestSnapshotAsOf,
           ),
           DataFeedStatus(
             name: 'Live vendor connections',
             availability: FeedAvailability.planned,
+            refreshCadence: FeedRefreshCadence.planned,
             detail: 'No live API feeds are connected yet.',
           ),
         ],
@@ -62,22 +90,28 @@ class FixtureMarketRepository implements MarketIntelligenceRepository {
       engineStatus: EngineStatusReport(
         title: 'Deterministic committee engine',
         summary:
-            'A rules-based ensemble now derives the regime read, stock ranking, sell alerts, and scenarios from raw inputs. No trained model weights are loaded yet.',
+            'A rules-based ensemble now derives the regime read, stock ranking, sell alerts, and scenarios from raw inputs. The research harness now reports chronological train/test splits, but no trained model weights are loaded yet.',
         isTrained: false,
         validationStage: ValidationStage.fixtureWalkForward,
         validationReport: validation,
         caveats: const [
           'This is not a trained model stack yet.',
-          'Validation is running on fixture windows, not a full point-in-time backtest.',
+          'Validation is running on fixture windows, not a full vendor-backed point-in-time backtest.',
+          'Train/test splits are chronological research harness splits, not ML training epochs.',
           'Probabilities in the UI are still implied by rules, not calibrated forecasts.',
         ],
         nextSteps: const [
           'Replace fixture feeds with live market, fundamentals, and options adapters.',
-          'Persist point-in-time snapshots for honest walk-forward validation.',
-          'Add a research harness for backtests, calibration, and slippage-aware evaluation.',
+          'Promote the local snapshot archive into a vendor-backed point-in-time history.',
+          'Expand the research harness into leakage-safe backtests, calibration, and slippage-aware evaluation.',
         ],
       ),
     );
+  }
+
+  @override
+  Future<IntelligenceAppState> refreshState() {
+    return loadState();
   }
 
   RawMarketState _currentMarketState() {

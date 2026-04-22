@@ -184,6 +184,30 @@ class MarketRadarView extends StatelessWidget {
                             style: Theme.of(context).textTheme.bodyMedium,
                           ),
                           const SizedBox(height: 16),
+                          LabelValueRow(
+                            label: 'Repository sync',
+                            value: formatAsOf(dataStatus.lastRefresh),
+                            highlight: AppTheme.sky,
+                          ),
+                          LabelValueRow(
+                            label: 'Archived snapshots',
+                            value: '${dataStatus.archiveSnapshotCount}',
+                            highlight: dataStatus.archiveSnapshotCount > 0
+                                ? AppTheme.mint
+                                : AppTheme.amber,
+                          ),
+                          if (dataStatus.latestArchive != null)
+                            LabelValueRow(
+                              label: 'Latest archived as-of',
+                              value: formatAsOf(dataStatus.latestArchive!),
+                              highlight: AppTheme.sky,
+                            ),
+                          const SizedBox(height: 14),
+                          Text(
+                            dataStatus.archiveSummary,
+                            style: Theme.of(context).textTheme.bodySmall,
+                          ),
+                          const SizedBox(height: 16),
                           ...dataStatus.feeds.map(
                             (feed) => Padding(
                               padding: const EdgeInsets.only(bottom: 14),
@@ -204,6 +228,23 @@ class MarketRadarView extends StatelessWidget {
                                         label: feed.availability.label,
                                         tone: _feedTone(feed.availability),
                                       ),
+                                    ],
+                                  ),
+                                  const SizedBox(height: 8),
+                                  Wrap(
+                                    spacing: 8,
+                                    runSpacing: 8,
+                                    children: [
+                                      TonePill(
+                                        label: feed.refreshCadence.label,
+                                        tone: SignalTone.neutral,
+                                      ),
+                                      if (feed.lastUpdated != null)
+                                        TonePill(
+                                          label:
+                                              'Updated ${formatAsOf(feed.lastUpdated!)}',
+                                          tone: SignalTone.neutral,
+                                        ),
                                     ],
                                   ),
                                   const SizedBox(height: 8),
@@ -271,6 +312,12 @@ class MarketRadarView extends StatelessWidget {
                             highlight: AppTheme.sky,
                           ),
                           LabelValueRow(
+                            label: 'Top picks scored',
+                            value:
+                                '${engineStatus.validationReport.topPickCount}',
+                            highlight: AppTheme.sky,
+                          ),
+                          LabelValueRow(
                             label: 'Top-pick hit rate',
                             value:
                                 '${engineStatus.validationReport.hitRate.toStringAsFixed(0)}%',
@@ -294,6 +341,50 @@ class MarketRadarView extends StatelessWidget {
                             style: Theme.of(context).textTheme.bodySmall,
                           ),
                           const SizedBox(height: 14),
+                          Text(
+                            'Research splits',
+                            style: Theme.of(context).textTheme.titleLarge,
+                          ),
+                          const SizedBox(height: 10),
+                          _SplitSummaryCard(
+                            split: engineStatus.validationReport.trainSplit,
+                          ),
+                          const SizedBox(height: 12),
+                          _SplitSummaryCard(
+                            split: engineStatus.validationReport.testSplit,
+                          ),
+                          const SizedBox(height: 14),
+                          Text(
+                            'Shadow readiness',
+                            style: Theme.of(context).textTheme.titleLarge,
+                          ),
+                          const SizedBox(height: 10),
+                          LabelValueRow(
+                            label: 'Archived snapshots',
+                            value:
+                                '${engineStatus.validationReport.shadowMode.archivedSnapshotCount} / ${engineStatus.validationReport.shadowMode.minimumSnapshotCount}',
+                            highlight:
+                                engineStatus.validationReport.shadowMode.isReady
+                                ? AppTheme.mint
+                                : AppTheme.amber,
+                          ),
+                          Text(
+                            engineStatus.validationReport.shadowMode.summary,
+                            style: Theme.of(context).textTheme.bodySmall,
+                          ),
+                          const SizedBox(height: 14),
+                          Text(
+                            'Window breakdown',
+                            style: Theme.of(context).textTheme.titleLarge,
+                          ),
+                          const SizedBox(height: 10),
+                          ...engineStatus.validationReport.windows.map(
+                            (window) => Padding(
+                              padding: const EdgeInsets.only(bottom: 12),
+                              child: _WindowSummaryCard(window: window),
+                            ),
+                          ),
+                          const SizedBox(height: 8),
                           Text(
                             'Caveats',
                             style: Theme.of(context).textTheme.titleLarge,
@@ -403,3 +494,122 @@ SignalTone _feedTone(FeedAvailability availability) => switch (availability) {
   FeedAvailability.planned => SignalTone.caution,
   FeedAvailability.missing => SignalTone.negative,
 };
+
+class _SplitSummaryCard extends StatelessWidget {
+  const _SplitSummaryCard({required this.split});
+
+  final ValidationSplitReport split;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: Colors.white.withValues(alpha: 0.03),
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(color: Colors.white.withValues(alpha: 0.08)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              TonePill(label: split.label, tone: SignalTone.neutral),
+              const SizedBox(width: 10),
+              TonePill(
+                label: '${split.windowCount} windows',
+                tone: SignalTone.neutral,
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          LabelValueRow(
+            label: 'Observations',
+            value: '${split.observationCount}',
+            highlight: AppTheme.sky,
+          ),
+          LabelValueRow(
+            label: 'Top-pick hit rate',
+            value: '${split.hitRate.toStringAsFixed(0)}%',
+            highlight: split.hitRate >= 60 ? AppTheme.mint : AppTheme.amber,
+          ),
+          LabelValueRow(
+            label: 'Average alpha',
+            value: '${split.averageAlpha.toStringAsFixed(1)}%',
+            highlight: split.averageAlpha >= 0 ? AppTheme.mint : AppTheme.coral,
+          ),
+          LabelValueRow(
+            label: 'Worst drawdown',
+            value: '${split.worstDrawdown.toStringAsFixed(1)}%',
+            highlight: AppTheme.coral,
+          ),
+          const SizedBox(height: 10),
+          Text(split.verdict, style: Theme.of(context).textTheme.bodySmall),
+        ],
+      ),
+    );
+  }
+}
+
+class _WindowSummaryCard extends StatelessWidget {
+  const _WindowSummaryCard({required this.window});
+
+  final ValidationWindowReport window;
+
+  @override
+  Widget build(BuildContext context) {
+    final picks = window.topPicks.isEmpty
+        ? 'No ranked picks with outcomes.'
+        : window.topPicks
+              .map(
+                (pick) =>
+                    '${pick.ticker} ${pick.alpha >= 0 ? '+' : ''}${pick.alpha.toStringAsFixed(1)}% alpha',
+              )
+              .join(' | ');
+
+    return Container(
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: Colors.white.withValues(alpha: 0.03),
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(color: Colors.white.withValues(alpha: 0.08)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: [
+              TonePill(
+                label: formatAsOf(window.asOf),
+                tone: SignalTone.neutral,
+              ),
+              TonePill(label: window.regimeLabel, tone: SignalTone.neutral),
+            ],
+          ),
+          const SizedBox(height: 12),
+          LabelValueRow(
+            label: 'Hit rate',
+            value: '${window.hitRate.toStringAsFixed(0)}%',
+            highlight: window.hitRate >= 50 ? AppTheme.mint : AppTheme.amber,
+          ),
+          LabelValueRow(
+            label: 'Average alpha',
+            value: '${window.averageAlpha.toStringAsFixed(1)}%',
+            highlight: window.averageAlpha >= 0
+                ? AppTheme.mint
+                : AppTheme.coral,
+          ),
+          LabelValueRow(
+            label: 'Worst drawdown',
+            value: '${window.worstDrawdown.toStringAsFixed(1)}%',
+            highlight: AppTheme.coral,
+          ),
+          const SizedBox(height: 10),
+          Text(picks, style: Theme.of(context).textTheme.bodySmall),
+        ],
+      ),
+    );
+  }
+}
