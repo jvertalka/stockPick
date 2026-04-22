@@ -114,6 +114,14 @@ class FixtureMarketRepository implements MarketIntelligenceRepository {
     return loadState();
   }
 
+  RawMarketState currentMarketState() {
+    return _currentMarketState();
+  }
+
+  List<ValidationWindow> validationWindows() {
+    return _validationWindows();
+  }
+
   RawMarketState _currentMarketState() {
     return RawMarketState(
       asOf: DateTime(2026, 4, 22, 9, 42),

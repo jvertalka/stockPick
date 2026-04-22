@@ -1,7 +1,7 @@
 import 'package:flutter/material.dart';
 
-import 'src/data/fixture_market_repository.dart';
 import 'src/data/market_intelligence_repository.dart';
+import 'src/data/provider_market_repository.dart';
 import 'src/models/intelligence_app_state.dart';
 import 'src/presentation/home_shell.dart';
 import 'src/theme/app_theme.dart';
@@ -142,7 +142,7 @@ class _DefaultRepository implements MarketIntelligenceRepository {
 
   @override
   Future<IntelligenceAppState> loadState() {
-    return FixtureMarketRepository().loadState();
+    return ProviderMarketRepository.fixtureBacked().loadState();
   }
 
   @override

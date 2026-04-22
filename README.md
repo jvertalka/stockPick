@@ -20,14 +20,14 @@ Cross-platform Flutter MVP for a regime-aware market intelligence product. The a
 
 The app now runs through a structured fixture repository and a deterministic intelligence engine:
 
-- raw market, sector, stock, and options-like inputs live in a repository layer
+- raw market, sector, stock, and options-like inputs now flow through provider-backed repository contracts
 - a rules-based engine derives regimes, stock rankings, sell alerts, and scenarios
 - a point-in-time snapshot archive now stores repository states locally
 - a fixture walk-forward validation pass reports hit rate, alpha, and drawdown stats
 - the research harness now surfaces chronological train/test splits and per-window breakdowns
 - the shell can manually refresh the repository and surfaces feed refresh cadence
 
-This is a better foundation than a handwritten final snapshot, but it is still not a live or trained system yet.
+This is a better foundation than a handwritten final snapshot, and the app is now wired for pluggable live feed providers, but it is still not a live or trained system yet.
 
 ## Run
 
@@ -39,6 +39,7 @@ flutter run
 ## Next build steps
 
 - replace the fixture repository with live market, fundamental, and options adapters
+- implement connected providers for market, sector/style, stock, and validation feeds
 - upgrade the local snapshot archive into a true vendor-backed point-in-time history
 - add a research harness for backtests, calibration, and slippage-aware evaluation
 - add persisted watchlists, action history, sync, and notification delivery
