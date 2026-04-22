@@ -36,6 +36,37 @@ flutter pub get
 flutter run
 ```
 
+To prefer live adapters when you have an endpoint ready:
+
+```bash
+flutter run --dart-define=ORACLE_DATA_MODE=live-preferred --dart-define=ORACLE_DATA_BASE_URL=https://your-api.example
+```
+
+Available modes:
+
+- `fixture`
+- `live-preferred`
+- `live-required`
+
+Expected live endpoint contract:
+
+- `GET /market/environment`
+- `GET /market/styles`
+- `GET /market/sectors`
+- `GET /market/stocks`
+- `GET /research/validation-windows`
+
+Each endpoint can return either raw JSON matching the app models or an envelope shaped like:
+
+```json
+{
+  "asOf": "2026-04-22T10:15:00.000Z",
+  "source": "oracle-live",
+  "detail": "Connected market environment feed.",
+  "data": {}
+}
+```
+
 ## Next build steps
 
 - replace the fixture repository with live market, fundamental, and options adapters

@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import 'src/data/market_data_configuration.dart';
 import 'src/data/market_intelligence_repository.dart';
 import 'src/data/provider_market_repository.dart';
 import 'src/models/intelligence_app_state.dart';
@@ -142,7 +143,13 @@ class _DefaultRepository implements MarketIntelligenceRepository {
 
   @override
   Future<IntelligenceAppState> loadState() {
-    return ProviderMarketRepository.fixtureBacked().loadState();
+    final configuration = MarketDataConfiguration.fromEnvironment();
+    final repository = switch (configuration.mode) {
+      MarketDataMode.fixtureOnly => ProviderMarketRepository.fixtureBacked(),
+      MarketDataMode.livePreferred || MarketDataMode.liveRequired =>
+        ProviderMarketRepository.liveConfigured(configuration: configuration),
+    };
+    return repository.loadState();
   }
 
   @override

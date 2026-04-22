@@ -409,6 +409,26 @@ class ValidationWindow {
   final DateTime asOf;
   final RawMarketState marketState;
   final List<ValidationOutcome> outcomes;
+
+  Map<String, dynamic> toJson() => {
+    'asOf': asOf.toIso8601String(),
+    'marketState': marketState.toJson(),
+    'outcomes': outcomes.map((outcome) => outcome.toJson()).toList(),
+  };
+
+  factory ValidationWindow.fromJson(Map<String, dynamic> json) =>
+      ValidationWindow(
+        asOf: DateTime.parse(json['asOf'] as String),
+        marketState: RawMarketState.fromJson(
+          json['marketState'] as Map<String, dynamic>,
+        ),
+        outcomes: (json['outcomes'] as List<dynamic>)
+            .map(
+              (outcome) =>
+                  ValidationOutcome.fromJson(outcome as Map<String, dynamic>),
+            )
+            .toList(),
+      );
 }
 
 class ValidationOutcome {
@@ -423,6 +443,21 @@ class ValidationOutcome {
   final double forwardReturn20d;
   final double sectorReturn20d;
   final double maxDrawdown20d;
+
+  Map<String, dynamic> toJson() => {
+    'ticker': ticker,
+    'forwardReturn20d': forwardReturn20d,
+    'sectorReturn20d': sectorReturn20d,
+    'maxDrawdown20d': maxDrawdown20d,
+  };
+
+  factory ValidationOutcome.fromJson(Map<String, dynamic> json) =>
+      ValidationOutcome(
+        ticker: json['ticker'] as String,
+        forwardReturn20d: _readDouble(json, 'forwardReturn20d'),
+        sectorReturn20d: _readDouble(json, 'sectorReturn20d'),
+        maxDrawdown20d: _readDouble(json, 'maxDrawdown20d'),
+      );
 }
 
 double _readDouble(Map<String, dynamic> json, String key) {
