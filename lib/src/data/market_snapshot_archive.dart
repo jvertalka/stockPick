@@ -68,11 +68,8 @@ class SharedPreferencesMarketSnapshotArchive implements MarketSnapshotArchive {
     final trimmed = records.length > maxSnapshots
         ? records.sublist(records.length - maxSnapshots)
         : records;
-    await preferences.setString(
-      preferencesKey,
-      jsonEncode(trimmed.map((entry) => entry.toJson()).toList()),
-    );
-    return ArchiveSummary.fromSnapshots(trimmed);
+    final savedRecords = await _persistNewestRecords(preferences, trimmed);
+    return ArchiveSummary.fromSnapshots(savedRecords);
   }
 
   @override
@@ -94,13 +91,44 @@ class SharedPreferencesMarketSnapshotArchive implements MarketSnapshotArchive {
       return <ArchivedMarketSnapshot>[];
     }
 
-    final decoded = jsonDecode(raw) as List<dynamic>;
-    return decoded
-        .map(
-          (entry) =>
-              ArchivedMarketSnapshot.fromJson(entry as Map<String, dynamic>),
-        )
-        .toList();
+    try {
+      final decoded = jsonDecode(raw) as List<dynamic>;
+      return decoded
+          .map(
+            (entry) =>
+                ArchivedMarketSnapshot.fromJson(entry as Map<String, dynamic>),
+          )
+          .toList();
+    } catch (_) {
+      return <ArchivedMarketSnapshot>[];
+    }
+  }
+
+  Future<List<ArchivedMarketSnapshot>> _persistNewestRecords(
+    SharedPreferences preferences,
+    List<ArchivedMarketSnapshot> records,
+  ) async {
+    var candidates = records;
+    while (candidates.isNotEmpty) {
+      try {
+        final saved = await preferences.setString(
+          preferencesKey,
+          jsonEncode(candidates.map((entry) => entry.toJson()).toList()),
+        );
+        if (saved) {
+          return candidates;
+        }
+      } catch (_) {
+        // Browsers can reject large localStorage writes. Keep the app usable by
+        // preserving the newest slice that fits instead of failing startup.
+      }
+
+      final midpoint = candidates.length ~/ 2;
+      candidates = candidates.sublist(midpoint == 0 ? 1 : midpoint);
+    }
+
+    await preferences.remove(preferencesKey);
+    return <ArchivedMarketSnapshot>[];
   }
 }
 

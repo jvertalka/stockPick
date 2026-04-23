@@ -116,4 +116,18 @@ void main() {
       expect(snapshots, hasLength(1));
     },
   );
+
+  test(
+    'archive ignores corrupt browser storage instead of failing startup',
+    () async {
+      SharedPreferences.setMockInitialValues({
+        'market_snapshot_archive_v1': 'not valid json',
+      });
+
+      final archive = SharedPreferencesMarketSnapshotArchive();
+
+      expect(await archive.loadSnapshots(), isEmpty);
+      expect((await archive.loadSummary()).snapshotCount, 0);
+    },
+  );
 }

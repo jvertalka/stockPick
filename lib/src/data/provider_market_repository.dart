@@ -2,6 +2,7 @@ import '../engine/market_intelligence_engine.dart';
 import '../engine/market_metric_history_builder.dart';
 import '../engine/validation_engine.dart';
 import '../models/intelligence_app_state.dart';
+import 'alpha_vantage_market_feed_provider.dart';
 import 'live_market_feed_provider.dart';
 import 'market_data_configuration.dart';
 import 'market_feed_provider.dart';
@@ -94,6 +95,7 @@ class ProviderMarketRepository implements MarketIntelligenceRepository {
       MarketDataMode.fixtureOnly => 'Provider-backed research repository',
       MarketDataMode.livePreferred => 'Live-preferred market repository',
       MarketDataMode.liveRequired => 'Live-required market repository',
+      MarketDataMode.alphaVantage => 'Alpha Vantage price spine',
     };
 
     final dataSummary = switch (configuration.mode) {
@@ -103,6 +105,8 @@ class ProviderMarketRepository implements MarketIntelligenceRepository {
         'The app is attempting to use live feed adapters first and falls back to fixtures when a live endpoint is not configured or unavailable.',
       MarketDataMode.liveRequired =>
         'The app is configured to require live feed adapters. If a live endpoint is missing or unhealthy, the repository will fail fast instead of silently using fixtures.',
+      MarketDataMode.alphaVantage =>
+        'The app is configured for Alpha Vantage daily price history. Use ProviderMarketRepository.alphaVantageConfigured so the price-spine adapter is selected.',
     };
 
     final engineCaveats = switch (configuration.mode) {
@@ -122,6 +126,12 @@ class ProviderMarketRepository implements MarketIntelligenceRepository {
         'This is still not a trained model stack.',
         'Live-required mode fails fast when a live adapter is missing or unhealthy.',
         'Point-in-time validation is only as honest as the connected research feed.',
+        'Probabilities in the UI are still implied by rules, not calibrated forecasts.',
+      ],
+      MarketDataMode.alphaVantage => const [
+        'This is still not a trained model stack.',
+        'Alpha Vantage mode should use the dedicated price-spine repository factory.',
+        'Fundamentals, revisions, options-style fields, and validation labels still need connected feeds.',
         'Probabilities in the UI are still implied by rules, not calibrated forecasts.',
       ],
     };
@@ -148,6 +158,52 @@ class ProviderMarketRepository implements MarketIntelligenceRepository {
         'Connect real market, fundamental, and options endpoints to the live provider contract.',
         'Promote the local archive into a durable point-in-time history store.',
         'Run leakage-safe backtests and shadow mode on connected feeds before training ML models.',
+      ],
+    );
+  }
+
+  factory ProviderMarketRepository.alphaVantageConfigured({
+    required MarketDataConfiguration configuration,
+    MarketSnapshotArchive? archive,
+    MarketIntelligenceEngine? engine,
+  }) {
+    final fixtureProvider = FixtureMarketFeedProvider(
+      stockUniverseLimit: configuration.stockUniverseLimit,
+      historicalSnapshotLimit: configuration.historicalSnapshotLimit,
+    );
+    final alphaVantageProvider = AlphaVantageMarketFeedProvider(
+      configuration: configuration,
+      fallbackProvider: fixtureProvider,
+    );
+
+    return ProviderMarketRepository(
+      marketEnvironmentProvider: alphaVantageProvider,
+      styleSignalProvider: alphaVantageProvider,
+      sectorSignalProvider: alphaVantageProvider,
+      stockSignalProvider: alphaVantageProvider,
+      validationWindowProvider: alphaVantageProvider,
+      historicalMarketStateProvider: alphaVantageProvider,
+      archive:
+          archive ??
+          createDefaultMarketSnapshotArchive(
+            maxSnapshots: configuration.historicalSnapshotLimit,
+          ),
+      engine: engine,
+      dataTitle: 'Alpha Vantage price spine',
+      dataSummary:
+          'Daily OHLCV prices from Alpha Vantage now drive the real price-history spine when an API key and quota are available. Trend, volatility, breadth, relative-strength, stock-score history, and chart provenance can now come from connected market data; fundamentals, analyst revisions, options-style signals, and labeled outcomes remain clearly marked fallback inputs until those feeds are connected.',
+      engineSummary:
+          'A rules-based ensemble now consumes Alpha Vantage price history where available to derive regime reads, stock rankings, buy/hold/sell guidance, sell alerts, and scenario views. It is a stronger decision engine foundation, but it is still not a trained or calibrated ML stack.',
+      engineCaveats: const [
+        'This is still not a trained model stack.',
+        'Alpha Vantage currently supplies daily price and volume history only.',
+        'Fundamentals, revisions, options-style fields, and validation labels still need connected point-in-time feeds.',
+        'Probabilities in the UI are still implied by rules, not calibrated forecasts.',
+      ],
+      engineNextSteps: const [
+        'Add a portfolio/account import so buy, hold, trim, and sell calls are tied to real positions.',
+        'Connect fundamentals, earnings estimates, and options-risk feeds beside the price spine.',
+        'Build a point-in-time research dataset for leakage-safe backtests before training ML models.',
       ],
     );
   }
@@ -271,13 +327,13 @@ class ProviderMarketRepository implements MarketIntelligenceRepository {
             lastUpdated: archiveSummary.latestSnapshotAsOf,
           ),
           DataFeedStatus(
-            name: 'Live vendor adapters',
+            name: 'Provider coverage',
             availability: adapterAvailability,
             refreshCadence: adapterAvailability == FeedAvailability.connected
                 ? FeedRefreshCadence.intraday
                 : FeedRefreshCadence.planned,
             detail:
-                'Provider contracts now support both broader stock-universe requests and point-in-time historical feeds, even when the current run falls back to fixtures.',
+                'Overall coverage across the feed rows above. Connected means every required feed is live; Fixture means at least one input is still using fixture or fallback data.',
             lastUpdated: _latestOptionalAsOf(
               feedStatuses.map((feed) => feed.asOf),
             ),

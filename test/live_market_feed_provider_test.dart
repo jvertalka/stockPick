@@ -21,6 +21,10 @@ void main() {
       MarketDataConfiguration.parseMode('live_required'),
       MarketDataMode.liveRequired,
     );
+    expect(
+      MarketDataConfiguration.parseMode('alpha-vantage'),
+      MarketDataMode.alphaVantage,
+    );
   });
 
   test(
@@ -109,7 +113,10 @@ void main() {
 
   test('live provider requests the configured stock-universe limit', () async {
     final client = MockClient((request) async {
-      expect(request.url.toString(), 'https://oracle.example/market/stocks?limit=25');
+      expect(
+        request.url.toString(),
+        'https://oracle.example/market/stocks?limit=25',
+      );
       return http.Response(
         '''
         {
@@ -185,7 +192,10 @@ void main() {
 
   test('live provider parses a connected historical market endpoint', () async {
     final client = MockClient((request) async {
-      expect(request.url.toString(), 'https://oracle.example/market/history?limit=180');
+      expect(
+        request.url.toString(),
+        'https://oracle.example/market/history?limit=180',
+      );
       return http.Response(
         '''
         {

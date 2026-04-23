@@ -6,6 +6,12 @@ snapshot-oriented API surface so the app can score the current market, archive
 point-in-time history, and validate the research stack without changing the
 rules engine.
 
+The app can also run in `alpha-vantage` mode when you want a free connected
+price-history spine before building a custom backend. In that mode the app
+fetches Alpha Vantage `TIME_SERIES_DAILY` compact OHLCV responses, caches them
+locally, respects the configured daily request budget, and marks fundamentals,
+revisions, options-like inputs, and validation labels as fallback data.
+
 ## Environment
 
 ```bash
@@ -20,6 +26,24 @@ flutter run \
 Use `live-required` when you want missing or malformed endpoints to fail fast.
 Use `live-preferred` when you want the app to fall back to fixture data while
 you are bringing endpoints online.
+
+For Alpha Vantage daily price history:
+
+```bash
+flutter run \
+  --dart-define=ORACLE_DATA_MODE=alpha-vantage \
+  --dart-define=ORACLE_ALPHA_VANTAGE_API_KEY=your-alpha-vantage-key \
+  --dart-define=ORACLE_ALPHA_VANTAGE_SYMBOLS=NVDA,MSFT,AVGO,JPM,LLY \
+  --dart-define=ORACLE_ALPHA_VANTAGE_BENCHMARK=SPY \
+  --dart-define=ORACLE_ALPHA_VANTAGE_DAILY_LIMIT=25 \
+  --dart-define=ORACLE_STOCK_UNIVERSE_LIMIT=25 \
+  --dart-define=ORACLE_HISTORICAL_SNAPSHOT_LIMIT=100
+```
+
+If `ORACLE_ALPHA_VANTAGE_SYMBOLS` is omitted, the app starts with a default
+large-cap watchlist and limits first-run network requests so the benchmark plus
+stocks fit the daily request budget. Cached symbols continue to be used even
+after the budget is spent.
 
 ## Envelope
 

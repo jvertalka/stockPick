@@ -59,7 +59,7 @@ void main() {
     );
     expect(state.dataStatus.title, 'Provider-backed research repository');
     expect(
-      state.dataStatus.feeds.any((feed) => feed.name == 'Live vendor adapters'),
+      state.dataStatus.feeds.any((feed) => feed.name == 'Provider coverage'),
       isTrue,
     );
     expect(

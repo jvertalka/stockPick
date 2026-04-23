@@ -149,6 +149,10 @@ class _DefaultRepository implements MarketIntelligenceRepository {
         stockUniverseLimit: configuration.stockUniverseLimit,
         historicalSnapshotLimit: configuration.historicalSnapshotLimit,
       ),
+      MarketDataMode.alphaVantage =>
+        ProviderMarketRepository.alphaVantageConfigured(
+          configuration: configuration,
+        ),
       MarketDataMode.livePreferred || MarketDataMode.liveRequired =>
         ProviderMarketRepository.liveConfigured(configuration: configuration),
     };

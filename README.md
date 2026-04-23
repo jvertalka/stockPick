@@ -23,11 +23,15 @@ The app now runs through a structured fixture repository and a deterministic int
 - raw market, sector, stock, and options-like inputs now flow through provider-backed repository contracts
 - a rules-based engine derives regimes, stock rankings, sell alerts, and scenarios
 - a point-in-time snapshot archive now stores repository states locally
+- an Alpha Vantage adapter can populate the daily price-history spine with
+  connected OHLCV data under a quota-aware cache
 - a fixture walk-forward validation pass reports hit rate, alpha, and drawdown stats
 - the research harness now surfaces chronological train/test splits and per-window breakdowns
 - the shell can manually refresh the repository and surfaces feed refresh cadence
 
-This is a better foundation than a handwritten final snapshot, and the app is now wired for pluggable live feed providers, but it is still not a live or trained system yet.
+This is a better foundation than a handwritten final snapshot, and the app is
+now wired for both pluggable live feed providers and a free Alpha Vantage daily
+price-history path. It is still not a trained system yet.
 
 ## Run
 
@@ -46,11 +50,30 @@ flutter run \
   --dart-define=ORACLE_HISTORICAL_SNAPSHOT_LIMIT=252
 ```
 
+To use the free Alpha Vantage price spine:
+
+```bash
+flutter run \
+  --dart-define=ORACLE_DATA_MODE=alpha-vantage \
+  --dart-define=ORACLE_ALPHA_VANTAGE_API_KEY=your-alpha-vantage-key \
+  --dart-define=ORACLE_ALPHA_VANTAGE_SYMBOLS=NVDA,MSFT,AVGO,JPM,LLY \
+  --dart-define=ORACLE_ALPHA_VANTAGE_DAILY_LIMIT=25 \
+  --dart-define=ORACLE_HISTORICAL_SNAPSHOT_LIMIT=100
+```
+
+Alpha Vantage mode uses `TIME_SERIES_DAILY` compact responses as the real daily
+price-and-volume history spine. That drives trend, volatility, breadth,
+relative strength, historical market states, and the trend charts where data is
+available. Fundamentals, analyst revisions, options-style risk, and labeled
+research outcomes are still explicit fallback inputs until those feeds are
+connected.
+
 Available modes:
 
 - `fixture`
 - `live-preferred`
 - `live-required`
+- `alpha-vantage`
 
 Expected live endpoint contract:
 
