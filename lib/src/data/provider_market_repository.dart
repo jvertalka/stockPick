@@ -217,6 +217,7 @@ class ProviderMarketRepository implements MarketIntelligenceRepository {
     final validation = _validationEngine.validate(
       validationFeed.data,
       archivedSnapshotCount: archiveSummary.snapshotCount,
+      stockUniverseCount: currentState.stocks.length,
     );
     final archivedSnapshots = await _archive.loadSnapshots();
     final snapshot = withHistoricalInsights(
@@ -304,13 +305,19 @@ class ProviderMarketRepository implements MarketIntelligenceRepository {
     Iterable<FeedAvailability> availabilities,
   ) {
     final values = availabilities.toList();
-    if (values.every((availability) => availability == FeedAvailability.connected)) {
+    if (values.every(
+      (availability) => availability == FeedAvailability.connected,
+    )) {
       return FeedAvailability.connected;
     }
-    if (values.any((availability) => availability == FeedAvailability.fixture)) {
+    if (values.any(
+      (availability) => availability == FeedAvailability.fixture,
+    )) {
       return FeedAvailability.fixture;
     }
-    if (values.any((availability) => availability == FeedAvailability.missing)) {
+    if (values.any(
+      (availability) => availability == FeedAvailability.missing,
+    )) {
       return FeedAvailability.missing;
     }
     return FeedAvailability.planned;

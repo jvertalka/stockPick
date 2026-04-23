@@ -134,6 +134,7 @@ class ValidationReport {
     required this.calibrationBands,
     required this.integrity,
     required this.robustness,
+    required this.modelReadiness,
     required this.verdict,
   });
 
@@ -154,6 +155,7 @@ class ValidationReport {
   final List<CalibrationBandReport> calibrationBands;
   final ResearchIntegrityReport integrity;
   final RobustnessReport robustness;
+  final ModelReadinessReport modelReadiness;
   final String verdict;
 }
 
@@ -239,6 +241,34 @@ class ShadowModeReport {
   final int archivedSnapshotCount;
   final int minimumSnapshotCount;
   final String summary;
+}
+
+class ModelReadinessReport {
+  const ModelReadinessReport({
+    required this.isReady,
+    required this.summary,
+    required this.gates,
+  });
+
+  final bool isReady;
+  final String summary;
+  final List<ReadinessGateReport> gates;
+}
+
+class ReadinessGateReport {
+  const ReadinessGateReport({
+    required this.label,
+    required this.passed,
+    required this.current,
+    required this.minimum,
+    required this.detail,
+  });
+
+  final String label;
+  final bool passed;
+  final int current;
+  final int minimum;
+  final String detail;
 }
 
 class CalibrationBandReport {

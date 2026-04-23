@@ -474,6 +474,44 @@ class MarketRadarView extends StatelessWidget {
                           ),
                           const SizedBox(height: 14),
                           Text(
+                            'Model readiness',
+                            style: Theme.of(context).textTheme.titleLarge,
+                          ),
+                          const SizedBox(height: 10),
+                          TonePill(
+                            label:
+                                engineStatus
+                                    .validationReport
+                                    .modelReadiness
+                                    .isReady
+                                ? 'ML-ready'
+                                : 'Not ML-ready',
+                            tone:
+                                engineStatus
+                                    .validationReport
+                                    .modelReadiness
+                                    .isReady
+                                ? SignalTone.positive
+                                : SignalTone.caution,
+                          ),
+                          const SizedBox(height: 10),
+                          Text(
+                            engineStatus
+                                .validationReport
+                                .modelReadiness
+                                .summary,
+                            style: Theme.of(context).textTheme.bodySmall,
+                          ),
+                          const SizedBox(height: 10),
+                          ...engineStatus.validationReport.modelReadiness.gates
+                              .map(
+                                (gate) => Padding(
+                                  padding: const EdgeInsets.only(bottom: 10),
+                                  child: _ReadinessGateRow(gate: gate),
+                                ),
+                              ),
+                          const SizedBox(height: 14),
+                          Text(
                             'Window breakdown',
                             style: Theme.of(context).textTheme.titleLarge,
                           ),
@@ -747,6 +785,46 @@ class _IntegrityCheckRow extends StatelessWidget {
           ),
           const SizedBox(height: 10),
           Text(check.detail, style: Theme.of(context).textTheme.bodySmall),
+        ],
+      ),
+    );
+  }
+}
+
+class _ReadinessGateRow extends StatelessWidget {
+  const _ReadinessGateRow({required this.gate});
+
+  final ReadinessGateReport gate;
+
+  @override
+  Widget build(BuildContext context) {
+    final tone = gate.passed ? SignalTone.positive : SignalTone.caution;
+    return Container(
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: Colors.white.withValues(alpha: 0.03),
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(color: Colors.white.withValues(alpha: 0.08)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Expanded(
+                child: TonePill(label: gate.label, tone: tone),
+              ),
+              const SizedBox(width: 10),
+              Text(
+                '${gate.current} / ${gate.minimum}',
+                style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                  color: gate.passed ? AppTheme.mint : AppTheme.amber,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 10),
+          Text(gate.detail, style: Theme.of(context).textTheme.bodySmall),
         ],
       ),
     );

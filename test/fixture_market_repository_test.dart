@@ -66,7 +66,9 @@ void main() {
     );
     expect(state.dataStatus.feeds.length, greaterThanOrEqualTo(4));
     expect(
-      state.dataStatus.feeds.any((feed) => feed.name == 'Historical market states'),
+      state.dataStatus.feeds.any(
+        (feed) => feed.name == 'Historical market states',
+      ),
       isTrue,
     );
     expect(state.dataStatus.archiveSnapshotCount, greaterThan(0));
@@ -94,5 +96,18 @@ void main() {
     );
     expect(state.engineStatus.validationReport.calibrationBands, isNotEmpty);
     expect(state.engineStatus.validationReport.integrity.checks, isNotEmpty);
+    expect(state.engineStatus.validationReport.modelReadiness.isReady, isFalse);
+    expect(
+      state.engineStatus.validationReport.modelReadiness.gates.map(
+        (gate) => gate.label,
+      ),
+      containsAll([
+        'Archived snapshots',
+        'Stock universe',
+        'Validation windows',
+        'Labeled outcomes',
+        'Integrity checks',
+      ]),
+    );
   });
 }

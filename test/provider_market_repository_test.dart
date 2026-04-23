@@ -63,7 +63,9 @@ void main() {
       isTrue,
     );
     expect(
-      state.dataStatus.feeds.any((feed) => feed.name == 'Historical market states'),
+      state.dataStatus.feeds.any(
+        (feed) => feed.name == 'Historical market states',
+      ),
       isTrue,
     );
     expect(state.engineStatus.isTrained, isFalse);
@@ -77,5 +79,10 @@ void main() {
     );
     expect(state.engineStatus.validationReport.calibrationBands, isNotEmpty);
     expect(state.engineStatus.validationReport.integrity.checks, isNotEmpty);
+    expect(state.engineStatus.validationReport.modelReadiness.isReady, isFalse);
+    expect(
+      state.engineStatus.validationReport.modelReadiness.gates,
+      hasLength(5),
+    );
   });
 }

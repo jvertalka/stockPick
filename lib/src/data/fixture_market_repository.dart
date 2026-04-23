@@ -41,7 +41,10 @@ class FixtureMarketRepository implements MarketIntelligenceRepository {
       validationWindows: windows,
     );
     final evaluation = _engine.evaluate(currentState);
-    await _archive.saveSnapshots(historicalReplay, source: 'fixture-research-replay');
+    await _archive.saveSnapshots(
+      historicalReplay,
+      source: 'fixture-research-replay',
+    );
     final archiveSummary = await _archive.saveSnapshot(
       currentState,
       source: 'fixture-research-repository',
@@ -49,6 +52,7 @@ class FixtureMarketRepository implements MarketIntelligenceRepository {
     final validation = _validationEngine.validate(
       windows,
       archivedSnapshotCount: archiveSummary.snapshotCount,
+      stockUniverseCount: currentState.stocks.length,
     );
     final archivedSnapshots = await _archive.loadSnapshots();
     final snapshot = withHistoricalInsights(
@@ -109,7 +113,9 @@ class FixtureMarketRepository implements MarketIntelligenceRepository {
             refreshCadence: FeedRefreshCadence.daily,
             detail:
                 'Fixture mode exposes a replay history that fills the durable archive with point-in-time market states until a connected historical feed takes over.',
-            lastUpdated: historicalReplay.isEmpty ? null : historicalReplay.last.asOf,
+            lastUpdated: historicalReplay.isEmpty
+                ? null
+                : historicalReplay.last.asOf,
           ),
           DataFeedStatus(
             name: 'Live vendor connections',
@@ -159,10 +165,13 @@ class FixtureMarketRepository implements MarketIntelligenceRepository {
     List<ValidationWindow>? validationWindows,
   }) {
     final resolvedCurrentState = currentState ?? currentMarketState();
-    final resolvedValidationWindows = validationWindows ?? this.validationWindows();
+    final resolvedValidationWindows =
+        validationWindows ?? this.validationWindows();
     return buildFixtureReplayHistory(
       currentState: resolvedCurrentState,
-      anchorStates: resolvedValidationWindows.map((window) => window.marketState),
+      anchorStates: resolvedValidationWindows.map(
+        (window) => window.marketState,
+      ),
       maxHistoryPoints: _historicalSnapshotLimit,
     );
   }
@@ -1670,7 +1679,8 @@ class FixtureMarketRepository implements MarketIntelligenceRepository {
           company: 'Fixture Expansion $index',
           sector: baseState.stocks[index % baseState.stocks.length].sector,
           industry: baseState.stocks[index % baseState.stocks.length].industry,
-          templateTicker: baseState.stocks[index % baseState.stocks.length].ticker,
+          templateTicker:
+              baseState.stocks[index % baseState.stocks.length].ticker,
         ),
     ];
 
@@ -1851,10 +1861,7 @@ class FixtureMarketRepository implements MarketIntelligenceRepository {
     );
   }
 
-  RawStockSignal _templateStockFor(
-    List<RawStockSignal> stocks,
-    String ticker,
-  ) {
+  RawStockSignal _templateStockFor(List<RawStockSignal> stocks, String ticker) {
     return stocks.firstWhere(
       (stock) => stock.ticker == ticker,
       orElse: () => stocks.first,

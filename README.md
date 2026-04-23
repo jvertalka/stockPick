@@ -39,7 +39,11 @@ flutter run
 To prefer live adapters when you have an endpoint ready:
 
 ```bash
-flutter run --dart-define=ORACLE_DATA_MODE=live-preferred --dart-define=ORACLE_DATA_BASE_URL=https://your-api.example
+flutter run \
+  --dart-define=ORACLE_DATA_MODE=live-preferred \
+  --dart-define=ORACLE_DATA_BASE_URL=https://your-api.example \
+  --dart-define=ORACLE_STOCK_UNIVERSE_LIMIT=100 \
+  --dart-define=ORACLE_HISTORICAL_SNAPSHOT_LIMIT=252
 ```
 
 Available modes:
@@ -53,7 +57,8 @@ Expected live endpoint contract:
 - `GET /market/environment`
 - `GET /market/styles`
 - `GET /market/sectors`
-- `GET /market/stocks`
+- `GET /market/stocks?limit=100`
+- `GET /market/history?limit=252`
 - `GET /research/validation-windows`
 
 Each endpoint can return either raw JSON matching the app models or an envelope shaped like:
@@ -67,13 +72,23 @@ Each endpoint can return either raw JSON matching the app models or an envelope 
 }
 ```
 
+See [docs/live-data-contract.md](docs/live-data-contract.md) for the full JSON
+contract, environment variables, data quality gates, and endpoint validation
+workflow.
+
+You can validate a live service before launching the app:
+
+```bash
+dart run tool/validate_live_feed_contract.dart --base-url https://your-api.example
+```
+
 ## Next build steps
 
 - replace the fixture repository with live market, fundamental, and options adapters
-- implement connected providers for market, sector/style, stock, and validation feeds
-- upgrade the local snapshot archive into a true vendor-backed point-in-time history
-- add a research harness for backtests, calibration, and slippage-aware evaluation
-- add persisted watchlists, action history, sync, and notification delivery
+- connect a production data service that implements `/market/stocks` and `/market/history`
+- grow the validation feed until the model-readiness gates pass
+- add trained model candidates only after point-in-time data, labeled outcomes, and shadow tracking are healthy
+- add sync and notification delivery for saved workflows
 
 ## Getting Started
 

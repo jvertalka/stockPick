@@ -16,6 +16,11 @@ class ValidationEngine {
     int topPickCount = 2,
     int archivedSnapshotCount = 0,
     int minimumShadowSnapshots = 20,
+    int stockUniverseCount = 0,
+    int minimumModelSnapshots = 252,
+    int minimumModelUniverse = 100,
+    int minimumModelValidationWindows = 20,
+    int minimumModelOutcomes = 500,
   }) {
     final orderedWindows = [...windows]
       ..sort((left, right) => left.asOf.compareTo(right.asOf));
@@ -48,6 +53,17 @@ class ValidationEngine {
       testWindows: testWindows,
     );
     final robustness = _buildRobustnessReport(evaluatedWindows);
+    final modelReadiness = _buildModelReadiness(
+      archivedSnapshotCount: archivedSnapshotCount,
+      stockUniverseCount: stockUniverseCount,
+      validationWindowCount: orderedWindows.length,
+      observationCount: aggregate.observationCount,
+      minimumModelSnapshots: minimumModelSnapshots,
+      minimumModelUniverse: minimumModelUniverse,
+      minimumModelValidationWindows: minimumModelValidationWindows,
+      minimumModelOutcomes: minimumModelOutcomes,
+      integrity: integrity,
+    );
 
     final verdict = _overallVerdict(
       trainSplit: trainSplit,
@@ -74,6 +90,7 @@ class ValidationEngine {
       calibrationBands: calibrationBands,
       integrity: integrity,
       robustness: robustness,
+      modelReadiness: modelReadiness,
       verdict: verdict,
     );
   }
@@ -383,6 +400,72 @@ class ValidationEngine {
       worstWindowAlpha: _minimum(windowAlpha),
       averageTopPickCount: averageTopPickCount,
       summary: summary,
+    );
+  }
+
+  ModelReadinessReport _buildModelReadiness({
+    required int archivedSnapshotCount,
+    required int stockUniverseCount,
+    required int validationWindowCount,
+    required int observationCount,
+    required int minimumModelSnapshots,
+    required int minimumModelUniverse,
+    required int minimumModelValidationWindows,
+    required int minimumModelOutcomes,
+    required ResearchIntegrityReport integrity,
+  }) {
+    final gates = [
+      ReadinessGateReport(
+        label: 'Archived snapshots',
+        passed: archivedSnapshotCount >= minimumModelSnapshots,
+        current: archivedSnapshotCount,
+        minimum: minimumModelSnapshots,
+        detail:
+            'Point-in-time snapshots are needed so training, backtests, and shadow runs see the market exactly as it looked then.',
+      ),
+      ReadinessGateReport(
+        label: 'Stock universe',
+        passed: stockUniverseCount >= minimumModelUniverse,
+        current: stockUniverseCount,
+        minimum: minimumModelUniverse,
+        detail:
+            'A larger universe reduces curated-sample bias and makes ranking quality easier to test honestly.',
+      ),
+      ReadinessGateReport(
+        label: 'Validation windows',
+        passed: validationWindowCount >= minimumModelValidationWindows,
+        current: validationWindowCount,
+        minimum: minimumModelValidationWindows,
+        detail:
+            'More labeled windows give the holdout enough variety across regimes and market conditions.',
+      ),
+      ReadinessGateReport(
+        label: 'Labeled outcomes',
+        passed: observationCount >= minimumModelOutcomes,
+        current: observationCount,
+        minimum: minimumModelOutcomes,
+        detail:
+            'Labeled outcomes are the examples that let us judge whether higher scores actually separated better future returns.',
+      ),
+      ReadinessGateReport(
+        label: 'Integrity checks',
+        passed: integrity.overallPassed,
+        current: integrity.overallPassed ? 1 : 0,
+        minimum: 1,
+        detail:
+            'Chronology, duplicate-date, and holdout-boundary checks must pass before model training is credible.',
+      ),
+    ];
+    final isReady = gates.every((gate) => gate.passed);
+    final missing = gates.where((gate) => !gate.passed).length;
+    final summary = isReady
+        ? 'Model-readiness gates pass. The next safe step is shadow-mode comparison before training a model candidate.'
+        : '$missing model-readiness gates still need work before ML training would be trustworthy.';
+
+    return ModelReadinessReport(
+      isReady: isReady,
+      summary: summary,
+      gates: gates,
     );
   }
 
