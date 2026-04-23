@@ -114,6 +114,41 @@ void main() {
       expect(find.text('Recent actions'), findsOneWidget);
     },
   );
+
+  testWidgets('imports holdings and renders portfolio-aware decisions', (
+    tester,
+  ) async {
+    await tester.binding.setSurfaceSize(const Size(1280, 1080));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+
+    await tester.pumpWidget(const FinanceOracleApp());
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.text('Decision Desk').first);
+    await tester.pumpAndSettle();
+
+    expect(find.text('Buy candidates'), findsWidgets);
+    expect(find.text('Portfolio input'), findsOneWidget);
+
+    await tester.ensureVisible(
+      find.byKey(const ValueKey('portfolio-csv-input')),
+    );
+    await tester.pumpAndSettle();
+    await tester.enterText(
+      find.byKey(const ValueKey('portfolio-csv-input')),
+      'Symbol,Quantity,Average Cost\nNVDA,2,820.10',
+    );
+    await tester.ensureVisible(
+      find.byKey(const ValueKey('import-portfolio-button')),
+    );
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const ValueKey('import-portfolio-button')));
+    await tester.pumpAndSettle();
+
+    expect(find.text('1 imported, 0 skipped.'), findsOneWidget);
+    expect(find.textContaining('NVDA'), findsWidgets);
+    expect(find.textContaining('2 shares'), findsWidgets);
+  });
 }
 
 class _StaticRepository implements MarketIntelligenceRepository {

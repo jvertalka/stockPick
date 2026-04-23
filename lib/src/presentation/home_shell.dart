@@ -1,10 +1,14 @@
 import 'package:flutter/material.dart';
 
+import '../data/portfolio_store.dart';
 import '../data/user_workflow_store.dart';
+import '../engine/portfolio_decision_engine.dart';
 import '../models/intelligence_app_state.dart';
 import '../models/market_intelligence.dart';
+import '../models/portfolio_models.dart';
 import '../models/workflow_models.dart';
 import '../theme/app_theme.dart';
+import 'views/decision_desk_view.dart';
 import 'views/market_radar_view.dart';
 import 'views/opportunity_board_view.dart';
 import 'views/scenario_lab_view.dart';
@@ -15,6 +19,7 @@ import 'widgets/insight_widgets.dart';
 
 enum AppView {
   marketRadar,
+  decisionDesk,
   opportunityBoard,
   stockIntelligence,
   sellAlerts,
@@ -25,6 +30,7 @@ enum AppView {
 extension AppViewMeta on AppView {
   String get label => switch (this) {
     AppView.marketRadar => 'Market Radar',
+    AppView.decisionDesk => 'Decision Desk',
     AppView.opportunityBoard => 'Opportunity Board',
     AppView.stockIntelligence => 'Stock Intelligence',
     AppView.sellAlerts => 'Sell Alerts',
@@ -34,6 +40,7 @@ extension AppViewMeta on AppView {
 
   IconData get icon => switch (this) {
     AppView.marketRadar => Icons.radar_rounded,
+    AppView.decisionDesk => Icons.fact_check_rounded,
     AppView.opportunityBoard => Icons.view_list_rounded,
     AppView.stockIntelligence => Icons.insights_rounded,
     AppView.sellAlerts => Icons.warning_amber_rounded,
@@ -63,7 +70,11 @@ class _HomeShellState extends State<HomeShell> {
   String? _selectedTicker;
   ScenarioType? _selectedScenario;
   final UserWorkflowStore _workflowStore = SharedPreferencesUserWorkflowStore();
+  final PortfolioStore _portfolioStore = SharedPreferencesPortfolioStore();
+  final PortfolioDecisionEngine _decisionEngine =
+      const PortfolioDecisionEngine();
   WorkflowState _workflowState = WorkflowState.empty;
+  PortfolioState _portfolioState = PortfolioState.empty;
 
   MarketIntelligenceSnapshot get _snapshot => widget.state.snapshot;
 
@@ -73,6 +84,7 @@ class _HomeShellState extends State<HomeShell> {
     _selectedTicker = _defaultTicker();
     _selectedScenario = _defaultScenario();
     _loadWorkflowState();
+    _loadPortfolioState();
   }
 
   @override
@@ -223,6 +235,23 @@ class _HomeShellState extends State<HomeShell> {
     await _workflowStore.save(state);
   }
 
+  Future<void> _loadPortfolioState() async {
+    final state = await _portfolioStore.load();
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _portfolioState = state;
+    });
+  }
+
+  Future<void> _persistPortfolioState(PortfolioState state) async {
+    setState(() {
+      _portfolioState = state;
+    });
+    await _portfolioStore.save(state);
+  }
+
   Future<void> _recordWorkflowAction(WorkflowActionRecord record) async {
     final recent = [record, ..._workflowState.recentActions];
     await _persistWorkflowState(
@@ -294,6 +323,18 @@ class _HomeShellState extends State<HomeShell> {
         radar: _snapshot.marketRadar,
         dataStatus: widget.state.dataStatus,
         engineStatus: widget.state.engineStatus,
+      ),
+      AppView.decisionDesk => DecisionDeskView(
+        snapshot: _snapshot,
+        portfolioState: _portfolioState,
+        report: _decisionEngine.build(
+          snapshot: _snapshot,
+          portfolio: _portfolioState,
+        ),
+        onPortfolioChanged: (state) {
+          _persistPortfolioState(state);
+        },
+        onOpenStock: _openStock,
       ),
       AppView.opportunityBoard => OpportunityBoardView(
         stocks: _snapshot.rankedUniverse,
