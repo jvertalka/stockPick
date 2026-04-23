@@ -107,11 +107,13 @@ void main() {
         snapshot,
         source: 'fixture-research-repository',
       );
+      final snapshots = await archive.loadSnapshots();
 
       expect(firstSave.snapshotCount, 1);
       expect(secondSave.snapshotCount, 1);
       expect(secondSave.latestSnapshotAsOf, snapshot.asOf);
       expect(secondSave.sources, contains('fixture-research-repository'));
+      expect(snapshots, hasLength(1));
     },
   );
 }

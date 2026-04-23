@@ -13,11 +13,15 @@ class MarketDataConfiguration {
     required this.mode,
     this.baseUrl,
     this.apiToken,
+    this.stockUniverseLimit = 40,
+    this.historicalSnapshotLimit = 240,
   });
 
   final MarketDataMode mode;
   final String? baseUrl;
   final String? apiToken;
+  final int stockUniverseLimit;
+  final int historicalSnapshotLimit;
 
   bool get hasBaseUrl => baseUrl != null && baseUrl!.trim().isNotEmpty;
 
@@ -34,11 +38,25 @@ class MarketDataConfiguration {
       'ORACLE_DATA_API_TOKEN',
       defaultValue: '',
     );
+    const stockUniverseLimitValue = int.fromEnvironment(
+      'ORACLE_STOCK_UNIVERSE_LIMIT',
+      defaultValue: 40,
+    );
+    const historicalSnapshotLimitValue = int.fromEnvironment(
+      'ORACLE_HISTORICAL_SNAPSHOT_LIMIT',
+      defaultValue: 240,
+    );
 
     return MarketDataConfiguration(
       mode: parseMode(modeValue),
       baseUrl: _normalizeOptionalValue(baseUrlValue),
       apiToken: _normalizeOptionalValue(apiTokenValue),
+      stockUniverseLimit: stockUniverseLimitValue < 10
+          ? 10
+          : stockUniverseLimitValue,
+      historicalSnapshotLimit: historicalSnapshotLimitValue < 60
+          ? 60
+          : historicalSnapshotLimitValue,
     );
   }
 

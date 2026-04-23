@@ -27,6 +27,12 @@ class SellAlertsView extends StatelessWidget {
                 tone: SignalTone.neutral,
               ),
             ),
+            PlainEnglishGuideCard(
+              summary:
+                  'This screen is about protecting discipline. It waits for several warning signs to agree before telling you to trim, de-risk, or leave.',
+              entries: _sellAlertsGuideEntries,
+            ),
+            SizedBox(height: 18),
             EmptyStateCard(
               icon: Icons.warning_amber_rounded,
               title: 'No sell alerts yet.',
@@ -72,6 +78,12 @@ class SellAlertsView extends StatelessWidget {
                   tone: SignalTone.caution,
                 ),
               ),
+              const PlainEnglishGuideCard(
+                summary:
+                    'This screen is about protecting discipline. It waits for several warning signs to agree before telling you to trim, de-risk, or leave.',
+                entries: _sellAlertsGuideEntries,
+              ),
+              const SizedBox(height: 18),
               InsightCard(
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
@@ -101,6 +113,8 @@ class SellAlertsView extends StatelessWidget {
                       detail:
                           'Stories that still work, but with less upside than before.',
                       tone: SignalTone.caution,
+                      definition:
+                          'Ideas where the thesis is not fully broken, but the reward has shrunk enough that smaller size makes more sense.',
                     ),
                   ),
                   SizedBox(
@@ -110,6 +124,8 @@ class SellAlertsView extends StatelessWidget {
                       value: '$exitCount',
                       detail: 'Theses that now look broken or unrewarding.',
                       tone: SignalTone.negative,
+                      definition:
+                          'Ideas where enough evidence has gone wrong that the app no longer sees a good reason to stay in the trade.',
                     ),
                   ),
                   SizedBox(
@@ -120,6 +136,8 @@ class SellAlertsView extends StatelessWidget {
                       detail:
                           'How many deterioration signals tend to agree before the board escalates.',
                       tone: SignalTone.neutral,
+                      definition:
+                          'A cluster is a group of separate warning signs pointing the same way. Bigger clusters mean the warning is broader, not just louder.',
                     ),
                   ),
                 ],
@@ -198,6 +216,8 @@ class SellAlertsView extends StatelessWidget {
                           label: 'Deterioration cluster count',
                           value: '${alert.clusterCount}',
                           highlight: AppTheme.amber,
+                          definition:
+                              'How many separate warning signs agreed strongly enough to trigger this alert.',
                         ),
                         const SizedBox(height: 8),
                         Text(
@@ -228,3 +248,31 @@ class SellAlertsView extends StatelessWidget {
     );
   }
 }
+
+const _sellAlertsGuideEntries = [
+  GuideEntry(
+    term: 'Deterioration cluster',
+    definition:
+        'A cluster means several independent warning signs are leaning negative at the same time, which is more trustworthy than one scary signal by itself.',
+  ),
+  GuideEntry(
+    term: 'Trim, de-risk, exit',
+    definition:
+        'These are escalating actions. Trim means reduce a winner. De-risk means cut exposure more meaningfully. Exit means the thesis now looks broken or not worth the pain.',
+  ),
+  GuideEntry(
+    term: 'Damage score',
+    definition:
+        'A quick summary of how badly the evidence is hurting the original story. Higher means the setup is under more pressure.',
+  ),
+  GuideEntry(
+    term: 'Trigger cluster',
+    definition:
+        'These are the exact signs that caused the alert, such as weakening price response, fading breadth, or rising options stress.',
+  ),
+  GuideEntry(
+    term: 'Next check',
+    definition:
+        'The follow-up clue that would help decide whether the setup is stabilizing or still getting worse.',
+  ),
+];

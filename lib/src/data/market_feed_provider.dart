@@ -42,15 +42,28 @@ abstract class ValidationWindowProvider {
   Future<FeedSlice<List<ValidationWindow>>> loadValidationWindows();
 }
 
+abstract class HistoricalMarketStateProvider {
+  Future<FeedSlice<List<RawMarketState>>> loadHistoricalMarketStates();
+}
+
 class FixtureMarketFeedProvider
     implements
         MarketEnvironmentProvider,
         StyleSignalProvider,
         SectorSignalProvider,
         StockSignalProvider,
-        ValidationWindowProvider {
-  FixtureMarketFeedProvider({FixtureMarketRepository? repository})
-    : _repository = repository ?? FixtureMarketRepository();
+        ValidationWindowProvider,
+        HistoricalMarketStateProvider {
+  FixtureMarketFeedProvider({
+    FixtureMarketRepository? repository,
+    int stockUniverseLimit = 40,
+    int historicalSnapshotLimit = 240,
+  }) : _repository =
+           repository ??
+           FixtureMarketRepository(
+             stockUniverseLimit: stockUniverseLimit,
+             historicalSnapshotLimit: historicalSnapshotLimit,
+           );
 
   final FixtureMarketRepository _repository;
 
@@ -128,7 +141,25 @@ class FixtureMarketFeedProvider
       availability: FeedAvailability.fixture,
       refreshCadence: FeedRefreshCadence.onDemand,
       detail:
-          'Train-style and holdout-style validation windows still come from fixture research data.',
+          'Train-style and holdout-style validation windows still come from fixture research data, and fixture mode uses them to prime the local research replay archive.',
+    );
+  }
+
+  @override
+  Future<FeedSlice<List<RawMarketState>>> loadHistoricalMarketStates() async {
+    final history = _repository.historicalReplayStates();
+    final asOf = history.isEmpty
+        ? _repository.currentMarketState().asOf
+        : history.last.asOf;
+    return FeedSlice(
+      name: 'Historical market states',
+      source: 'fixture-history-replay',
+      asOf: asOf,
+      data: history,
+      availability: FeedAvailability.fixture,
+      refreshCadence: FeedRefreshCadence.daily,
+      detail:
+          'Fixture mode exposes a broader historical replay timeline that can backfill the local archive until real connected history is available.',
     );
   }
 }

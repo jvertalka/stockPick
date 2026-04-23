@@ -26,7 +26,8 @@ class ScenarioLabView extends StatelessWidget {
           children: [
             ViewHeader(
               eyebrow: 'Scenario Lab',
-              title: 'Stress testing comes online once the current board exists.',
+              title:
+                  'Stress testing comes online once the current board exists.',
               subtitle:
                   'Scenario re-ranking depends on a populated opportunity set, so this view stays in standby until the repository can produce one.',
               trailing: TonePill(
@@ -34,6 +35,18 @@ class ScenarioLabView extends StatelessWidget {
                 tone: SignalTone.neutral,
               ),
             ),
+            PlainEnglishGuideCard(
+              summary:
+                  'This screen answers a simple what-if question: if the market mood changes, which kinds of stocks should become more or less attractive?',
+              entries: _scenarioLabGuideEntries,
+            ),
+            SizedBox(height: 18),
+            HowThisIsCalculatedCard(
+              summary:
+                  'Scenario scores re-rank the same opportunity set under alternate market conditions rather than inventing a separate stock list.',
+              entries: _scenarioCalculationEntries,
+            ),
+            SizedBox(height: 18),
             EmptyStateCard(
               icon: Icons.science_rounded,
               title: 'No scenario outputs yet.',
@@ -73,6 +86,18 @@ class ScenarioLabView extends StatelessWidget {
                   tone: SignalTone.neutral,
                 ),
               ),
+              const PlainEnglishGuideCard(
+                summary:
+                    'This screen answers a simple what-if question: if the market mood changes, which kinds of stocks should become more or less attractive?',
+                entries: _scenarioLabGuideEntries,
+              ),
+              const SizedBox(height: 18),
+              const HowThisIsCalculatedCard(
+                summary:
+                    'Scenario sensitivity shows how violently the ranked board would change if a given macro shock became real.',
+                entries: _scenarioCalculationEntries,
+              ),
+              const SizedBox(height: 18),
               Wrap(
                 spacing: 10,
                 runSpacing: 10,
@@ -112,6 +137,17 @@ class ScenarioLabView extends StatelessWidget {
                     ),
                   ],
                 ),
+              ),
+              const SizedBox(height: 18),
+              MetricTile(
+                label: 'Scenario sensitivity',
+                value: scenario.sensitivityScore.toStringAsFixed(1),
+                detail:
+                    'Average size of the opportunity-score changes this scenario would create across the board.',
+                tone: SignalTone.caution,
+                trend: scenario.sensitivityTrend,
+                definition:
+                    'Higher sensitivity means this scenario would reshuffle the board more aggressively.',
               ),
               const SizedBox(height: 18),
               Wrap(
@@ -226,3 +262,58 @@ class ScenarioLabView extends StatelessWidget {
     );
   }
 }
+
+const _scenarioLabGuideEntries = [
+  GuideEntry(
+    term: 'Scenario',
+    definition:
+        'A scenario is a stress test. The app imagines a market change and asks how today’s opportunity board would look in that alternate world.',
+  ),
+  GuideEntry(
+    term: 'Favored exposures',
+    definition:
+        'These are the kinds of businesses or styles that should hold up better if that scenario plays out.',
+  ),
+  GuideEntry(
+    term: 'Vulnerable exposures',
+    definition:
+        'These are the setups most likely to struggle if the assumed scenario becomes real.',
+  ),
+  GuideEntry(
+    term: 'Re-ranked names',
+    definition:
+        'The same stocks are rescored under the new scenario so you can see which ideas would likely rise or fall in priority.',
+  ),
+  GuideEntry(
+    term: 'Delta opportunity',
+    definition:
+        'This is the change in attractiveness under the scenario. Positive means the setup would likely look better; negative means worse.',
+  ),
+];
+
+const _scenarioCalculationEntries = [
+  CalculationEntry(
+    title: 'Scenario sensitivity',
+    summary:
+        'A simple stress-intensity score based on how much the ranked names would move up or down under the scenario.',
+    drivers: [
+      'Change in opportunity score for the impacted names',
+      'How broad the repricing is across the board',
+      'How severe the regime change is for the current leaders',
+    ],
+    interpretation:
+        'Higher means the scenario would force a larger rethink of the board. Lower means the ranking is more stable under that shock.',
+  ),
+  CalculationEntry(
+    title: 'Favored and vulnerable exposures',
+    summary:
+        'Each scenario defines the business styles that should benefit or suffer if the stress becomes real.',
+    drivers: [
+      'Credit sensitivity and balance-sheet quality',
+      'Growth versus defensive exposure',
+      'Expected stability and crowding sensitivity',
+    ],
+    interpretation:
+        'These are structural tendencies, not hard predictions about a single stock on a single day.',
+  ),
+];

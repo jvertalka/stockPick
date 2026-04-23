@@ -129,6 +129,11 @@ class ValidationReport {
     required this.testSplit,
     required this.windows,
     required this.shadowMode,
+    required this.coverageStart,
+    required this.coverageEnd,
+    required this.calibrationBands,
+    required this.integrity,
+    required this.robustness,
     required this.verdict,
   });
 
@@ -144,6 +149,11 @@ class ValidationReport {
   final ValidationSplitReport testSplit;
   final List<ValidationWindowReport> windows;
   final ShadowModeReport shadowMode;
+  final DateTime? coverageStart;
+  final DateTime? coverageEnd;
+  final List<CalibrationBandReport> calibrationBands;
+  final ResearchIntegrityReport integrity;
+  final RobustnessReport robustness;
   final String verdict;
 }
 
@@ -228,5 +238,61 @@ class ShadowModeReport {
   final bool isReady;
   final int archivedSnapshotCount;
   final int minimumSnapshotCount;
+  final String summary;
+}
+
+class CalibrationBandReport {
+  const CalibrationBandReport({
+    required this.label,
+    required this.observationCount,
+    required this.hitRate,
+    required this.averageAlpha,
+    required this.averageScore,
+  });
+
+  final String label;
+  final int observationCount;
+  final double hitRate;
+  final double averageAlpha;
+  final double averageScore;
+}
+
+class ResearchIntegrityReport {
+  const ResearchIntegrityReport({
+    required this.summary,
+    required this.overallPassed,
+    required this.checks,
+  });
+
+  final String summary;
+  final bool overallPassed;
+  final List<ResearchIntegrityCheck> checks;
+}
+
+class ResearchIntegrityCheck {
+  const ResearchIntegrityCheck({
+    required this.label,
+    required this.passed,
+    required this.detail,
+  });
+
+  final String label;
+  final bool passed;
+  final String detail;
+}
+
+class RobustnessReport {
+  const RobustnessReport({
+    required this.positiveWindowRate,
+    required this.medianWindowAlpha,
+    required this.worstWindowAlpha,
+    required this.averageTopPickCount,
+    required this.summary,
+  });
+
+  final double positiveWindowRate;
+  final double medianWindowAlpha;
+  final double worstWindowAlpha;
+  final double averageTopPickCount;
   final String summary;
 }

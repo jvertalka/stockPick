@@ -145,7 +145,10 @@ class _DefaultRepository implements MarketIntelligenceRepository {
   Future<IntelligenceAppState> loadState() {
     final configuration = MarketDataConfiguration.fromEnvironment();
     final repository = switch (configuration.mode) {
-      MarketDataMode.fixtureOnly => ProviderMarketRepository.fixtureBacked(),
+      MarketDataMode.fixtureOnly => ProviderMarketRepository.fixtureBacked(
+        stockUniverseLimit: configuration.stockUniverseLimit,
+        historicalSnapshotLimit: configuration.historicalSnapshotLimit,
+      ),
       MarketDataMode.livePreferred || MarketDataMode.liveRequired =>
         ProviderMarketRepository.liveConfigured(configuration: configuration),
     };

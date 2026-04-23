@@ -1,5 +1,4 @@
-import 'dart:ui';
-
+import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -23,11 +22,30 @@ void main() {
 
     expect(find.text('Finance Oracle'), findsOneWidget);
     expect(find.text('Market Radar'), findsWidgets);
+    expect(find.textContaining('60 mean'), findsWidgets);
 
     await tester.tap(find.text('Opportunity Board').first);
     await tester.pumpAndSettle();
 
     expect(find.text('NVDA'), findsOneWidget);
+  });
+
+  testWidgets('surfaces plain-English guides for confusing finance terms', (
+    tester,
+  ) async {
+    await tester.binding.setSurfaceSize(const Size(1280, 960));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+
+    await tester.pumpWidget(const FinanceOracleApp());
+    await tester.pumpAndSettle();
+
+    expect(find.text('Plain-English guide'), findsOneWidget);
+
+    await tester.tap(find.text('Plain-English guide'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Market regime'), findsOneWidget);
+    expect(find.text('Alpha and drawdown'), findsOneWidget);
   });
 
   testWidgets('renders empty-state fallbacks for sparse live snapshots', (
@@ -41,6 +59,7 @@ void main() {
       snapshot: MarketIntelligenceSnapshot(
         asOf: baseState.snapshot.asOf,
         marketRadar: baseState.snapshot.marketRadar,
+        rankedUniverse: const [],
         opportunities: const [],
         sellAlerts: const [],
         scenarios: const [],
@@ -70,6 +89,31 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.text('No scenario outputs yet.'), findsOneWidget);
   });
+
+  testWidgets(
+    'supports workflow actions and surfaces them in the workflow hub',
+    (tester) async {
+      await tester.binding.setSurfaceSize(const Size(1280, 960));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+
+      await tester.pumpWidget(const FinanceOracleApp());
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.text('Opportunity Board').first);
+      await tester.pumpAndSettle();
+
+      await tester.ensureVisible(find.byType(FilterChip).first);
+      await tester.pumpAndSettle();
+      await tester.tap(find.byType(FilterChip).first);
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.text('Workflow Hub').first);
+      await tester.pumpAndSettle();
+
+      expect(find.textContaining('Added to watchlist'), findsOneWidget);
+      expect(find.text('Recent actions'), findsOneWidget);
+    },
+  );
 }
 
 class _StaticRepository implements MarketIntelligenceRepository {

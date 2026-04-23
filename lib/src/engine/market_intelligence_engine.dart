@@ -49,14 +49,13 @@ class MarketIntelligenceEngine {
               right.thesisDamageScore.compareTo(left.thesisDamageScore),
         );
 
-    final opportunities = scoredStocks
-        .take(6)
-        .map((item) => item.insight)
-        .toList();
+    final rankedUniverse = scoredStocks.map((item) => item.insight).toList();
+    final opportunities = rankedUniverse.take(6).toList();
 
     final snapshot = MarketIntelligenceSnapshot(
       asOf: state.asOf,
       marketRadar: _buildMarketRadar(state, regimeContext),
+      rankedUniverse: rankedUniverse,
       opportunities: opportunities,
       sellAlerts: sellAlerts,
       scenarios: _buildScenarios(scoredStocks, regimeContext),
@@ -407,6 +406,7 @@ class MarketIntelligenceEngine {
       metrics: [
         RadarMetric(
           label: 'Index trend',
+          numericValue: env.indexTrend,
           value: env.indexTrend.round().toString(),
           detail:
               'Major indexes remain supportive relative to their medium-term trend.',
@@ -414,6 +414,7 @@ class MarketIntelligenceEngine {
         ),
         RadarMetric(
           label: 'Realized volatility',
+          numericValue: env.realizedVolatility,
           value: env.realizedVolatility.round().toString(),
           detail:
               'Higher values mean realized swings are large enough to demand humility.',
@@ -423,6 +424,7 @@ class MarketIntelligenceEngine {
         ),
         RadarMetric(
           label: 'Credit pulse',
+          numericValue: 100 - env.creditStress,
           value: (100 - env.creditStress).round().toString(),
           detail:
               'Credit is still calm enough to avoid confirming broad stress.',
@@ -432,6 +434,7 @@ class MarketIntelligenceEngine {
         ),
         RadarMetric(
           label: 'Breadth health',
+          numericValue: breadthHealth,
           value: breadthHealth.round().toString(),
           detail:
               'Participation remains the key test for trusting the current tape.',
@@ -439,6 +442,7 @@ class MarketIntelligenceEngine {
         ),
         RadarMetric(
           label: 'Leadership quality',
+          numericValue: leadershipQuality,
           value: leadershipQuality.round().toString(),
           detail:
               'Leadership improves when dispersion and sector participation stay supportive.',
@@ -446,6 +450,7 @@ class MarketIntelligenceEngine {
         ),
         RadarMetric(
           label: 'Crowding risk',
+          numericValue: crowdingRisk,
           value: crowdingRisk.round().toString(),
           detail:
               'High values mean consensus positioning is rich enough to matter.',

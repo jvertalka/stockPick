@@ -1,4 +1,5 @@
 import '../engine/market_intelligence_engine.dart';
+import '../engine/market_metric_history_builder.dart';
 import '../engine/validation_engine.dart';
 import '../models/intelligence_app_state.dart';
 import 'live_market_feed_provider.dart';
@@ -6,6 +7,7 @@ import 'market_data_configuration.dart';
 import 'market_feed_provider.dart';
 import 'market_intelligence_repository.dart';
 import 'market_snapshot_archive.dart';
+import 'market_snapshot_archive_factory.dart';
 import 'raw_market_data.dart';
 
 class ProviderMarketRepository implements MarketIntelligenceRepository {
@@ -15,6 +17,7 @@ class ProviderMarketRepository implements MarketIntelligenceRepository {
     required SectorSignalProvider sectorSignalProvider,
     required StockSignalProvider stockSignalProvider,
     required ValidationWindowProvider validationWindowProvider,
+    required HistoricalMarketStateProvider historicalMarketStateProvider,
     MarketSnapshotArchive? archive,
     MarketIntelligenceEngine? engine,
     this.dataTitle = 'Provider-backed research repository',
@@ -38,7 +41,8 @@ class ProviderMarketRepository implements MarketIntelligenceRepository {
        _sectorSignalProvider = sectorSignalProvider,
        _stockSignalProvider = stockSignalProvider,
        _validationWindowProvider = validationWindowProvider,
-       _archive = archive ?? SharedPreferencesMarketSnapshotArchive(),
+       _historicalMarketStateProvider = historicalMarketStateProvider,
+       _archive = archive ?? createDefaultMarketSnapshotArchive(),
        _engine = engine ?? MarketIntelligenceEngine(),
        _validationEngine = ValidationEngine(
          engine: engine ?? MarketIntelligenceEngine(),
@@ -47,16 +51,28 @@ class ProviderMarketRepository implements MarketIntelligenceRepository {
   factory ProviderMarketRepository.fixtureBacked({
     MarketSnapshotArchive? archive,
     MarketIntelligenceEngine? engine,
+    int stockUniverseLimit = 40,
+    int historicalSnapshotLimit = 240,
   }) {
-    final provider = FixtureMarketFeedProvider();
+    final provider = FixtureMarketFeedProvider(
+      stockUniverseLimit: stockUniverseLimit,
+      historicalSnapshotLimit: historicalSnapshotLimit,
+    );
     return ProviderMarketRepository(
       marketEnvironmentProvider: provider,
       styleSignalProvider: provider,
       sectorSignalProvider: provider,
       stockSignalProvider: provider,
       validationWindowProvider: provider,
-      archive: archive,
+      historicalMarketStateProvider: provider,
+      archive:
+          archive ??
+          createDefaultMarketSnapshotArchive(
+            maxSnapshots: historicalSnapshotLimit,
+          ),
       engine: engine,
+      dataSummary:
+          'The app now runs through pluggable feed providers for market, style, sector, stock, and research windows. In fixture mode, the local archive is primed with research replay history so trend charts read from durable history instead of transient interpolation, and the screened universe expands beyond the original hand-picked sample.',
     );
   }
 
@@ -65,7 +81,10 @@ class ProviderMarketRepository implements MarketIntelligenceRepository {
     MarketSnapshotArchive? archive,
     MarketIntelligenceEngine? engine,
   }) {
-    final fixtureProvider = FixtureMarketFeedProvider();
+    final fixtureProvider = FixtureMarketFeedProvider(
+      stockUniverseLimit: configuration.stockUniverseLimit,
+      historicalSnapshotLimit: configuration.historicalSnapshotLimit,
+    );
     final liveProvider = LiveMarketFeedProvider(
       configuration: configuration,
       fallbackProvider: fixtureProvider,
@@ -113,7 +132,12 @@ class ProviderMarketRepository implements MarketIntelligenceRepository {
       sectorSignalProvider: liveProvider,
       stockSignalProvider: liveProvider,
       validationWindowProvider: liveProvider,
-      archive: archive,
+      historicalMarketStateProvider: liveProvider,
+      archive:
+          archive ??
+          createDefaultMarketSnapshotArchive(
+            maxSnapshots: configuration.historicalSnapshotLimit,
+          ),
       engine: engine,
       dataTitle: dataTitle,
       dataSummary: dataSummary,
@@ -133,6 +157,7 @@ class ProviderMarketRepository implements MarketIntelligenceRepository {
   final SectorSignalProvider _sectorSignalProvider;
   final StockSignalProvider _stockSignalProvider;
   final ValidationWindowProvider _validationWindowProvider;
+  final HistoricalMarketStateProvider _historicalMarketStateProvider;
   final MarketSnapshotArchive _archive;
   final MarketIntelligenceEngine _engine;
   final ValidationEngine _validationEngine;
@@ -152,6 +177,8 @@ class ProviderMarketRepository implements MarketIntelligenceRepository {
     final stockFeed = await _stockSignalProvider.loadStockSignals();
     final validationFeed = await _validationWindowProvider
         .loadValidationWindows();
+    final historicalFeed = await _historicalMarketStateProvider
+        .loadHistoricalMarketStates();
 
     final currentState = RawMarketState(
       asOf: _latestAsOf([
@@ -166,6 +193,16 @@ class ProviderMarketRepository implements MarketIntelligenceRepository {
       stocks: stockFeed.data,
     );
 
+    final historicalStates = historicalFeed.data
+        .where((state) => state.asOf.isBefore(currentState.asOf))
+        .toList();
+    if (historicalStates.isNotEmpty) {
+      await _archive.saveSnapshots(
+        historicalStates,
+        source: historicalFeed.source,
+      );
+    }
+
     final evaluation = _engine.evaluate(currentState);
     final sourceSummary = {
       environmentFeed.source,
@@ -175,31 +212,44 @@ class ProviderMarketRepository implements MarketIntelligenceRepository {
     }.join(', ');
     final archiveSummary = await _archive.saveSnapshot(
       currentState,
-      source: sourceSummary,
+      source: 'provider-current:$sourceSummary',
     );
     final validation = _validationEngine.validate(
       validationFeed.data,
       archivedSnapshotCount: archiveSummary.snapshotCount,
     );
-    final feeds = [
+    final archivedSnapshots = await _archive.loadSnapshots();
+    final snapshot = withHistoricalInsights(
+      snapshot: evaluation.snapshot,
+      historicalSnapshots: archivedSnapshots,
+      engine: _engine,
+    );
+    final feedStatuses = [
       environmentFeed,
       styleFeed,
       sectorFeed,
       stockFeed,
       validationFeed,
+      historicalFeed,
     ];
+    final adapterAvailability = _adapterAvailability(
+      feedStatuses.map((feed) => feed.availability),
+    );
+    final hydratedHistoryCount = historicalStates.length;
+    final runtimeSummary =
+        '$dataSummary The current run scored ${evaluation.scoredStocks.length} stocks and hydrated $hydratedHistoryCount historical market snapshots before archiving the latest state.';
 
     return IntelligenceAppState(
-      snapshot: evaluation.snapshot,
+      snapshot: snapshot,
       dataStatus: DataStatusReport(
         title: dataTitle,
-        summary: dataSummary,
+        summary: runtimeSummary,
         lastRefresh: syncTime,
         archiveSummary: archiveSummary.summaryText,
         archiveSnapshotCount: archiveSummary.snapshotCount,
         latestArchive: archiveSummary.latestSnapshotAsOf,
         feeds: [
-          ...feeds.map(
+          ...feedStatuses.map(
             (feed) => DataFeedStatus(
               name: feed.name,
               availability: feed.availability,
@@ -215,20 +265,21 @@ class ProviderMarketRepository implements MarketIntelligenceRepository {
                 : FeedAvailability.missing,
             refreshCadence: FeedRefreshCadence.onDemand,
             detail: archiveSummary.hasSnapshots
-                ? 'Snapshots from the provider-backed repository are being archived locally for future replay.'
+                ? 'Snapshots from the provider-backed repository are archived locally, and fixture mode primes that archive with research replay history so trends have durable local depth.'
                 : 'Archive wiring exists, but no provider-backed snapshots have been stored yet.',
             lastUpdated: archiveSummary.latestSnapshotAsOf,
           ),
           DataFeedStatus(
             name: 'Live vendor adapters',
-            availability: _adapterAvailability(feeds),
-            refreshCadence:
-                _adapterAvailability(feeds) == FeedAvailability.connected
+            availability: adapterAvailability,
+            refreshCadence: adapterAvailability == FeedAvailability.connected
                 ? FeedRefreshCadence.intraday
                 : FeedRefreshCadence.planned,
             detail:
-                'Provider contracts are ready for live vendors, but the current adapters are still fixture-backed.',
-            lastUpdated: _latestOptionalAsOf(feeds.map((feed) => feed.asOf)),
+                'Provider contracts now support both broader stock-universe requests and point-in-time historical feeds, even when the current run falls back to fixtures.',
+            lastUpdated: _latestOptionalAsOf(
+              feedStatuses.map((feed) => feed.asOf),
+            ),
           ),
         ],
       ),
@@ -249,16 +300,17 @@ class ProviderMarketRepository implements MarketIntelligenceRepository {
     return loadState();
   }
 
-  FeedAvailability _adapterAvailability(List<FeedSlice<Object>> feeds) {
-    if (feeds.every(
-      (feed) => feed.availability == FeedAvailability.connected,
-    )) {
+  FeedAvailability _adapterAvailability(
+    Iterable<FeedAvailability> availabilities,
+  ) {
+    final values = availabilities.toList();
+    if (values.every((availability) => availability == FeedAvailability.connected)) {
       return FeedAvailability.connected;
     }
-    if (feeds.any((feed) => feed.availability == FeedAvailability.fixture)) {
+    if (values.any((availability) => availability == FeedAvailability.fixture)) {
       return FeedAvailability.fixture;
     }
-    if (feeds.any((feed) => feed.availability == FeedAvailability.missing)) {
+    if (values.any((availability) => availability == FeedAvailability.missing)) {
       return FeedAvailability.missing;
     }
     return FeedAvailability.planned;

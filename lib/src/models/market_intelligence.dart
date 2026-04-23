@@ -78,6 +78,18 @@ extension AlertSeverityLabel on AlertSeverity {
 
 enum SignalTone { positive, caution, negative, neutral }
 
+enum HistoryProvenance { live, archived, researchReplay, mixed, missing }
+
+extension HistoryProvenanceLabel on HistoryProvenance {
+  String get label => switch (this) {
+    HistoryProvenance.live => 'Live',
+    HistoryProvenance.archived => 'Archived',
+    HistoryProvenance.researchReplay => 'Research replay',
+    HistoryProvenance.mixed => 'Mixed',
+    HistoryProvenance.missing => 'Missing',
+  };
+}
+
 enum ScenarioType {
   creditWidening,
   volatilityShock,
@@ -98,6 +110,7 @@ class MarketIntelligenceSnapshot {
   const MarketIntelligenceSnapshot({
     required this.asOf,
     required this.marketRadar,
+    required this.rankedUniverse,
     required this.opportunities,
     required this.sellAlerts,
     required this.scenarios,
@@ -105,18 +118,44 @@ class MarketIntelligenceSnapshot {
 
   final DateTime asOf;
   final MarketRadar marketRadar;
+  final List<StockInsight> rankedUniverse;
   final List<StockInsight> opportunities;
   final List<SellAlert> sellAlerts;
   final List<ScenarioOutcome> scenarios;
 
+  MarketIntelligenceSnapshot copyWith({
+    DateTime? asOf,
+    MarketRadar? marketRadar,
+    List<StockInsight>? rankedUniverse,
+    List<StockInsight>? opportunities,
+    List<SellAlert>? sellAlerts,
+    List<ScenarioOutcome>? scenarios,
+  }) {
+    return MarketIntelligenceSnapshot(
+      asOf: asOf ?? this.asOf,
+      marketRadar: marketRadar ?? this.marketRadar,
+      rankedUniverse: rankedUniverse ?? this.rankedUniverse,
+      opportunities: opportunities ?? this.opportunities,
+      sellAlerts: sellAlerts ?? this.sellAlerts,
+      scenarios: scenarios ?? this.scenarios,
+    );
+  }
+
   StockInsight stockByTicker(String ticker) {
-    return opportunities.firstWhere(
+    final stocks = rankedUniverse.isNotEmpty ? rankedUniverse : opportunities;
+    if (stocks.isEmpty) {
+      throw StateError('No ranked stocks are available.');
+    }
+    return stocks.firstWhere(
       (stock) => stock.ticker == ticker,
-      orElse: () => opportunities.first,
+      orElse: () => stocks.first,
     );
   }
 
   ScenarioOutcome scenarioByType(ScenarioType type) {
+    if (scenarios.isEmpty) {
+      throw StateError('No scenarios are available.');
+    }
     return scenarios.firstWhere(
       (scenario) => scenario.type == type,
       orElse: () => scenarios.first,
@@ -154,20 +193,99 @@ class MarketRadar {
   final List<SectorRotation> sectorRotation;
   final List<String> supportingSignals;
   final List<String> warnings;
+
+  MarketRadar copyWith({
+    MarketRegimeType? regime,
+    double? regimeConfidence,
+    double? marketScore,
+    double? riskScore,
+    InternalHealthType? internalHealth,
+    String? headline,
+    String? summary,
+    String? breadthSummary,
+    List<RadarMetric>? metrics,
+    List<StyleRotation>? styleRotation,
+    List<SectorRotation>? sectorRotation,
+    List<String>? supportingSignals,
+    List<String>? warnings,
+  }) {
+    return MarketRadar(
+      regime: regime ?? this.regime,
+      regimeConfidence: regimeConfidence ?? this.regimeConfidence,
+      marketScore: marketScore ?? this.marketScore,
+      riskScore: riskScore ?? this.riskScore,
+      internalHealth: internalHealth ?? this.internalHealth,
+      headline: headline ?? this.headline,
+      summary: summary ?? this.summary,
+      breadthSummary: breadthSummary ?? this.breadthSummary,
+      metrics: metrics ?? this.metrics,
+      styleRotation: styleRotation ?? this.styleRotation,
+      sectorRotation: sectorRotation ?? this.sectorRotation,
+      supportingSignals: supportingSignals ?? this.supportingSignals,
+      warnings: warnings ?? this.warnings,
+    );
+  }
+}
+
+class MetricTrend {
+  const MetricTrend({
+    required this.points,
+    required this.mean60,
+    required this.median60,
+    required this.lookbackCount,
+    required this.provenance,
+  });
+
+  final List<MetricTrendPoint> points;
+  final double mean60;
+  final double median60;
+  final int lookbackCount;
+  final HistoryProvenance provenance;
+
+  bool get hasHistory => points.length > 1;
+}
+
+class MetricTrendPoint {
+  const MetricTrendPoint({required this.asOf, required this.value});
+
+  final DateTime asOf;
+  final double value;
 }
 
 class RadarMetric {
   const RadarMetric({
     required this.label,
+    required this.numericValue,
     required this.value,
     required this.detail,
     required this.tone,
+    this.trend,
   });
 
   final String label;
+  final double numericValue;
   final String value;
   final String detail;
   final SignalTone tone;
+  final MetricTrend? trend;
+
+  RadarMetric copyWith({
+    String? label,
+    double? numericValue,
+    String? value,
+    String? detail,
+    SignalTone? tone,
+    MetricTrend? trend,
+  }) {
+    return RadarMetric(
+      label: label ?? this.label,
+      numericValue: numericValue ?? this.numericValue,
+      value: value ?? this.value,
+      detail: detail ?? this.detail,
+      tone: tone ?? this.tone,
+      trend: trend ?? this.trend,
+    );
+  }
 }
 
 class StyleRotation {
@@ -224,6 +342,10 @@ class StockInsight {
     required this.stabilitySummary,
     required this.optionsSignal,
     required this.peers,
+    this.opportunityTrend,
+    this.fragilityTrend,
+    this.regimeFitTrend,
+    this.convictionTrend,
   });
 
   final String ticker;
@@ -248,6 +370,10 @@ class StockInsight {
   final String stabilitySummary;
   final OptionsSignal optionsSignal;
   final List<PeerScore> peers;
+  final MetricTrend? opportunityTrend;
+  final MetricTrend? fragilityTrend;
+  final MetricTrend? regimeFitTrend;
+  final MetricTrend? convictionTrend;
 
   String get confidenceLabel {
     if (confidenceScore >= 80) {
@@ -257,6 +383,64 @@ class StockInsight {
       return 'Moderate confidence';
     }
     return 'Low confidence';
+  }
+
+  StockInsight copyWith({
+    String? ticker,
+    String? company,
+    String? sector,
+    String? industry,
+    RecommendationAction? action,
+    double? opportunityScore,
+    double? regimeFit,
+    double? trendQuality,
+    double? revisionTrend,
+    double? convictionScore,
+    double? fragilityScore,
+    double? asymmetryScore,
+    double? riskScore,
+    double? confidenceScore,
+    String? summary,
+    List<String>? whyItRanks,
+    List<String>? whatCouldGoWrong,
+    List<String>? invalidationSignals,
+    List<String>? recentChanges,
+    String? stabilitySummary,
+    OptionsSignal? optionsSignal,
+    List<PeerScore>? peers,
+    MetricTrend? opportunityTrend,
+    MetricTrend? fragilityTrend,
+    MetricTrend? regimeFitTrend,
+    MetricTrend? convictionTrend,
+  }) {
+    return StockInsight(
+      ticker: ticker ?? this.ticker,
+      company: company ?? this.company,
+      sector: sector ?? this.sector,
+      industry: industry ?? this.industry,
+      action: action ?? this.action,
+      opportunityScore: opportunityScore ?? this.opportunityScore,
+      regimeFit: regimeFit ?? this.regimeFit,
+      trendQuality: trendQuality ?? this.trendQuality,
+      revisionTrend: revisionTrend ?? this.revisionTrend,
+      convictionScore: convictionScore ?? this.convictionScore,
+      fragilityScore: fragilityScore ?? this.fragilityScore,
+      asymmetryScore: asymmetryScore ?? this.asymmetryScore,
+      riskScore: riskScore ?? this.riskScore,
+      confidenceScore: confidenceScore ?? this.confidenceScore,
+      summary: summary ?? this.summary,
+      whyItRanks: whyItRanks ?? this.whyItRanks,
+      whatCouldGoWrong: whatCouldGoWrong ?? this.whatCouldGoWrong,
+      invalidationSignals: invalidationSignals ?? this.invalidationSignals,
+      recentChanges: recentChanges ?? this.recentChanges,
+      stabilitySummary: stabilitySummary ?? this.stabilitySummary,
+      optionsSignal: optionsSignal ?? this.optionsSignal,
+      peers: peers ?? this.peers,
+      opportunityTrend: opportunityTrend ?? this.opportunityTrend,
+      fragilityTrend: fragilityTrend ?? this.fragilityTrend,
+      regimeFitTrend: regimeFitTrend ?? this.regimeFitTrend,
+      convictionTrend: convictionTrend ?? this.convictionTrend,
+    );
   }
 }
 
@@ -325,6 +509,8 @@ class ScenarioOutcome {
     required this.favoredExposures,
     required this.vulnerableExposures,
     required this.stockImpacts,
+    this.sensitivityScore = 0,
+    this.sensitivityTrend,
   });
 
   final ScenarioType type;
@@ -334,6 +520,32 @@ class ScenarioOutcome {
   final List<String> favoredExposures;
   final List<String> vulnerableExposures;
   final List<ScenarioStockImpact> stockImpacts;
+  final double sensitivityScore;
+  final MetricTrend? sensitivityTrend;
+
+  ScenarioOutcome copyWith({
+    ScenarioType? type,
+    String? title,
+    String? description,
+    String? regimeImpact,
+    List<String>? favoredExposures,
+    List<String>? vulnerableExposures,
+    List<ScenarioStockImpact>? stockImpacts,
+    double? sensitivityScore,
+    MetricTrend? sensitivityTrend,
+  }) {
+    return ScenarioOutcome(
+      type: type ?? this.type,
+      title: title ?? this.title,
+      description: description ?? this.description,
+      regimeImpact: regimeImpact ?? this.regimeImpact,
+      favoredExposures: favoredExposures ?? this.favoredExposures,
+      vulnerableExposures: vulnerableExposures ?? this.vulnerableExposures,
+      stockImpacts: stockImpacts ?? this.stockImpacts,
+      sensitivityScore: sensitivityScore ?? this.sensitivityScore,
+      sensitivityTrend: sensitivityTrend ?? this.sensitivityTrend,
+    );
+  }
 }
 
 class ScenarioStockImpact {

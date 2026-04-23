@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../../models/market_intelligence.dart';
+import '../../models/workflow_models.dart';
 import '../../theme/app_theme.dart';
 import '../widgets/insight_widgets.dart';
 
@@ -8,16 +9,29 @@ class OpportunityBoardView extends StatelessWidget {
   const OpportunityBoardView({
     super.key,
     required this.stocks,
+    required this.highlightedTickers,
+    required this.workflowState,
     required this.onOpenStock,
+    required this.onToggleWatchlist,
+    required this.onToggleSavedIdea,
+    required this.onToggleAlertSubscription,
   });
 
   final List<StockInsight> stocks;
+  final Set<String> highlightedTickers;
+  final WorkflowState workflowState;
   final ValueChanged<String> onOpenStock;
+  final ValueChanged<String> onToggleWatchlist;
+  final ValueChanged<String> onToggleSavedIdea;
+  final ValueChanged<String> onToggleAlertSubscription;
 
   @override
   Widget build(BuildContext context) {
     final hasStocks = stocks.isNotEmpty;
     final topIdeas = stocks.take(3).map((stock) => stock.ticker).join(' | ');
+    final boardLabel = hasStocks
+        ? '${stocks.length} ranked names | top: $topIdeas'
+        : 'Awaiting ranked stocks';
 
     return SingleChildScrollView(
       padding: const EdgeInsets.fromLTRB(24, 18, 24, 28),
@@ -30,10 +44,16 @@ class OpportunityBoardView extends StatelessWidget {
             subtitle:
                 'Each name is ranked inside the current market regime, then stress-tested for crowding, fragility, and thesis invalidation.',
             trailing: TonePill(
-              label: hasStocks ? 'Top board: $topIdeas' : 'Awaiting ranked stocks',
+              label: boardLabel,
               tone: hasStocks ? SignalTone.positive : SignalTone.neutral,
             ),
           ),
+          const PlainEnglishGuideCard(
+            summary:
+                'This board is less about predicting the future perfectly and more about comparing which setups look strongest right now after adjusting for market conditions.',
+            entries: _opportunityBoardGuideEntries,
+          ),
+          const SizedBox(height: 18),
           if (!hasStocks)
             const EmptyStateCard(
               icon: Icons.query_stats_rounded,
@@ -64,7 +84,13 @@ class OpportunityBoardView extends StatelessWidget {
                 padding: const EdgeInsets.only(bottom: 16),
                 child: _OpportunityCard(
                   stock: stock,
+                  isHighlighted: highlightedTickers.contains(stock.ticker),
+                  workflowState: workflowState,
                   onOpen: () => onOpenStock(stock.ticker),
+                  onToggleWatchlist: () => onToggleWatchlist(stock.ticker),
+                  onToggleSavedIdea: () => onToggleSavedIdea(stock.ticker),
+                  onToggleAlertSubscription: () =>
+                      onToggleAlertSubscription(stock.ticker),
                 ),
               ),
             ),
@@ -76,13 +102,31 @@ class OpportunityBoardView extends StatelessWidget {
 }
 
 class _OpportunityCard extends StatelessWidget {
-  const _OpportunityCard({required this.stock, required this.onOpen});
+  const _OpportunityCard({
+    required this.stock,
+    required this.isHighlighted,
+    required this.workflowState,
+    required this.onOpen,
+    required this.onToggleWatchlist,
+    required this.onToggleSavedIdea,
+    required this.onToggleAlertSubscription,
+  });
 
   final StockInsight stock;
+  final bool isHighlighted;
+  final WorkflowState workflowState;
   final VoidCallback onOpen;
+  final VoidCallback onToggleWatchlist;
+  final VoidCallback onToggleSavedIdea;
+  final VoidCallback onToggleAlertSubscription;
 
   @override
   Widget build(BuildContext context) {
+    final isWatched = workflowState.watchlistTickers.contains(stock.ticker);
+    final isSaved = workflowState.savedIdeas.contains(stock.ticker);
+    final isSubscribed = workflowState.alertSubscriptions.contains(
+      stock.ticker,
+    );
     return InkWell(
       borderRadius: BorderRadius.circular(28),
       onTap: onOpen,
@@ -108,6 +152,13 @@ class _OpportunityCard extends StatelessWidget {
                                     ?.copyWith(fontSize: 34),
                               ),
                               const SizedBox(width: 12),
+                              if (isHighlighted) ...[
+                                const TonePill(
+                                  label: 'Top surface',
+                                  tone: SignalTone.positive,
+                                ),
+                                const SizedBox(width: 12),
+                              ],
                               ActionBadge(action: stock.action),
                             ],
                           ),
@@ -158,6 +209,8 @@ class _OpportunityCard extends StatelessWidget {
                         label: 'Regime fit',
                         value: stock.regimeFit,
                         color: AppTheme.sky,
+                        definition:
+                            'How well this stock matches the kind of market we are in right now.',
                       ),
                     ),
                     SizedBox(
@@ -166,6 +219,8 @@ class _OpportunityCard extends StatelessWidget {
                         label: 'Trend quality',
                         value: stock.trendQuality,
                         color: AppTheme.mint,
+                        definition:
+                            'Whether the price trend looks healthy and supported, not just whether the stock has gone up lately.',
                       ),
                     ),
                     SizedBox(
@@ -174,6 +229,8 @@ class _OpportunityCard extends StatelessWidget {
                         label: 'Revision trend',
                         value: stock.revisionTrend,
                         color: AppTheme.amber,
+                        definition:
+                            'Whether earnings and business expectations are improving or drifting lower.',
                       ),
                     ),
                     SizedBox(
@@ -182,7 +239,49 @@ class _OpportunityCard extends StatelessWidget {
                         label: 'Fragility',
                         value: stock.fragilityScore,
                         color: AppTheme.coral,
+                        definition:
+                            'How easily this thesis could crack if sentiment, options positioning, or price behavior turns against it.',
                       ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 20),
+                Wrap(
+                  spacing: 10,
+                  runSpacing: 10,
+                  children: [
+                    FilterChip(
+                      selected: isWatched,
+                      label: const Text('Watchlist'),
+                      avatar: Icon(
+                        isWatched
+                            ? Icons.star_rounded
+                            : Icons.star_border_rounded,
+                        size: 18,
+                      ),
+                      onSelected: (_) => onToggleWatchlist(),
+                    ),
+                    FilterChip(
+                      selected: isSaved,
+                      label: const Text('Save idea'),
+                      avatar: Icon(
+                        isSaved
+                            ? Icons.bookmark_rounded
+                            : Icons.bookmark_border_rounded,
+                        size: 18,
+                      ),
+                      onSelected: (_) => onToggleSavedIdea(),
+                    ),
+                    FilterChip(
+                      selected: isSubscribed,
+                      label: const Text('Sell alerts'),
+                      avatar: Icon(
+                        isSubscribed
+                            ? Icons.notifications_active_rounded
+                            : Icons.notifications_none_rounded,
+                        size: 18,
+                      ),
+                      onSelected: (_) => onToggleAlertSubscription(),
                     ),
                   ],
                 ),
@@ -238,6 +337,39 @@ class _OpportunityCard extends StatelessWidget {
     );
   }
 }
+
+const _opportunityBoardGuideEntries = [
+  GuideEntry(
+    term: 'Opportunity score',
+    definition:
+        'The app’s overall read on how attractive a setup looks right now after blending upside, quality, regime fit, and downside risk.',
+  ),
+  GuideEntry(
+    term: 'Regime fit',
+    definition:
+        'A stock can be good in general but still be a poor fit for the current market. This asks whether the setup matches today’s environment.',
+  ),
+  GuideEntry(
+    term: 'Trend quality',
+    definition:
+        'This looks at how healthy the move is. Strong trend quality means the price action has support instead of feeling thin or forced.',
+  ),
+  GuideEntry(
+    term: 'Revision trend',
+    definition:
+        'This is the direction of analyst and business expectations. Improving revisions usually help a thesis stay alive.',
+  ),
+  GuideEntry(
+    term: 'Fragility',
+    definition:
+        'Fragility is the “how easily could this break?” score. Higher fragility means less room for error.',
+  ),
+  GuideEntry(
+    term: 'Why it ranks vs what could go wrong',
+    definition:
+        'The left column summarizes the evidence supporting the setup. The right column highlights the most likely ways the story could disappoint.',
+  ),
+];
 
 class _BulletSection extends StatelessWidget {
   const _BulletSection({

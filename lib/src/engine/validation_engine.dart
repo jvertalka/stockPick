@@ -41,11 +41,19 @@ class ValidationEngine {
       archivedSnapshotCount: archivedSnapshotCount,
       minimumShadowSnapshots: minimumShadowSnapshots,
     );
+    final calibrationBands = _buildCalibrationBands(evaluatedWindows);
+    final integrity = _buildIntegrityReport(
+      orderedWindows: orderedWindows,
+      trainWindows: trainWindows,
+      testWindows: testWindows,
+    );
+    final robustness = _buildRobustnessReport(evaluatedWindows);
 
     final verdict = _overallVerdict(
       trainSplit: trainSplit,
       testSplit: testSplit,
       shadowMode: shadowMode,
+      integrity: integrity,
     );
 
     return ValidationReport(
@@ -61,6 +69,11 @@ class ValidationEngine {
       testSplit: testSplit,
       windows: evaluatedWindows.map((window) => window.report).toList(),
       shadowMode: shadowMode,
+      coverageStart: orderedWindows.isEmpty ? null : orderedWindows.first.asOf,
+      coverageEnd: orderedWindows.isEmpty ? null : orderedWindows.last.asOf,
+      calibrationBands: calibrationBands,
+      integrity: integrity,
+      robustness: robustness,
       verdict: verdict,
     );
   }
@@ -70,6 +83,7 @@ class ValidationEngine {
     final outcomeMap = {
       for (final outcome in window.outcomes) outcome.ticker: outcome,
     };
+    final allObservations = <_ScoreOutcomeObservation>[];
     final allScores = <double>[];
     final allAlpha = <double>[];
     final topPickAlpha = <double>[];
@@ -81,8 +95,15 @@ class ValidationEngine {
       if (outcome == null) {
         continue;
       }
+      final alpha = outcome.forwardReturn20d - outcome.sectorReturn20d;
       allScores.add(scored.insight.opportunityScore);
-      allAlpha.add(outcome.forwardReturn20d - outcome.sectorReturn20d);
+      allAlpha.add(alpha);
+      allObservations.add(
+        _ScoreOutcomeObservation(
+          score: scored.insight.opportunityScore,
+          alpha: alpha,
+        ),
+      );
     }
 
     final ranked =
@@ -134,6 +155,7 @@ class ValidationEngine {
         worstDrawdown: worstDrawdown,
         topPicks: picks,
       ),
+      allObservations: allObservations,
       allScores: allScores,
       allAlpha: allAlpha,
       topPickAlpha: topPickAlpha,
@@ -220,7 +242,11 @@ class ValidationEngine {
     required ValidationSplitReport trainSplit,
     required ValidationSplitReport testSplit,
     required ShadowModeReport shadowMode,
+    required ResearchIntegrityReport integrity,
   }) {
+    if (!integrity.overallPassed) {
+      return 'The research diagnostics now expose useful structure, but the chronology and holdout checks are not yet strong enough for production confidence.';
+    }
     if (testSplit.windowCount == 0) {
       return 'The research harness now has train-style diagnostics, but there is still no meaningful holdout yet.';
     }
@@ -232,6 +258,132 @@ class ValidationEngine {
           : 'The rules engine looks directionally constructive on the current holdout, but archive depth and live feeds are still too thin for real shadow mode.';
     }
     return 'The research harness is now exposing the right train/test questions, but the current evidence is still too thin for production confidence.';
+  }
+
+  List<CalibrationBandReport> _buildCalibrationBands(
+    List<_WindowEvaluation> windows,
+  ) {
+    final observations = windows
+        .expand((window) => window.allObservations)
+        .toList();
+
+    return [
+      _bandReport('High score', observations.where((item) => item.score >= 75)),
+      _bandReport(
+        'Middle score',
+        observations.where((item) => item.score >= 60 && item.score < 75),
+      ),
+      _bandReport('Low score', observations.where((item) => item.score < 60)),
+    ];
+  }
+
+  CalibrationBandReport _bandReport(
+    String label,
+    Iterable<_ScoreOutcomeObservation> items,
+  ) {
+    final observations = items.toList();
+    final hitRate = observations.isEmpty
+        ? 0.0
+        : observations.where((item) => item.alpha > 0).length /
+              observations.length *
+              100;
+    return CalibrationBandReport(
+      label: label,
+      observationCount: observations.length,
+      hitRate: hitRate,
+      averageAlpha: _average(observations.map((item) => item.alpha).toList()),
+      averageScore: _average(observations.map((item) => item.score).toList()),
+    );
+  }
+
+  ResearchIntegrityReport _buildIntegrityReport({
+    required List<ValidationWindow> orderedWindows,
+    required List<_WindowEvaluation> trainWindows,
+    required List<_WindowEvaluation> testWindows,
+  }) {
+    final dates = orderedWindows.map((window) => window.asOf).toList();
+    final strictlyOrdered = _isStrictlyIncreasing(dates);
+    final uniqueDates =
+        dates.map((date) => date.toIso8601String()).toSet().length ==
+        dates.length;
+    final chronologicalSplit =
+        trainWindows.isEmpty ||
+        testWindows.isEmpty ||
+        trainWindows.last.report.asOf.isBefore(testWindows.first.report.asOf);
+    final holdoutDepth = testWindows.length >= 2;
+
+    final checks = [
+      ResearchIntegrityCheck(
+        label: 'Chronological ordering',
+        passed: strictlyOrdered,
+        detail: strictlyOrdered
+            ? 'Validation windows are strictly increasing in time.'
+            : 'At least one validation window is out of chronological order.',
+      ),
+      ResearchIntegrityCheck(
+        label: 'Unique as-of dates',
+        passed: uniqueDates,
+        detail: uniqueDates
+            ? 'No duplicate validation dates were detected.'
+            : 'Duplicate validation dates were detected, which can leak repeated evidence.',
+      ),
+      ResearchIntegrityCheck(
+        label: 'Train/test separation',
+        passed: chronologicalSplit,
+        detail: chronologicalSplit
+            ? 'The train split finishes before the holdout starts.'
+            : 'Train and holdout windows overlap in time.',
+      ),
+      ResearchIntegrityCheck(
+        label: 'Holdout depth',
+        passed: holdoutDepth,
+        detail: holdoutDepth
+            ? 'The holdout contains at least two windows.'
+            : 'The holdout is still only one window deep, so results remain fragile.',
+      ),
+    ];
+
+    final overallPassed = checks.every((check) => check.passed);
+    final summary = overallPassed
+        ? 'Chronology, duplicate-date, and holdout-boundary checks passed.'
+        : 'At least one integrity guard failed, so the research output should stay exploratory.';
+    return ResearchIntegrityReport(
+      summary: summary,
+      overallPassed: overallPassed,
+      checks: checks,
+    );
+  }
+
+  RobustnessReport _buildRobustnessReport(List<_WindowEvaluation> windows) {
+    final scoredWindows = windows
+        .where((window) => window.report.topPickCount > 0)
+        .toList();
+    final windowAlpha = scoredWindows
+        .map((window) => window.report.averageAlpha)
+        .toList();
+    final positiveWindowRate = windowAlpha.isEmpty
+        ? 0.0
+        : windowAlpha.where((value) => value > 0).length /
+              windowAlpha.length *
+              100;
+    final averageTopPickCount = scoredWindows.isEmpty
+        ? 0.0
+        : _average(
+            scoredWindows
+                .map((window) => window.report.topPickCount.toDouble())
+                .toList(),
+          );
+    final summary = positiveWindowRate >= 60
+        ? 'Window-level results are more often positive than negative, though the sample is still thin.'
+        : 'Window-level results are still inconsistent, so the stack needs more evidence before it earns trust.';
+
+    return RobustnessReport(
+      positiveWindowRate: positiveWindowRate,
+      medianWindowAlpha: _median(windowAlpha),
+      worstWindowAlpha: _minimum(windowAlpha),
+      averageTopPickCount: averageTopPickCount,
+      summary: summary,
+    );
   }
 
   _AggregateMetrics _aggregate(List<_WindowEvaluation> windows) {
@@ -313,11 +465,33 @@ class ValidationEngine {
     }
     return numerator / denominator;
   }
+
+  double _median(List<double> values) {
+    if (values.isEmpty) {
+      return 0.0;
+    }
+    final ordered = [...values]..sort();
+    final middle = ordered.length ~/ 2;
+    if (ordered.length.isOdd) {
+      return ordered[middle];
+    }
+    return (ordered[middle - 1] + ordered[middle]) / 2;
+  }
+
+  bool _isStrictlyIncreasing(List<DateTime> values) {
+    for (var index = 1; index < values.length; index++) {
+      if (!values[index].isAfter(values[index - 1])) {
+        return false;
+      }
+    }
+    return true;
+  }
 }
 
 class _WindowEvaluation {
   const _WindowEvaluation({
     required this.report,
+    required this.allObservations,
     required this.allScores,
     required this.allAlpha,
     required this.topPickAlpha,
@@ -326,11 +500,19 @@ class _WindowEvaluation {
   });
 
   final ValidationWindowReport report;
+  final List<_ScoreOutcomeObservation> allObservations;
   final List<double> allScores;
   final List<double> allAlpha;
   final List<double> topPickAlpha;
   final List<double> topPickReturns;
   final List<double> topPickDrawdowns;
+}
+
+class _ScoreOutcomeObservation {
+  const _ScoreOutcomeObservation({required this.score, required this.alpha});
+
+  final double score;
+  final double alpha;
 }
 
 class _AggregateMetrics {

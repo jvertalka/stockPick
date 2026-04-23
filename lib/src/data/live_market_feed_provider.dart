@@ -13,7 +13,8 @@ class LiveMarketFeedProvider
         StyleSignalProvider,
         SectorSignalProvider,
         StockSignalProvider,
-        ValidationWindowProvider {
+        ValidationWindowProvider,
+        HistoricalMarketStateProvider {
   LiveMarketFeedProvider({
     required MarketDataConfiguration configuration,
     required FixtureMarketFeedProvider fallbackProvider,
@@ -73,6 +74,9 @@ class LiveMarketFeedProvider
   Future<FeedSlice<List<RawStockSignal>>> loadStockSignals() {
     return _loadFeed(
       path: '/market/stocks',
+      queryParameters: {
+        'limit': _configuration.stockUniverseLimit.toString(),
+      },
       feedName: 'Stock, revisions, and options signals',
       refreshCadence: FeedRefreshCadence.daily,
       parser: (data) => (data as List<dynamic>)
@@ -101,6 +105,24 @@ class LiveMarketFeedProvider
     );
   }
 
+  @override
+  Future<FeedSlice<List<RawMarketState>>> loadHistoricalMarketStates() {
+    return _loadFeed(
+      path: '/market/history',
+      queryParameters: {
+        'limit': _configuration.historicalSnapshotLimit.toString(),
+      },
+      feedName: 'Historical market states',
+      refreshCadence: FeedRefreshCadence.daily,
+      parser: (data) => (data as List<dynamic>)
+          .map((item) => RawMarketState.fromJson(item as Map<String, dynamic>))
+          .toList(),
+      fallbackLoader: _fallbackProvider.loadHistoricalMarketStates,
+      successDetail:
+          'Connected historical market snapshots are available for point-in-time charting and archive hydration.',
+    );
+  }
+
   Future<FeedSlice<T>> _loadFeed<T>({
     required String path,
     required String feedName,
@@ -108,6 +130,7 @@ class LiveMarketFeedProvider
     required T Function(Object? data) parser,
     required Future<FeedSlice<T>> Function() fallbackLoader,
     required String successDetail,
+    Map<String, String>? queryParameters,
   }) async {
     if (!_configuration.hasBaseUrl) {
       return _resolveFallback(
@@ -117,7 +140,15 @@ class LiveMarketFeedProvider
       );
     }
 
-    final uri = Uri.parse(_configuration.baseUrl!).resolve(path);
+    final baseUri = Uri.parse(_configuration.baseUrl!).resolve(path);
+    final uri = queryParameters == null || queryParameters.isEmpty
+        ? baseUri
+        : baseUri.replace(
+            queryParameters: {
+              ...baseUri.queryParameters,
+              ...queryParameters,
+            },
+          );
     try {
       final response = await _client.get(uri, headers: _headers());
       if (response.statusCode < 200 || response.statusCode >= 300) {

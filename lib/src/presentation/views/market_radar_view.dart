@@ -49,6 +49,18 @@ class MarketRadarView extends StatelessWidget {
                   tone: SignalTone.positive,
                 ),
               ),
+              const PlainEnglishGuideCard(
+                summary:
+                    'Use this screen to answer three simple questions: what kind of market are we in, how broad is the strength, and how trustworthy is the data behind the read?',
+                entries: _marketRadarGuideEntries,
+              ),
+              const SizedBox(height: 18),
+              const HowThisIsCalculatedCard(
+                summary:
+                    'The radar is a rules-based summary of market internals, not a black box. These are the main ingredients and how to read them.',
+                entries: _marketRadarCalculationEntries,
+              ),
+              const SizedBox(height: 18),
               InsightCard(
                 child: heroWide
                     ? Row(
@@ -84,6 +96,8 @@ class MarketRadarView extends StatelessWidget {
                           value: metric.value,
                           detail: metric.detail,
                           tone: metric.tone,
+                          definition: _metricDefinition(metric.label),
+                          trend: metric.trend,
                         ),
                       ),
                     )
@@ -291,6 +305,12 @@ class MarketRadarView extends StatelessWidget {
                           ),
                           const SizedBox(height: 16),
                           LabelValueRow(
+                            label: 'Research coverage',
+                            value:
+                                '${engineStatus.validationReport.coverageStart == null ? 'N/A' : formatAsOf(engineStatus.validationReport.coverageStart!)} - ${engineStatus.validationReport.coverageEnd == null ? 'N/A' : formatAsOf(engineStatus.validationReport.coverageEnd!)}',
+                            highlight: AppTheme.sky,
+                          ),
+                          LabelValueRow(
                             label: 'Training status',
                             value: engineStatus.isTrained
                                 ? 'Trained'
@@ -304,40 +324,118 @@ class MarketRadarView extends StatelessWidget {
                             value:
                                 '${engineStatus.validationReport.windowCount}',
                             highlight: AppTheme.sky,
+                            definition:
+                                'A validation window is one historical snapshot where the engine made picks and we later checked how those picks actually behaved.',
                           ),
                           LabelValueRow(
                             label: 'Observations',
                             value:
                                 '${engineStatus.validationReport.observationCount}',
                             highlight: AppTheme.sky,
+                            definition:
+                                'Observations are the individual stock outcomes the app used to judge whether its scores were directionally useful.',
                           ),
                           LabelValueRow(
                             label: 'Top picks scored',
                             value:
                                 '${engineStatus.validationReport.topPickCount}',
                             highlight: AppTheme.sky,
+                            definition:
+                                'This counts how many of the engine’s highest-ranked ideas were later measured against real outcomes.',
                           ),
                           LabelValueRow(
                             label: 'Top-pick hit rate',
                             value:
                                 '${engineStatus.validationReport.hitRate.toStringAsFixed(0)}%',
                             highlight: AppTheme.mint,
+                            definition:
+                                'Hit rate is the share of top-ranked ideas that went on to outperform their sector after the snapshot date.',
                           ),
                           LabelValueRow(
                             label: 'Average alpha',
                             value:
                                 '${engineStatus.validationReport.averageAlpha.toStringAsFixed(1)}%',
                             highlight: AppTheme.mint,
+                            definition:
+                                'Alpha is how much the picks beat or lagged their sector, not just whether they went up on their own.',
                           ),
                           LabelValueRow(
                             label: 'Worst drawdown',
                             value:
                                 '${engineStatus.validationReport.worstDrawdown.toStringAsFixed(1)}%',
                             highlight: AppTheme.coral,
+                            definition:
+                                'Drawdown is the worst drop after the signal. It shows how painful the ride got before the trade either worked or failed.',
                           ),
                           const SizedBox(height: 14),
                           Text(
                             engineStatus.validationReport.verdict,
+                            style: Theme.of(context).textTheme.bodySmall,
+                          ),
+                          const SizedBox(height: 14),
+                          Text(
+                            'Calibration bands',
+                            style: Theme.of(context).textTheme.titleLarge,
+                          ),
+                          const SizedBox(height: 10),
+                          ...engineStatus.validationReport.calibrationBands.map(
+                            (band) => Padding(
+                              padding: const EdgeInsets.only(bottom: 10),
+                              child: _CalibrationBandRow(band: band),
+                            ),
+                          ),
+                          const SizedBox(height: 10),
+                          Text(
+                            'Research integrity',
+                            style: Theme.of(context).textTheme.titleLarge,
+                          ),
+                          const SizedBox(height: 10),
+                          Text(
+                            engineStatus.validationReport.integrity.summary,
+                            style: Theme.of(context).textTheme.bodySmall,
+                          ),
+                          const SizedBox(height: 10),
+                          ...engineStatus.validationReport.integrity.checks.map(
+                            (check) => Padding(
+                              padding: const EdgeInsets.only(bottom: 10),
+                              child: _IntegrityCheckRow(check: check),
+                            ),
+                          ),
+                          const SizedBox(height: 10),
+                          Text(
+                            'Robustness',
+                            style: Theme.of(context).textTheme.titleLarge,
+                          ),
+                          const SizedBox(height: 10),
+                          LabelValueRow(
+                            label: 'Positive windows',
+                            value:
+                                '${engineStatus.validationReport.robustness.positiveWindowRate.toStringAsFixed(0)}%',
+                            highlight: AppTheme.mint,
+                          ),
+                          LabelValueRow(
+                            label: 'Median window alpha',
+                            value:
+                                '${engineStatus.validationReport.robustness.medianWindowAlpha.toStringAsFixed(1)}%',
+                            highlight: AppTheme.sky,
+                          ),
+                          LabelValueRow(
+                            label: 'Worst window alpha',
+                            value:
+                                '${engineStatus.validationReport.robustness.worstWindowAlpha.toStringAsFixed(1)}%',
+                            highlight: AppTheme.coral,
+                          ),
+                          LabelValueRow(
+                            label: 'Average top-pick count',
+                            value: engineStatus
+                                .validationReport
+                                .robustness
+                                .averageTopPickCount
+                                .toStringAsFixed(1),
+                            highlight: AppTheme.amber,
+                          ),
+                          Text(
+                            engineStatus.validationReport.robustness.summary,
                             style: Theme.of(context).textTheme.bodySmall,
                           ),
                           const SizedBox(height: 14),
@@ -367,6 +465,8 @@ class MarketRadarView extends StatelessWidget {
                                 engineStatus.validationReport.shadowMode.isReady
                                 ? AppTheme.mint
                                 : AppTheme.amber,
+                            definition:
+                                'Shadow readiness is a progress check for whether the app has stored enough snapshots to quietly track live calls before trusting them.',
                           ),
                           Text(
                             engineStatus.validationReport.shadowMode.summary,
@@ -468,6 +568,8 @@ class _ScoreStack extends StatelessWidget {
           value: radar.marketScore,
           detail: 'How favorable the present environment is for taking risk.',
           color: AppTheme.mint,
+          definition:
+              'Think of this as the market weather score. Higher means the overall backdrop is more supportive for taking risk.',
         ),
         const SizedBox(height: 14),
         ScoreBar(
@@ -475,6 +577,8 @@ class _ScoreStack extends StatelessWidget {
           value: radar.riskScore,
           detail: 'Higher means the environment is demanding more humility.',
           color: AppTheme.amber,
+          definition:
+              'This is the stress meter. Higher means the market is less forgiving and mistakes can get punished faster.',
         ),
         const SizedBox(height: 14),
         ScoreBar(
@@ -482,6 +586,8 @@ class _ScoreStack extends StatelessWidget {
           value: radar.regimeConfidence,
           detail: radar.breadthSummary,
           color: AppTheme.sky,
+          definition:
+              'This measures how strongly the evidence agrees on the current market regime instead of giving a mixed signal.',
         ),
       ],
     );
@@ -527,24 +633,120 @@ class _SplitSummaryCard extends StatelessWidget {
             label: 'Observations',
             value: '${split.observationCount}',
             highlight: AppTheme.sky,
+            definition:
+                'Observations are the individual stock results used to judge whether the scoring method had any real separation power.',
           ),
           LabelValueRow(
             label: 'Top-pick hit rate',
             value: '${split.hitRate.toStringAsFixed(0)}%',
             highlight: split.hitRate >= 60 ? AppTheme.mint : AppTheme.amber,
+            definition:
+                'This is the share of the split’s top ideas that outperformed their sector.',
           ),
           LabelValueRow(
             label: 'Average alpha',
             value: '${split.averageAlpha.toStringAsFixed(1)}%',
             highlight: split.averageAlpha >= 0 ? AppTheme.mint : AppTheme.coral,
+            definition:
+                'Alpha shows whether the picks beat their sector on average, not just whether the whole market was rising.',
           ),
           LabelValueRow(
             label: 'Worst drawdown',
             value: '${split.worstDrawdown.toStringAsFixed(1)}%',
             highlight: AppTheme.coral,
+            definition:
+                'The deepest drop the picks experienced during that split before recovering or failing.',
           ),
           const SizedBox(height: 10),
           Text(split.verdict, style: Theme.of(context).textTheme.bodySmall),
+        ],
+      ),
+    );
+  }
+}
+
+class _CalibrationBandRow extends StatelessWidget {
+  const _CalibrationBandRow({required this.band});
+
+  final CalibrationBandReport band;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: Colors.white.withValues(alpha: 0.03),
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(color: Colors.white.withValues(alpha: 0.08)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              TonePill(label: band.label, tone: SignalTone.neutral),
+              const SizedBox(width: 10),
+              Text(
+                '${band.observationCount} obs',
+                style: Theme.of(context).textTheme.bodySmall,
+              ),
+            ],
+          ),
+          const SizedBox(height: 10),
+          LabelValueRow(
+            label: 'Hit rate',
+            value: '${band.hitRate.toStringAsFixed(0)}%',
+            highlight: band.hitRate >= 55 ? AppTheme.mint : AppTheme.amber,
+          ),
+          LabelValueRow(
+            label: 'Average alpha',
+            value: '${band.averageAlpha.toStringAsFixed(1)}%',
+            highlight: band.averageAlpha >= 0 ? AppTheme.mint : AppTheme.coral,
+          ),
+          LabelValueRow(
+            label: 'Average score',
+            value: band.averageScore.toStringAsFixed(1),
+            highlight: AppTheme.sky,
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _IntegrityCheckRow extends StatelessWidget {
+  const _IntegrityCheckRow({required this.check});
+
+  final ResearchIntegrityCheck check;
+
+  @override
+  Widget build(BuildContext context) {
+    final tone = check.passed ? SignalTone.positive : SignalTone.caution;
+    return Container(
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: Colors.white.withValues(alpha: 0.03),
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(color: Colors.white.withValues(alpha: 0.08)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              TonePill(label: check.label, tone: tone),
+              const SizedBox(width: 10),
+              Icon(
+                check.passed
+                    ? Icons.verified_rounded
+                    : Icons.error_outline_rounded,
+                size: 18,
+                color: check.passed ? AppTheme.mint : AppTheme.amber,
+              ),
+            ],
+          ),
+          const SizedBox(height: 10),
+          Text(check.detail, style: Theme.of(context).textTheme.bodySmall),
         ],
       ),
     );
@@ -593,6 +795,8 @@ class _WindowSummaryCard extends StatelessWidget {
             label: 'Hit rate',
             value: '${window.hitRate.toStringAsFixed(0)}%',
             highlight: window.hitRate >= 50 ? AppTheme.mint : AppTheme.amber,
+            definition:
+                'The share of this window’s top picks that went on to outperform their sector.',
           ),
           LabelValueRow(
             label: 'Average alpha',
@@ -600,11 +804,15 @@ class _WindowSummaryCard extends StatelessWidget {
             highlight: window.averageAlpha >= 0
                 ? AppTheme.mint
                 : AppTheme.coral,
+            definition:
+                'How much the window’s picks beat or lagged their sector on average.',
           ),
           LabelValueRow(
             label: 'Worst drawdown',
             value: '${window.worstDrawdown.toStringAsFixed(1)}%',
             highlight: AppTheme.coral,
+            definition:
+                'The worst peak-to-trough drop seen after the picks from this snapshot were made.',
           ),
           const SizedBox(height: 10),
           Text(picks, style: Theme.of(context).textTheme.bodySmall),
@@ -612,4 +820,106 @@ class _WindowSummaryCard extends StatelessWidget {
       ),
     );
   }
+}
+
+const _marketRadarGuideEntries = [
+  GuideEntry(
+    term: 'Market regime',
+    definition:
+        'The app’s read on the current market mood. Risk-on means buyers are comfortable taking chances; risk-off means investors are more defensive.',
+  ),
+  GuideEntry(
+    term: 'Breadth',
+    definition:
+        'Breadth asks whether many stocks are participating in the move or only a few big names. Strong breadth usually makes a rally healthier.',
+  ),
+  GuideEntry(
+    term: 'Style rotation',
+    definition:
+        'This shows which kinds of stocks are leading right now, such as growth, defensives, or cyclicals.',
+  ),
+  GuideEntry(
+    term: 'Sector sponsorship',
+    definition:
+        'Sponsorship is a plain-English way of saying where money appears to be flowing with conviction, not just bouncing briefly.',
+  ),
+  GuideEntry(
+    term: 'Alpha and drawdown',
+    definition:
+        'Alpha means performance versus a fair comparison group like the stock’s sector. Drawdown means the worst drop along the way, even if the idea later recovered.',
+  ),
+  GuideEntry(
+    term: 'Data readiness',
+    definition:
+        'This tells you whether the app is reading curated fixture data or truly connected live feeds, and how much history it has stored for replay and validation.',
+  ),
+];
+
+const _marketRadarCalculationEntries = [
+  CalculationEntry(
+    title: 'Market score',
+    summary:
+        'A broad market weather score that rewards supportive trend, breadth, and financial conditions.',
+    drivers: [
+      'Index trend, breadth, and sector participation',
+      'Credit calm and easier financial conditions',
+      'Style leadership that matches the current tape',
+    ],
+    interpretation:
+        'Higher is better for taking risk. A high score does not guarantee upside, but it means the backdrop is less hostile.',
+  ),
+  CalculationEntry(
+    title: 'Risk score',
+    summary:
+        'A stress meter that rises when volatility, credit pressure, and crowding become harder to ignore.',
+    drivers: [
+      'Realized and implied volatility',
+      'Credit stress and correlation',
+      'Crowding and fragile price response',
+    ],
+    interpretation:
+        'Higher means the market is less forgiving. It is a warning flag, not a directional call on its own.',
+  ),
+  CalculationEntry(
+    title: 'Breadth health',
+    summary:
+        'A participation check built from advance-decline strength, new highs versus new lows, and percent-above-average confirmation.',
+    drivers: [
+      'Advance-decline line and new high-low data',
+      'Equal-weight confirmation',
+      'Percent of stocks above key averages',
+    ],
+    interpretation:
+        'Higher means the move is being confirmed by more than a small handful of names.',
+  ),
+  CalculationEntry(
+    title: 'Validation metrics',
+    summary:
+        'The research card compares the engine’s historical rankings with later outcomes to see whether higher scores actually separated better ideas from worse ones.',
+    drivers: [
+      'Top-pick hit rate versus sector-relative alpha',
+      'Train and holdout splits kept in time order',
+      'Calibration bands and integrity checks',
+    ],
+    interpretation:
+        'Strong metrics are only useful when the chronology and holdout checks also pass. Good headline numbers with weak integrity still deserve caution.',
+  ),
+];
+
+String? _metricDefinition(String label) {
+  return switch (label) {
+    'Index trend' =>
+      'A quick read on whether the major indexes are still behaving like an uptrend or starting to weaken.',
+    'Realized volatility' =>
+      'How much the market has actually been swinging recently. Higher means the ride has been bumpier in real life.',
+    'Credit pulse' =>
+      'A stress check on the credit market. Calm credit often supports risk-taking; stressed credit can be an early warning sign.',
+    'Breadth health' =>
+      'How widely the current move is being confirmed across the market instead of relying on only a handful of winners.',
+    'Leadership quality' =>
+      'Whether the market’s strongest names look healthy and broad-based rather than narrow and fragile.',
+    'Crowding risk' =>
+      'How packed the trade looks. High crowding means lots of investors may already be leaning the same way, which can make reversals sharper.',
+    _ => null,
+  };
 }

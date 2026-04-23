@@ -10,13 +10,20 @@ abstract class MarketSnapshotArchive {
     required String source,
   });
 
+  Future<ArchiveSummary> saveSnapshots(
+    Iterable<RawMarketState> marketStates, {
+    required String source,
+  });
+
   Future<ArchiveSummary> loadSummary();
+
+  Future<List<ArchivedMarketSnapshot>> loadSnapshots();
 }
 
 class SharedPreferencesMarketSnapshotArchive implements MarketSnapshotArchive {
   SharedPreferencesMarketSnapshotArchive({
     this.preferencesKey = 'market_snapshot_archive_v1',
-    this.maxSnapshots = 48,
+    this.maxSnapshots = 240,
   });
 
   final String preferencesKey;
@@ -27,22 +34,33 @@ class SharedPreferencesMarketSnapshotArchive implements MarketSnapshotArchive {
     RawMarketState marketState, {
     required String source,
   }) async {
+    return saveSnapshots([marketState], source: source);
+  }
+
+  @override
+  Future<ArchiveSummary> saveSnapshots(
+    Iterable<RawMarketState> marketStates, {
+    required String source,
+  }) async {
     final preferences = await SharedPreferences.getInstance();
     final records = _readRecords(preferences);
-    final snapshotId = '$source:${marketState.asOf.toIso8601String()}';
-    final record = ArchivedMarketSnapshot(
-      snapshotId: snapshotId,
-      source: source,
-      capturedAt: DateTime.now(),
-      marketState: marketState,
-    );
-    final existingIndex = records.indexWhere(
-      (entry) => entry.snapshotId == record.snapshotId,
-    );
-    if (existingIndex == -1) {
-      records.add(record);
-    } else {
-      records[existingIndex] = record;
+    final capturedAt = DateTime.now();
+    for (final marketState in marketStates) {
+      final snapshotId = '$source:${marketState.asOf.toIso8601String()}';
+      final record = ArchivedMarketSnapshot(
+        snapshotId: snapshotId,
+        source: source,
+        capturedAt: capturedAt,
+        marketState: marketState,
+      );
+      final existingIndex = records.indexWhere(
+        (entry) => entry.snapshotId == record.snapshotId,
+      );
+      if (existingIndex == -1) {
+        records.add(record);
+      } else {
+        records[existingIndex] = record;
+      }
     }
     records.sort(
       (left, right) => left.marketState.asOf.compareTo(right.marketState.asOf),
@@ -62,6 +80,12 @@ class SharedPreferencesMarketSnapshotArchive implements MarketSnapshotArchive {
     final preferences = await SharedPreferences.getInstance();
     final records = _readRecords(preferences);
     return ArchiveSummary.fromSnapshots(records);
+  }
+
+  @override
+  Future<List<ArchivedMarketSnapshot>> loadSnapshots() async {
+    final preferences = await SharedPreferences.getInstance();
+    return _readRecords(preferences);
   }
 
   List<ArchivedMarketSnapshot> _readRecords(SharedPreferences preferences) {

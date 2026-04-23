@@ -1,13 +1,16 @@
 import 'package:flutter/material.dart';
 
+import '../data/user_workflow_store.dart';
 import '../models/intelligence_app_state.dart';
 import '../models/market_intelligence.dart';
+import '../models/workflow_models.dart';
 import '../theme/app_theme.dart';
 import 'views/market_radar_view.dart';
 import 'views/opportunity_board_view.dart';
 import 'views/scenario_lab_view.dart';
 import 'views/sell_alerts_view.dart';
 import 'views/stock_intelligence_view.dart';
+import 'views/workflow_hub_view.dart';
 import 'widgets/insight_widgets.dart';
 
 enum AppView {
@@ -16,6 +19,7 @@ enum AppView {
   stockIntelligence,
   sellAlerts,
   scenarioLab,
+  workflowHub,
 }
 
 extension AppViewMeta on AppView {
@@ -25,6 +29,7 @@ extension AppViewMeta on AppView {
     AppView.stockIntelligence => 'Stock Intelligence',
     AppView.sellAlerts => 'Sell Alerts',
     AppView.scenarioLab => 'Scenario Lab',
+    AppView.workflowHub => 'Workflow Hub',
   };
 
   IconData get icon => switch (this) {
@@ -33,6 +38,7 @@ extension AppViewMeta on AppView {
     AppView.stockIntelligence => Icons.insights_rounded,
     AppView.sellAlerts => Icons.warning_amber_rounded,
     AppView.scenarioLab => Icons.science_rounded,
+    AppView.workflowHub => Icons.bookmarks_rounded,
   };
 }
 
@@ -56,6 +62,8 @@ class _HomeShellState extends State<HomeShell> {
   AppView _selectedView = AppView.marketRadar;
   String? _selectedTicker;
   ScenarioType? _selectedScenario;
+  final UserWorkflowStore _workflowStore = SharedPreferencesUserWorkflowStore();
+  WorkflowState _workflowState = WorkflowState.empty;
 
   MarketIntelligenceSnapshot get _snapshot => widget.state.snapshot;
 
@@ -64,13 +72,16 @@ class _HomeShellState extends State<HomeShell> {
     super.initState();
     _selectedTicker = _defaultTicker();
     _selectedScenario = _defaultScenario();
+    _loadWorkflowState();
   }
 
   @override
   void didUpdateWidget(covariant HomeShell oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (_selectedTicker == null ||
-        !_snapshot.opportunities.any((stock) => stock.ticker == _selectedTicker)) {
+        !_snapshot.rankedUniverse.any(
+          (stock) => stock.ticker == _selectedTicker,
+        )) {
       _selectedTicker = _defaultTicker();
     }
     if (_selectedScenario == null ||
@@ -82,10 +93,10 @@ class _HomeShellState extends State<HomeShell> {
   }
 
   String? _defaultTicker() {
-    if (_snapshot.opportunities.isEmpty) {
+    if (_snapshot.rankedUniverse.isEmpty) {
       return null;
     }
-    return _snapshot.opportunities.first.ticker;
+    return _snapshot.rankedUniverse.first.ticker;
   }
 
   ScenarioType? _defaultScenario() {
@@ -186,6 +197,95 @@ class _HomeShellState extends State<HomeShell> {
       _selectedTicker = ticker;
       _selectedView = AppView.stockIntelligence;
     });
+    _recordWorkflowAction(
+      WorkflowActionRecord(
+        type: WorkflowActionType.stockOpened,
+        ticker: ticker,
+        occurredAt: DateTime.now(),
+      ),
+    );
+  }
+
+  Future<void> _loadWorkflowState() async {
+    final state = await _workflowStore.load();
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _workflowState = state;
+    });
+  }
+
+  Future<void> _persistWorkflowState(WorkflowState state) async {
+    setState(() {
+      _workflowState = state;
+    });
+    await _workflowStore.save(state);
+  }
+
+  Future<void> _recordWorkflowAction(WorkflowActionRecord record) async {
+    final recent = [record, ..._workflowState.recentActions];
+    await _persistWorkflowState(
+      _workflowState.copyWith(recentActions: recent.take(24).toList()),
+    );
+  }
+
+  Future<void> _toggleWatchlist(String ticker) async {
+    final next = {..._workflowState.watchlistTickers};
+    final added = !next.remove(ticker);
+    if (added) {
+      next.add(ticker);
+    }
+    await _persistWorkflowState(
+      _workflowState.copyWith(watchlistTickers: next),
+    );
+    await _recordWorkflowAction(
+      WorkflowActionRecord(
+        type: added
+            ? WorkflowActionType.watchlistAdded
+            : WorkflowActionType.watchlistRemoved,
+        ticker: ticker,
+        occurredAt: DateTime.now(),
+      ),
+    );
+  }
+
+  Future<void> _toggleSavedIdea(String ticker) async {
+    final next = {..._workflowState.savedIdeas};
+    final added = !next.remove(ticker);
+    if (added) {
+      next.add(ticker);
+    }
+    await _persistWorkflowState(_workflowState.copyWith(savedIdeas: next));
+    await _recordWorkflowAction(
+      WorkflowActionRecord(
+        type: added
+            ? WorkflowActionType.savedIdeaAdded
+            : WorkflowActionType.savedIdeaRemoved,
+        ticker: ticker,
+        occurredAt: DateTime.now(),
+      ),
+    );
+  }
+
+  Future<void> _toggleAlertSubscription(String ticker) async {
+    final next = {..._workflowState.alertSubscriptions};
+    final added = !next.remove(ticker);
+    if (added) {
+      next.add(ticker);
+    }
+    await _persistWorkflowState(
+      _workflowState.copyWith(alertSubscriptions: next),
+    );
+    await _recordWorkflowAction(
+      WorkflowActionRecord(
+        type: added
+            ? WorkflowActionType.alertSubscribed
+            : WorkflowActionType.alertUnsubscribed,
+        ticker: ticker,
+        occurredAt: DateTime.now(),
+      ),
+    );
   }
 
   Widget _buildView() {
@@ -196,16 +296,39 @@ class _HomeShellState extends State<HomeShell> {
         engineStatus: widget.state.engineStatus,
       ),
       AppView.opportunityBoard => OpportunityBoardView(
-        stocks: _snapshot.opportunities,
+        stocks: _snapshot.rankedUniverse,
+        highlightedTickers: _snapshot.opportunities
+            .map((stock) => stock.ticker)
+            .toSet(),
+        workflowState: _workflowState,
         onOpenStock: _openStock,
+        onToggleWatchlist: (ticker) {
+          _toggleWatchlist(ticker);
+        },
+        onToggleSavedIdea: (ticker) {
+          _toggleSavedIdea(ticker);
+        },
+        onToggleAlertSubscription: (ticker) {
+          _toggleAlertSubscription(ticker);
+        },
       ),
       AppView.stockIntelligence => StockIntelligenceView(
-        stocks: _snapshot.opportunities,
+        stocks: _snapshot.rankedUniverse,
         selectedTicker: _selectedTicker,
+        workflowState: _workflowState,
         onSelectTicker: (ticker) {
           setState(() {
             _selectedTicker = ticker;
           });
+        },
+        onToggleWatchlist: (ticker) {
+          _toggleWatchlist(ticker);
+        },
+        onToggleSavedIdea: (ticker) {
+          _toggleSavedIdea(ticker);
+        },
+        onToggleAlertSubscription: (ticker) {
+          _toggleAlertSubscription(ticker);
         },
       ),
       AppView.sellAlerts => SellAlertsView(alerts: _snapshot.sellAlerts),
@@ -216,6 +339,20 @@ class _HomeShellState extends State<HomeShell> {
           setState(() {
             _selectedScenario = scenario;
           });
+        },
+      ),
+      AppView.workflowHub => WorkflowHubView(
+        snapshot: _snapshot,
+        workflowState: _workflowState,
+        onOpenStock: _openStock,
+        onToggleWatchlist: (ticker) {
+          _toggleWatchlist(ticker);
+        },
+        onToggleSavedIdea: (ticker) {
+          _toggleSavedIdea(ticker);
+        },
+        onToggleAlertSubscription: (ticker) {
+          _toggleAlertSubscription(ticker);
         },
       ),
     };
