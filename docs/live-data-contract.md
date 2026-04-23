@@ -9,7 +9,8 @@ rules engine.
 The app can also run in `alpha-vantage` mode when you want a free connected
 price-history spine before building a custom backend. In that mode the app
 fetches Alpha Vantage `TIME_SERIES_DAILY` compact OHLCV responses, caches them
-locally, respects the configured daily request budget, and marks fundamentals,
+into a durable local store, respects the configured daily request budget,
+surfaces sync cadence and local coverage in the UI, and marks fundamentals,
 revisions, options-like inputs, and validation labels as fallback data.
 
 ## Environment
@@ -36,6 +37,7 @@ flutter run \
   --dart-define=ORACLE_ALPHA_VANTAGE_SYMBOLS=NVDA,MSFT,AVGO,JPM,LLY \
   --dart-define=ORACLE_ALPHA_VANTAGE_BENCHMARK=SPY \
   --dart-define=ORACLE_ALPHA_VANTAGE_DAILY_LIMIT=25 \
+  --dart-define=ORACLE_ALPHA_VANTAGE_SYNC_INTERVAL_MINUTES=20 \
   --dart-define=ORACLE_STOCK_UNIVERSE_LIMIT=25 \
   --dart-define=ORACLE_HISTORICAL_SNAPSHOT_LIMIT=100
 ```
@@ -44,6 +46,24 @@ If `ORACLE_ALPHA_VANTAGE_SYMBOLS` is omitted, the app starts with a default
 large-cap watchlist and limits first-run network requests so the benchmark plus
 stocks fit the daily request budget. Cached symbols continue to be used even
 after the budget is spent.
+
+The sync interval controls when the app is allowed to try the vendor again
+after a sync attempt. Between those windows, the app reads from the local store
+first instead of repeatedly burning quota on every refresh.
+
+For web/Chrome runs, use the local proxy because Alpha Vantage does not ship
+permissive CORS headers:
+
+```bash
+dart run tool/alpha_vantage_proxy_server.dart --port=8081
+
+flutter run -d web-server \
+  --web-hostname 127.0.0.1 \
+  --web-port 54123 \
+  --dart-define=ORACLE_DATA_MODE=alpha-vantage \
+  --dart-define=ORACLE_ALPHA_VANTAGE_API_KEY=your-alpha-vantage-key \
+  --dart-define=ORACLE_ALPHA_VANTAGE_PROXY_URL=http://127.0.0.1:8081/query
+```
 
 ## Envelope
 

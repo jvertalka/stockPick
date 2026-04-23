@@ -15,9 +15,11 @@ class MarketDataConfiguration {
     this.baseUrl,
     this.apiToken,
     this.alphaVantageApiKey,
+    this.alphaVantageProxyUrl,
     this.alphaVantageSymbols = const [],
     this.alphaVantageBenchmarkSymbol = 'SPY',
     this.alphaVantageDailyRequestLimit = 25,
+    this.alphaVantageSyncIntervalMinutes = 20,
     this.stockUniverseLimit = 40,
     this.historicalSnapshotLimit = 240,
   });
@@ -26,9 +28,11 @@ class MarketDataConfiguration {
   final String? baseUrl;
   final String? apiToken;
   final String? alphaVantageApiKey;
+  final String? alphaVantageProxyUrl;
   final List<String> alphaVantageSymbols;
   final String alphaVantageBenchmarkSymbol;
   final int alphaVantageDailyRequestLimit;
+  final int alphaVantageSyncIntervalMinutes;
   final int stockUniverseLimit;
   final int historicalSnapshotLimit;
 
@@ -51,6 +55,10 @@ class MarketDataConfiguration {
       'ORACLE_ALPHA_VANTAGE_API_KEY',
       defaultValue: '',
     );
+    const alphaVantageProxyUrlValue = String.fromEnvironment(
+      'ORACLE_ALPHA_VANTAGE_PROXY_URL',
+      defaultValue: '',
+    );
     const alphaVantageSymbolsValue = String.fromEnvironment(
       'ORACLE_ALPHA_VANTAGE_SYMBOLS',
       defaultValue: '',
@@ -62,6 +70,10 @@ class MarketDataConfiguration {
     const alphaVantageDailyRequestLimitValue = int.fromEnvironment(
       'ORACLE_ALPHA_VANTAGE_DAILY_LIMIT',
       defaultValue: 25,
+    );
+    const alphaVantageSyncIntervalMinutesValue = int.fromEnvironment(
+      'ORACLE_ALPHA_VANTAGE_SYNC_INTERVAL_MINUTES',
+      defaultValue: 20,
     );
     const stockUniverseLimitValue = int.fromEnvironment(
       'ORACLE_STOCK_UNIVERSE_LIMIT',
@@ -79,12 +91,16 @@ class MarketDataConfiguration {
       alphaVantageApiKey:
           _normalizeOptionalValue(alphaVantageApiKeyValue) ??
           _normalizeOptionalValue(apiTokenValue),
+      alphaVantageProxyUrl: _normalizeOptionalValue(alphaVantageProxyUrlValue),
       alphaVantageSymbols: _parseSymbolList(alphaVantageSymbolsValue),
       alphaVantageBenchmarkSymbol:
           _normalizeTicker(alphaVantageBenchmarkSymbolValue) ?? 'SPY',
       alphaVantageDailyRequestLimit: alphaVantageDailyRequestLimitValue < 1
           ? 1
           : alphaVantageDailyRequestLimitValue,
+      alphaVantageSyncIntervalMinutes: alphaVantageSyncIntervalMinutesValue < 1
+          ? 1
+          : alphaVantageSyncIntervalMinutesValue,
       stockUniverseLimit: stockUniverseLimitValue < 10
           ? 10
           : stockUniverseLimitValue,

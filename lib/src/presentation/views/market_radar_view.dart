@@ -929,7 +929,7 @@ const _marketRadarGuideEntries = [
   GuideEntry(
     term: 'Data readiness',
     definition:
-        'This tells you whether the app is reading curated fixture data or truly connected live feeds, and how much history it has stored for replay and validation.',
+        'This tells you whether the app is reading fixtures, connected feeds, or a synced local market-data store, plus how much history and sync coverage it already has on hand.',
   ),
 ];
 

@@ -21,6 +21,7 @@ class ProviderMarketRepository implements MarketIntelligenceRepository {
     required HistoricalMarketStateProvider historicalMarketStateProvider,
     MarketSnapshotArchive? archive,
     MarketIntelligenceEngine? engine,
+    Future<List<DataFeedStatus>> Function()? supplementalFeedStatusesLoader,
     this.dataTitle = 'Provider-backed research repository',
     this.dataSummary =
         'The app now runs through pluggable feed providers for market, style, sector, stock, and research windows. The current adapters are still fixture-backed, but live vendors can now replace them without changing the engine contract.',
@@ -45,6 +46,7 @@ class ProviderMarketRepository implements MarketIntelligenceRepository {
        _historicalMarketStateProvider = historicalMarketStateProvider,
        _archive = archive ?? createDefaultMarketSnapshotArchive(),
        _engine = engine ?? MarketIntelligenceEngine(),
+       _supplementalFeedStatusesLoader = supplementalFeedStatusesLoader,
        _validationEngine = ValidationEngine(
          engine: engine ?? MarketIntelligenceEngine(),
        );
@@ -183,6 +185,8 @@ class ProviderMarketRepository implements MarketIntelligenceRepository {
       stockSignalProvider: alphaVantageProvider,
       validationWindowProvider: alphaVantageProvider,
       historicalMarketStateProvider: alphaVantageProvider,
+      supplementalFeedStatusesLoader:
+          alphaVantageProvider.loadSupplementalFeedStatuses,
       archive:
           archive ??
           createDefaultMarketSnapshotArchive(
@@ -191,7 +195,7 @@ class ProviderMarketRepository implements MarketIntelligenceRepository {
       engine: engine,
       dataTitle: 'Alpha Vantage price spine',
       dataSummary:
-          'Daily OHLCV prices from Alpha Vantage now drive the real price-history spine when an API key and quota are available. Trend, volatility, breadth, relative-strength, stock-score history, and chart provenance can now come from connected market data; fundamentals, analyst revisions, options-style signals, and labeled outcomes remain clearly marked fallback inputs until those feeds are connected.',
+          'Daily OHLCV prices from Alpha Vantage now drive the real price-history spine when an API key and quota are available. The app syncs that history into a local store first, then reads trend, volatility, breadth, relative-strength, stock-score history, and chart provenance from local coverage where possible; fundamentals, analyst revisions, options-style signals, and labeled outcomes remain clearly marked fallback inputs until those feeds are connected.',
       engineSummary:
           'A rules-based ensemble now consumes Alpha Vantage price history where available to derive regime reads, stock rankings, buy/hold/sell guidance, sell alerts, and scenario views. It is a stronger decision engine foundation, but it is still not a trained or calibrated ML stack.',
       engineCaveats: const [
@@ -216,6 +220,8 @@ class ProviderMarketRepository implements MarketIntelligenceRepository {
   final HistoricalMarketStateProvider _historicalMarketStateProvider;
   final MarketSnapshotArchive _archive;
   final MarketIntelligenceEngine _engine;
+  final Future<List<DataFeedStatus>> Function()?
+  _supplementalFeedStatusesLoader;
   final ValidationEngine _validationEngine;
   final String dataTitle;
   final String dataSummary;
@@ -292,6 +298,9 @@ class ProviderMarketRepository implements MarketIntelligenceRepository {
     final adapterAvailability = _adapterAvailability(
       feedStatuses.map((feed) => feed.availability),
     );
+    final supplementalFeedStatuses =
+        await _supplementalFeedStatusesLoader?.call() ??
+        const <DataFeedStatus>[];
     final hydratedHistoryCount = historicalStates.length;
     final runtimeSummary =
         '$dataSummary The current run scored ${evaluation.scoredStocks.length} stocks and hydrated $hydratedHistoryCount historical market snapshots before archiving the latest state.';
@@ -338,6 +347,7 @@ class ProviderMarketRepository implements MarketIntelligenceRepository {
               feedStatuses.map((feed) => feed.asOf),
             ),
           ),
+          ...supplementalFeedStatuses,
         ],
       ),
       engineStatus: EngineStatusReport(

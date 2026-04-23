@@ -25,6 +25,8 @@ The app now runs through a structured fixture repository and a deterministic int
 - a point-in-time snapshot archive now stores repository states locally
 - an Alpha Vantage adapter can populate the daily price-history spine with
   connected OHLCV data under a quota-aware cache
+- Alpha Vantage now syncs into a durable local store with cached coverage and
+  sync-cadence metadata so the app can read from local history first
 - a fixture walk-forward validation pass reports hit rate, alpha, and drawdown stats
 - the research harness now surfaces chronological train/test splits and per-window breakdowns
 - the shell can manually refresh the repository and surfaces feed refresh cadence
@@ -58,15 +60,34 @@ flutter run \
   --dart-define=ORACLE_ALPHA_VANTAGE_API_KEY=your-alpha-vantage-key \
   --dart-define=ORACLE_ALPHA_VANTAGE_SYMBOLS=NVDA,MSFT,AVGO,JPM,LLY \
   --dart-define=ORACLE_ALPHA_VANTAGE_DAILY_LIMIT=25 \
+  --dart-define=ORACLE_ALPHA_VANTAGE_SYNC_INTERVAL_MINUTES=20 \
   --dart-define=ORACLE_HISTORICAL_SNAPSHOT_LIMIT=100
 ```
 
 Alpha Vantage mode uses `TIME_SERIES_DAILY` compact responses as the real daily
 price-and-volume history spine. That drives trend, volatility, breadth,
 relative strength, historical market states, and the trend charts where data is
-available. Fundamentals, analyst revisions, options-style risk, and labeled
+available. The app now stores synced symbol history and sync metadata locally so
+repeat opens and refreshes can read from the local store before touching the
+vendor again. Fundamentals, analyst revisions, options-style risk, and labeled
 research outcomes are still explicit fallback inputs until those feeds are
 connected.
+
+For Flutter web/Chrome, run the local proxy first because Alpha Vantage does not
+send browser-friendly CORS headers:
+
+```bash
+dart run tool/alpha_vantage_proxy_server.dart --port=8081
+
+flutter run -d web-server \
+  --web-hostname 127.0.0.1 \
+  --web-port 54123 \
+  --dart-define=ORACLE_DATA_MODE=alpha-vantage \
+  --dart-define=ORACLE_ALPHA_VANTAGE_API_KEY=your-alpha-vantage-key \
+  --dart-define=ORACLE_ALPHA_VANTAGE_PROXY_URL=http://127.0.0.1:8081/query \
+  --dart-define=ORACLE_ALPHA_VANTAGE_DAILY_LIMIT=25 \
+  --dart-define=ORACLE_ALPHA_VANTAGE_SYNC_INTERVAL_MINUTES=20
+```
 
 Available modes:
 

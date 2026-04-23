@@ -1,10 +1,11 @@
-import 'dart:convert';
 import 'dart:math' as math;
 
 import 'package:http/http.dart' as http;
-import 'package:shared_preferences/shared_preferences.dart';
 
 import '../models/intelligence_app_state.dart';
+import 'alpha_vantage_models.dart';
+import 'alpha_vantage_store.dart';
+import 'alpha_vantage_store_factory.dart';
 import 'market_data_configuration.dart';
 import 'market_feed_provider.dart';
 import 'raw_market_data.dart';
@@ -36,6 +37,10 @@ const _defaultAlphaVantageSymbols = [
   'DASH',
 ];
 
+abstract class SupplementalDataStatusProvider {
+  Future<List<DataFeedStatus>> loadSupplementalFeedStatuses();
+}
+
 class AlphaVantageMarketFeedProvider
     implements
         MarketEnvironmentProvider,
@@ -43,7 +48,8 @@ class AlphaVantageMarketFeedProvider
         SectorSignalProvider,
         StockSignalProvider,
         ValidationWindowProvider,
-        HistoricalMarketStateProvider {
+        HistoricalMarketStateProvider,
+        SupplementalDataStatusProvider {
   AlphaVantageMarketFeedProvider({
     required MarketDataConfiguration configuration,
     required FixtureMarketFeedProvider fallbackProvider,
@@ -59,6 +65,47 @@ class AlphaVantageMarketFeedProvider
   final http.Client _client;
   final AlphaVantagePriceCacheStore _cacheStore;
   Future<_PriceBundle>? _bundleFuture;
+
+  @override
+  Future<List<DataFeedStatus>> loadSupplementalFeedStatuses() async {
+    final snapshot = await _cacheStore.loadSnapshot();
+    final storeAvailability = snapshot.hasHistory
+        ? FeedAvailability.connected
+        : FeedAvailability.missing;
+    final syncAvailability = snapshot.sync.hasSuccessfulSync
+        ? FeedAvailability.connected
+        : FeedAvailability.planned;
+    final coverageRange =
+        snapshot.coverageStart == null || snapshot.coverageEnd == null
+        ? 'Coverage will appear after the first successful sync.'
+        : 'Coverage spans ${snapshot.coverageStart!.toIso8601String()} through ${snapshot.coverageEnd!.toIso8601String()}.';
+    final nextSyncText = snapshot.sync.nextEligibleSyncAt == null
+        ? 'A sync can run on the next refresh.'
+        : 'Next eligible sync after ${snapshot.sync.nextEligibleSyncAt!.toIso8601String()}.';
+    final requestedCount = snapshot.sync.requestedSymbols.length;
+    final availableCount = snapshot.sync.availableSymbols.length;
+    final missingCount = snapshot.sync.missingSymbols.length;
+
+    return [
+      DataFeedStatus(
+        name: 'Alpha Vantage local store',
+        availability: storeAvailability,
+        refreshCadence: FeedRefreshCadence.daily,
+        detail:
+            'Stored $availableCount/$requestedCount requested symbols across ${snapshot.cachedBarCount} daily bars. $coverageRange',
+        lastUpdated: snapshot.coverageEnd,
+      ),
+      DataFeedStatus(
+        name: 'Alpha Vantage sync cadence',
+        availability: syncAvailability,
+        refreshCadence: FeedRefreshCadence.intraday,
+        detail:
+            '${snapshot.sync.summary ?? 'The sync pipeline is ready but has not populated local history yet.'} $nextSyncText ${missingCount > 0 ? '$missingCount requested symbols are still waiting for local coverage.' : 'All requested symbols in the current run have local coverage.'}',
+        lastUpdated:
+            snapshot.sync.lastSuccessfulSyncAt ?? snapshot.sync.lastAttemptedAt,
+      ),
+    ];
+  }
 
   @override
   Future<FeedSlice<RawMarketEnvironment>> loadMarketEnvironment() async {
@@ -236,15 +283,27 @@ class AlphaVantageMarketFeedProvider
     final requestedSymbols = <String>{benchmarkSymbol, ...symbols}.toList();
     final seriesBySymbol = <String, AlphaVantageDailySeries>{};
     final messages = <String>[];
+    final now = DateTime.now();
+    final previousSync = await _cacheStore.loadSyncState();
+    final allowNetwork = previousSync.isDue(now);
+    if (!allowNetwork && previousSync.nextEligibleSyncAt != null) {
+      messages.add(
+        'Local store is warm, so the next vendor sync waits until ${previousSync.nextEligibleSyncAt!.toIso8601String()}.',
+      );
+    }
     var networkRequests = 0;
+    var successfulFetches = 0;
 
     for (final symbol in requestedSymbols) {
-      final result = await _loadSeries(symbol);
+      final result = await _loadSeries(symbol, allowNetwork: allowNetwork);
       if (result.series != null) {
         seriesBySymbol[symbol] = result.series!;
       }
       if (result.usedNetwork) {
         networkRequests++;
+        if (result.series != null) {
+          successfulFetches++;
+        }
       }
       if (result.message != null) {
         messages.add(result.message!);
@@ -257,6 +316,40 @@ class AlphaVantageMarketFeedProvider
         if (seriesBySymbol.containsKey(symbol)) symbol: seriesBySymbol[symbol]!,
     };
     final latestAsOf = _latestSeriesDate([...stockSeries.values, ?benchmark]);
+    final availableSymbols =
+        requestedSymbols
+            .where((symbol) => seriesBySymbol.containsKey(symbol))
+            .toList()
+          ..sort();
+    final missingSymbols =
+        requestedSymbols
+            .where((symbol) => !seriesBySymbol.containsKey(symbol))
+            .toList()
+          ..sort();
+    final syncState = AlphaVantageSyncState(
+      lastAttemptedAt: allowNetwork ? now : previousSync.lastAttemptedAt,
+      lastSuccessfulSyncAt: successfulFetches > 0
+          ? now
+          : previousSync.lastSuccessfulSyncAt,
+      nextEligibleSyncAt: allowNetwork
+          ? now.add(
+              Duration(minutes: _configuration.alphaVantageSyncIntervalMinutes),
+            )
+          : previousSync.nextEligibleSyncAt,
+      requestedSymbols: [...requestedSymbols]..sort(),
+      availableSymbols: availableSymbols,
+      missingSymbols: missingSymbols,
+      networkRequestsUsed: networkRequests,
+      summary: _syncSummary(
+        allowNetwork: allowNetwork,
+        availableCount: availableSymbols.length,
+        requestedCount: requestedSymbols.length,
+        networkRequests: networkRequests,
+        missingCount: missingSymbols.length,
+      ),
+      messages: messages,
+    );
+    await _saveSyncState(syncState);
 
     return _PriceBundle(
       requestedSymbols: symbols,
@@ -265,6 +358,7 @@ class AlphaVantageMarketFeedProvider
       latestAsOf: latestAsOf ?? DateTime.now(),
       networkRequests: networkRequests,
       messages: messages,
+      syncState: syncState,
       templateByTicker: {for (final stock in fallback) stock.ticker: stock},
     );
   }
@@ -297,9 +391,16 @@ class AlphaVantageMarketFeedProvider
         .toList();
   }
 
-  Future<_SeriesLoadResult> _loadSeries(String symbol) async {
+  Future<_SeriesLoadResult> _loadSeries(
+    String symbol, {
+    required bool allowNetwork,
+  }) async {
     final cached = await _cacheStore.loadSeries(symbol);
     if (_isFresh(cached)) {
+      return _SeriesLoadResult(series: cached);
+    }
+
+    if (!allowNetwork) {
       return _SeriesLoadResult(series: cached);
     }
 
@@ -320,7 +421,7 @@ class AlphaVantageMarketFeedProvider
     }
 
     try {
-      final uri = Uri.https('www.alphavantage.co', '/query', {
+      final uri = _alphaVantageUri({
         'function': 'TIME_SERIES_DAILY',
         'symbol': symbol,
         'outputsize': 'compact',
@@ -370,6 +471,29 @@ class AlphaVantageMarketFeedProvider
     }
   }
 
+  Future<void> _saveSyncState(AlphaVantageSyncState syncState) async {
+    try {
+      await _cacheStore.saveSyncState(syncState);
+    } catch (_) {
+      // The live run should still work even if sync metadata fails to persist.
+    }
+  }
+
+  Uri _alphaVantageUri(Map<String, String> queryParameters) {
+    final proxyUrl = _configuration.alphaVantageProxyUrl;
+    if (proxyUrl == null || proxyUrl.isEmpty) {
+      return Uri.https('www.alphavantage.co', '/query', queryParameters);
+    }
+
+    final baseUri = Uri.parse(proxyUrl);
+    final mergedQuery = <String, String>{
+      ...baseUri.queryParameters,
+      ...queryParameters,
+    };
+
+    return baseUri.replace(queryParameters: mergedQuery);
+  }
+
   bool _isFresh(AlphaVantageDailySeries? series) {
     if (series == null) {
       return false;
@@ -378,6 +502,20 @@ class AlphaVantageMarketFeedProvider
     return series.fetchedAt.year == now.year &&
         series.fetchedAt.month == now.month &&
         series.fetchedAt.day == now.day;
+  }
+
+  String _syncSummary({
+    required bool allowNetwork,
+    required int availableCount,
+    required int requestedCount,
+    required int networkRequests,
+    required int missingCount,
+  }) {
+    if (!allowNetwork) {
+      return 'The app is currently reading from the local store instead of hitting Alpha Vantage again.';
+    }
+    final requestLabel = networkRequests == 1 ? 'request' : 'requests';
+    return 'This sync cycle populated $availableCount/$requestedCount requested symbols and used $networkRequests vendor $requestLabel. ${missingCount > 0 ? '$missingCount symbols are still waiting for history.' : 'Local coverage is complete for the current request set.'}';
   }
 
   FeedSlice<List<RawStockSignal>> _fallbackStockSlice(
@@ -840,221 +978,101 @@ class AlphaVantageMarketFeedProvider
   }
 }
 
-class AlphaVantageDailySeries {
-  const AlphaVantageDailySeries({
-    required this.symbol,
-    required this.fetchedAt,
-    required this.bars,
-  });
-
-  final String symbol;
-  final DateTime fetchedAt;
-  final List<AlphaVantageDailyBar> bars;
-
-  Map<String, dynamic> toJson() => {
-    'symbol': symbol,
-    'fetchedAt': fetchedAt.toIso8601String(),
-    'bars': bars.map((bar) => bar.toJson()).toList(),
-  };
-
-  factory AlphaVantageDailySeries.fromJson(Map<String, dynamic> json) {
-    return AlphaVantageDailySeries(
-      symbol: json['symbol'] as String,
-      fetchedAt: DateTime.parse(json['fetchedAt'] as String),
-      bars:
-          (json['bars'] as List<dynamic>)
-              .map(
-                (bar) =>
-                    AlphaVantageDailyBar.fromJson(bar as Map<String, dynamic>),
-              )
-              .toList()
-            ..sort((left, right) => left.date.compareTo(right.date)),
-    );
-  }
-
-  factory AlphaVantageDailySeries.fromResponse({
-    required String symbol,
-    required String body,
-    required DateTime fetchedAt,
-  }) {
-    final decoded = jsonDecode(body) as Map<String, dynamic>;
-    final error =
-        decoded['Error Message'] ?? decoded['Note'] ?? decoded['Information'];
-    if (error != null) {
-      throw StateError(error.toString());
-    }
-
-    final rawSeries = decoded['Time Series (Daily)'];
-    if (rawSeries is! Map<String, dynamic>) {
-      throw StateError('Alpha Vantage response did not include daily prices.');
-    }
-
-    final bars = rawSeries.entries.map((entry) {
-      final values = entry.value as Map<String, dynamic>;
-      return AlphaVantageDailyBar(
-        date: DateTime.parse(entry.key),
-        open: _readAlphaNumber(values, '1. open'),
-        high: _readAlphaNumber(values, '2. high'),
-        low: _readAlphaNumber(values, '3. low'),
-        close: _readAlphaNumber(values, '4. close'),
-        volume: _readAlphaNumber(values, '5. volume'),
-      );
-    }).toList()..sort((left, right) => left.date.compareTo(right.date));
-
-    if (bars.isEmpty) {
-      throw StateError('Alpha Vantage response contained no price bars.');
-    }
-
-    return AlphaVantageDailySeries(
-      symbol: symbol,
-      fetchedAt: fetchedAt,
-      bars: bars,
-    );
-  }
-}
-
-class AlphaVantageDailyBar {
-  const AlphaVantageDailyBar({
-    required this.date,
-    required this.open,
-    required this.high,
-    required this.low,
-    required this.close,
-    required this.volume,
-  });
-
-  final DateTime date;
-  final double open;
-  final double high;
-  final double low;
-  final double close;
-  final double volume;
-
-  Map<String, dynamic> toJson() => {
-    'date': date.toIso8601String(),
-    'open': open,
-    'high': high,
-    'low': low,
-    'close': close,
-    'volume': volume,
-  };
-
-  factory AlphaVantageDailyBar.fromJson(Map<String, dynamic> json) {
-    return AlphaVantageDailyBar(
-      date: DateTime.parse(json['date'] as String),
-      open: (json['open'] as num).toDouble(),
-      high: (json['high'] as num).toDouble(),
-      low: (json['low'] as num).toDouble(),
-      close: (json['close'] as num).toDouble(),
-      volume: (json['volume'] as num).toDouble(),
-    );
-  }
-}
-
 class AlphaVantagePriceCacheStore {
   AlphaVantagePriceCacheStore({
-    this.priceCacheKey = 'finance_oracle_alpha_vantage_price_cache_v1',
-    this.quotaCacheKey = 'finance_oracle_alpha_vantage_quota_v1',
-  });
+    String? storeKey,
+    String? priceCacheKey,
+    String? quotaCacheKey,
+    AlphaVantageLocalStore? localStore,
+  }) : _localStore =
+           localStore ??
+           createDefaultAlphaVantageLocalStore(
+             preferencesKey:
+                 storeKey ??
+                 priceCacheKey ??
+                 quotaCacheKey ??
+                 'finance_oracle_alpha_vantage_store_v1',
+           ),
+       storeKey =
+           storeKey ??
+           priceCacheKey ??
+           quotaCacheKey ??
+           'finance_oracle_alpha_vantage_store_v1';
 
-  final String priceCacheKey;
-  final String quotaCacheKey;
+  final String storeKey;
+  final AlphaVantageLocalStore _localStore;
 
   Future<AlphaVantageDailySeries?> loadSeries(String symbol) async {
-    final preferences = await SharedPreferences.getInstance();
-    final raw = preferences.getString(priceCacheKey);
-    if (raw == null || raw.isEmpty) {
-      return null;
-    }
-    try {
-      final decoded = jsonDecode(raw) as Map<String, dynamic>;
-      final seriesJson = decoded[symbol] as Map<String, dynamic>?;
-      return seriesJson == null
-          ? null
-          : AlphaVantageDailySeries.fromJson(seriesJson);
-    } catch (_) {
-      return null;
-    }
+    final state = await _localStore.load();
+    return state.seriesBySymbol[symbol];
   }
 
   Future<void> saveSeries(AlphaVantageDailySeries series) async {
-    final preferences = await SharedPreferences.getInstance();
-    final raw = preferences.getString(priceCacheKey);
-    final decoded = _decodeCache(raw);
-    decoded[series.symbol] = series.toJson();
-    await preferences.setString(priceCacheKey, jsonEncode(decoded));
-  }
-
-  Map<String, dynamic> _decodeCache(String? raw) {
-    if (raw == null || raw.isEmpty) {
-      return <String, dynamic>{};
-    }
-    try {
-      return jsonDecode(raw) as Map<String, dynamic>;
-    } catch (_) {
-      return <String, dynamic>{};
-    }
+    final state = await _localStore.load();
+    final nextSeries = Map<String, AlphaVantageDailySeries>.from(
+      state.seriesBySymbol,
+    );
+    nextSeries[series.symbol] = series;
+    await _localStore.save(state.copyWith(seriesBySymbol: nextSeries));
   }
 
   Future<AlphaVantageQuotaState> loadQuota() async {
-    final preferences = await SharedPreferences.getInstance();
-    final raw = preferences.getString(quotaCacheKey);
-    if (raw == null || raw.isEmpty) {
-      return AlphaVantageQuotaState.today();
-    }
-    try {
-      final quota = AlphaVantageQuotaState.fromJson(
-        jsonDecode(raw) as Map<String, dynamic>,
-      );
-      return quota.isToday ? quota : AlphaVantageQuotaState.today();
-    } catch (_) {
-      return AlphaVantageQuotaState.today();
-    }
+    final state = await _localStore.load();
+    return state.quota.isToday ? state.quota : AlphaVantageQuotaState.today();
   }
 
   Future<void> recordRequest() async {
-    final preferences = await SharedPreferences.getInstance();
-    final quota = await loadQuota();
-    await preferences.setString(
-      quotaCacheKey,
-      quota.copyWith(requestsUsed: quota.requestsUsed + 1).toJson(),
-    );
-  }
-}
-
-class AlphaVantageQuotaState {
-  const AlphaVantageQuotaState({required this.day, required this.requestsUsed});
-
-  final String day;
-  final int requestsUsed;
-
-  bool get isToday => day == _todayKey();
-
-  bool canUse(int limit) => isToday && requestsUsed < limit;
-
-  AlphaVantageQuotaState copyWith({int? requestsUsed}) {
-    return AlphaVantageQuotaState(
-      day: day,
-      requestsUsed: requestsUsed ?? this.requestsUsed,
+    final state = await _localStore.load();
+    final quota = state.quota.isToday
+        ? state.quota
+        : AlphaVantageQuotaState.today();
+    await _localStore.save(
+      state.copyWith(
+        quota: quota.copyWith(requestsUsed: quota.requestsUsed + 1),
+      ),
     );
   }
 
-  String toJson() => jsonEncode({'day': day, 'requestsUsed': requestsUsed});
-
-  factory AlphaVantageQuotaState.today() {
-    return AlphaVantageQuotaState(day: _todayKey(), requestsUsed: 0);
+  Future<AlphaVantageSyncState> loadSyncState() async {
+    final state = await _localStore.load();
+    return state.sync;
   }
 
-  factory AlphaVantageQuotaState.fromJson(Map<String, dynamic> json) {
-    return AlphaVantageQuotaState(
-      day: json['day'] as String,
-      requestsUsed: json['requestsUsed'] as int? ?? 0,
+  Future<void> saveSyncState(AlphaVantageSyncState syncState) async {
+    final state = await _localStore.load();
+    await _localStore.save(state.copyWith(sync: syncState));
+  }
+
+  Future<AlphaVantageStoreSnapshot> loadSnapshot() async {
+    final state = await _localStore.load();
+    final seriesList = state.seriesBySymbol.values.toList();
+    DateTime? coverageStart;
+    DateTime? coverageEnd;
+    var cachedBarCount = 0;
+    for (final series in seriesList) {
+      cachedBarCount += series.bars.length;
+      if (series.bars.isEmpty) {
+        continue;
+      }
+      final seriesStart = series.bars.first.date;
+      final seriesEnd = series.bars.last.date;
+      coverageStart =
+          coverageStart == null || seriesStart.isBefore(coverageStart)
+          ? seriesStart
+          : coverageStart;
+      coverageEnd = coverageEnd == null || seriesEnd.isAfter(coverageEnd)
+          ? seriesEnd
+          : coverageEnd;
+    }
+
+    return AlphaVantageStoreSnapshot(
+      sync: state.sync,
+      quota: state.quota.isToday ? state.quota : AlphaVantageQuotaState.today(),
+      cachedSymbolCount: state.seriesBySymbol.length,
+      cachedBarCount: cachedBarCount,
+      coverageStart: coverageStart,
+      coverageEnd: coverageEnd,
     );
-  }
-
-  static String _todayKey() {
-    final now = DateTime.now();
-    return '${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}';
   }
 }
 
@@ -1066,6 +1084,7 @@ class _PriceBundle {
     required this.latestAsOf,
     required this.networkRequests,
     required this.messages,
+    required this.syncState,
     required this.templateByTicker,
   });
 
@@ -1075,6 +1094,7 @@ class _PriceBundle {
   final DateTime latestAsOf;
   final int networkRequests;
   final List<String> messages;
+  final AlphaVantageSyncState syncState;
   final Map<String, RawStockSignal> templateByTicker;
 
   bool get hasAlphaData => stockSeries.isNotEmpty;
@@ -1085,7 +1105,8 @@ class _PriceBundle {
     final missingText = missing <= 0
         ? ''
         : ' $missing symbols still need cache coverage.';
-    return '${stockSeries.length}/${requestedSymbols.length} requested symbols have price history; $networkRequests Alpha Vantage $requestText used this run.$missingText';
+    final syncText = syncState.summary == null ? '' : ' ${syncState.summary}';
+    return '${stockSeries.length}/${requestedSymbols.length} requested symbols have price history; $networkRequests Alpha Vantage $requestText used this run.$missingText$syncText';
   }
 }
 
@@ -1099,17 +1120,6 @@ class _SeriesLoadResult {
   final AlphaVantageDailySeries? series;
   final bool usedNetwork;
   final String? message;
-}
-
-double _readAlphaNumber(Map<String, dynamic> values, String key) {
-  final raw = values[key];
-  if (raw is num) {
-    return raw.toDouble();
-  }
-  if (raw is String) {
-    return double.parse(raw.replaceAll(',', ''));
-  }
-  throw StateError('Alpha Vantage response is missing $key.');
 }
 
 extension _FirstOrNull<T> on Iterable<T> {

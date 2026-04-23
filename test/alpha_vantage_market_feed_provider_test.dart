@@ -59,6 +59,7 @@ void main() {
 
       final stockFeed = await provider.loadStockSignals();
       final historyFeed = await provider.loadHistoricalMarketStates();
+      final supplementalFeeds = await provider.loadSupplementalFeedStatuses();
 
       expect(stockFeed.availability, FeedAvailability.connected);
       expect(stockFeed.source, 'alpha-vantage-daily-prices');
@@ -69,6 +70,14 @@ void main() {
       expect(historyFeed.availability, FeedAvailability.connected);
       expect(historyFeed.source, 'alpha-vantage-price-history');
       expect(historyFeed.data, hasLength(65));
+      expect(
+        supplementalFeeds.any(
+          (feed) =>
+              feed.name == 'Alpha Vantage local store' &&
+              feed.availability == FeedAvailability.connected,
+        ),
+        isTrue,
+      );
       expect(requests.map((uri) => uri.queryParameters['symbol']), [
         'SPY',
         'NVDA',
@@ -103,6 +112,96 @@ void main() {
       expect(feed.data, isNotEmpty);
     },
   );
+
+  test('Alpha Vantage mode can route requests through a local proxy', () async {
+    final requests = <Uri>[];
+    final client = MockClient((request) async {
+      requests.add(request.url);
+      return http.Response(
+        _dailySeriesJson(
+          symbol: request.url.queryParameters['symbol']!,
+          startClose: 120,
+          dailyStep: 0.8,
+        ),
+        200,
+        headers: {'content-type': 'application/json'},
+      );
+    });
+
+    final provider = AlphaVantageMarketFeedProvider(
+      configuration: const MarketDataConfiguration(
+        mode: MarketDataMode.alphaVantage,
+        alphaVantageApiKey: 'demo-key',
+        alphaVantageProxyUrl: 'http://127.0.0.1:8081/query',
+        alphaVantageSymbols: ['NVDA'],
+        alphaVantageBenchmarkSymbol: 'SPY',
+        stockUniverseLimit: 1,
+      ),
+      fallbackProvider: FixtureMarketFeedProvider(),
+      client: client,
+      cacheStore: AlphaVantagePriceCacheStore(
+        priceCacheKey: 'test_proxy_price_cache',
+        quotaCacheKey: 'test_proxy_quota',
+      ),
+    );
+
+    await provider.loadStockSignals();
+
+    expect(requests, isNotEmpty);
+    expect(
+      requests.first.toString(),
+      startsWith('http://127.0.0.1:8081/query?'),
+    );
+    expect(requests.first.queryParameters['function'], 'TIME_SERIES_DAILY');
+    expect(requests.first.queryParameters['apikey'], 'demo-key');
+  });
+
+  test('Alpha Vantage sync cooldown avoids repeated quota burns', () async {
+    var requestCount = 0;
+    final client = MockClient((request) async {
+      requestCount++;
+      return http.Response(
+        _dailySeriesJson(
+          symbol: request.url.queryParameters['symbol']!,
+          startClose: 100,
+          dailyStep: 1,
+        ),
+        200,
+        headers: {'content-type': 'application/json'},
+      );
+    });
+
+    final cacheStore = AlphaVantagePriceCacheStore(
+      priceCacheKey: 'test_sync_cooldown_store',
+    );
+    final configuration = const MarketDataConfiguration(
+      mode: MarketDataMode.alphaVantage,
+      alphaVantageApiKey: 'demo-key',
+      alphaVantageSymbols: ['NVDA'],
+      alphaVantageBenchmarkSymbol: 'SPY',
+      alphaVantageDailyRequestLimit: 1,
+      alphaVantageSyncIntervalMinutes: 60,
+      stockUniverseLimit: 1,
+    );
+
+    final firstProvider = AlphaVantageMarketFeedProvider(
+      configuration: configuration,
+      fallbackProvider: FixtureMarketFeedProvider(),
+      client: client,
+      cacheStore: cacheStore,
+    );
+    await firstProvider.loadStockSignals();
+
+    final secondProvider = AlphaVantageMarketFeedProvider(
+      configuration: configuration,
+      fallbackProvider: FixtureMarketFeedProvider(),
+      client: client,
+      cacheStore: cacheStore,
+    );
+    await secondProvider.loadStockSignals();
+
+    expect(requestCount, 1);
+  });
 }
 
 String _dailySeriesJson({
