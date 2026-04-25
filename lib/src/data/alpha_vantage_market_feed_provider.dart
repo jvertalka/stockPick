@@ -6,9 +6,11 @@ import '../models/intelligence_app_state.dart';
 import 'alpha_vantage_models.dart';
 import 'alpha_vantage_store.dart';
 import 'alpha_vantage_store_factory.dart';
+import 'local_secrets.dart' as local;
 import 'market_data_configuration.dart';
 import 'market_feed_provider.dart';
 import 'raw_market_data.dart';
+import 'yahoo_finance_feed_provider.dart';
 
 const _defaultAlphaVantageSymbols = [
   'NVDA',
@@ -310,6 +312,19 @@ class AlphaVantageMarketFeedProvider
       }
     }
 
+    // Yahoo Finance fallback for symbols Alpha Vantage couldn't provide.
+    // Covers the 75+ stocks/day beyond AV's free-tier quota.
+    final yahooBackfilled = await _backfillFromYahoo(
+      requestedSymbols: requestedSymbols,
+      seriesBySymbol: seriesBySymbol,
+      now: now,
+    );
+    if (yahooBackfilled > 0) {
+      messages.add(
+        'Yahoo Finance filled $yahooBackfilled symbol(s) that were beyond the Alpha Vantage daily quota.',
+      );
+    }
+
     final benchmark = seriesBySymbol[benchmarkSymbol];
     final stockSeries = {
       for (final symbol in symbols)
@@ -389,6 +404,70 @@ class AlphaVantageMarketFeedProvider
         .toSet()
         .take(limit)
         .toList();
+  }
+
+  /// After the Alpha Vantage pass, try Yahoo Finance for any requested symbol
+  /// whose series is still missing. Yahoo's free endpoint covers the full
+  /// universe — its only limitation is CORS for direct browser calls, which
+  /// the configured CORS proxy works around.
+  ///
+  /// Requests run in batches of 10 concurrent calls to keep total wall time
+  /// under a minute even for 300-symbol universes.
+  Future<int> _backfillFromYahoo({
+    required Iterable<String> requestedSymbols,
+    required Map<String, AlphaVantageDailySeries> seriesBySymbol,
+    required DateTime now,
+  }) async {
+    final missing = requestedSymbols
+        .where((symbol) => !seriesBySymbol.containsKey(symbol))
+        .toList();
+    if (missing.isEmpty) return 0;
+
+    final yahoo = YahooFinanceFeedProvider(
+      symbols: missing,
+      corsProxyPrefix: local.kCorsProxyPrefix,
+    );
+
+    const concurrency = 10;
+    var filled = 0;
+
+    for (var start = 0; start < missing.length; start += concurrency) {
+      final end = math.min(start + concurrency, missing.length);
+      final batch = missing.sublist(start, end);
+      final results = await Future.wait(
+        batch.map(
+          (symbol) => yahoo
+              .loadDailyBars(symbol, rangeDays: 365)
+              .then((bars) => MapEntry(symbol, bars)),
+        ),
+      );
+      for (final entry in results) {
+        final bars = entry.value;
+        if (bars == null || bars.bars.isEmpty) continue;
+        final converted = AlphaVantageDailySeries(
+          symbol: entry.key,
+          fetchedAt: now,
+          bars:
+              bars.bars
+                  .map(
+                    (bar) => AlphaVantageDailyBar(
+                      date: bar.date,
+                      open: bar.open,
+                      high: bar.high,
+                      low: bar.low,
+                      close: bar.close,
+                      volume: bar.volume,
+                    ),
+                  )
+                  .toList()
+                ..sort((a, b) => a.date.compareTo(b.date)),
+        );
+        seriesBySymbol[entry.key] = converted;
+        await _saveSeries(converted);
+        filled++;
+      }
+    }
+    return filled;
   }
 
   Future<_SeriesLoadResult> _loadSeries(
@@ -651,6 +730,7 @@ class AlphaVantageMarketFeedProvider
         _clampScore(closeVsSma50 * 55),
       ]),
       peers: hasKnownTemplate ? template.peers : const <RawPeerSignal>[],
+      lastPrice: latest.close,
     );
   }
 

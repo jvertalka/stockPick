@@ -60,6 +60,11 @@ class RawMarketEnvironment {
     required this.correlation,
     required this.dispersion,
     required this.volumeConcentration,
+    this.regimeStability = 70,
+    this.regimePersistenceSessions = 0,
+    this.volTermStructure = 0,
+    this.yieldCurveSlope = 0,
+    this.breadthByPhase = const <String, double>{},
   });
 
   final double indexTrend;
@@ -80,6 +85,11 @@ class RawMarketEnvironment {
   final double correlation;
   final double dispersion;
   final double volumeConcentration;
+  final double regimeStability;
+  final int regimePersistenceSessions;
+  final double volTermStructure;
+  final double yieldCurveSlope;
+  final Map<String, double> breadthByPhase;
 
   Map<String, dynamic> toJson() => {
     'indexTrend': indexTrend,
@@ -100,32 +110,40 @@ class RawMarketEnvironment {
     'correlation': correlation,
     'dispersion': dispersion,
     'volumeConcentration': volumeConcentration,
+    'regimeStability': regimeStability,
+    'regimePersistenceSessions': regimePersistenceSessions,
+    'volTermStructure': volTermStructure,
+    'yieldCurveSlope': yieldCurveSlope,
+    'breadthByPhase': breadthByPhase,
   };
 
-  factory RawMarketEnvironment.fromJson(Map<String, dynamic> json) =>
-      RawMarketEnvironment(
-        indexTrend: _readDouble(json, 'indexTrend'),
-        realizedVolatility: _readDouble(json, 'realizedVolatility'),
-        impliedVolatility: _readDouble(json, 'impliedVolatility'),
-        creditStress: _readDouble(json, 'creditStress'),
-        financialConditions: _readDouble(json, 'financialConditions'),
-        growthLeadership: _readDouble(json, 'growthLeadership'),
-        defensiveLeadership: _readDouble(json, 'defensiveLeadership'),
-        smallCapLeadership: _readDouble(json, 'smallCapLeadership'),
-        inflationPressure: _readDouble(json, 'inflationPressure'),
-        breadth: _readDouble(json, 'breadth'),
-        advanceDecline: _readDouble(json, 'advanceDecline'),
-        newHighLow: _readDouble(json, 'newHighLow'),
-        percentAboveMajorAverages: _readDouble(
-          json,
-          'percentAboveMajorAverages',
-        ),
-        equalWeightConfirmation: _readDouble(json, 'equalWeightConfirmation'),
-        sectorParticipation: _readDouble(json, 'sectorParticipation'),
-        correlation: _readDouble(json, 'correlation'),
-        dispersion: _readDouble(json, 'dispersion'),
-        volumeConcentration: _readDouble(json, 'volumeConcentration'),
-      );
+  factory RawMarketEnvironment.fromJson(
+    Map<String, dynamic> json,
+  ) => RawMarketEnvironment(
+    indexTrend: _readDouble(json, 'indexTrend'),
+    realizedVolatility: _readDouble(json, 'realizedVolatility'),
+    impliedVolatility: _readDouble(json, 'impliedVolatility'),
+    creditStress: _readDouble(json, 'creditStress'),
+    financialConditions: _readDouble(json, 'financialConditions'),
+    growthLeadership: _readDouble(json, 'growthLeadership'),
+    defensiveLeadership: _readDouble(json, 'defensiveLeadership'),
+    smallCapLeadership: _readDouble(json, 'smallCapLeadership'),
+    inflationPressure: _readDouble(json, 'inflationPressure'),
+    breadth: _readDouble(json, 'breadth'),
+    advanceDecline: _readDouble(json, 'advanceDecline'),
+    newHighLow: _readDouble(json, 'newHighLow'),
+    percentAboveMajorAverages: _readDouble(json, 'percentAboveMajorAverages'),
+    equalWeightConfirmation: _readDouble(json, 'equalWeightConfirmation'),
+    sectorParticipation: _readDouble(json, 'sectorParticipation'),
+    correlation: _readDouble(json, 'correlation'),
+    dispersion: _readDouble(json, 'dispersion'),
+    volumeConcentration: _readDouble(json, 'volumeConcentration'),
+    regimeStability: _readDoubleOr(json, 'regimeStability', 70),
+    regimePersistenceSessions: _readIntOr(json, 'regimePersistenceSessions', 0),
+    volTermStructure: _readDoubleOr(json, 'volTermStructure', 0),
+    yieldCurveSlope: _readDoubleOr(json, 'yieldCurveSlope', 0),
+    breadthByPhase: _readStringDoubleMap(json, 'breadthByPhase'),
+  );
 }
 
 class RawStyleSignal {
@@ -235,6 +253,19 @@ class RawStockSignal {
     required this.rateSensitivity,
     required this.expectedStability,
     required this.peers,
+    this.volTermStructureSlope = 0,
+    this.frontMonthSkew = 0,
+    this.backMonthSkew = 0,
+    this.gammaExposure = 0,
+    this.pinningRisk = 0,
+    this.unusualFlowRatio = 1.0,
+    this.putCallRatio = 1.0,
+    this.dealerPositioning = 0,
+    this.correlationClusterId = '',
+    this.correlationStrength = 0,
+    this.signalFirstObservedDays = const <String, int>{},
+    this.expectedMoveEarnings = 0,
+    this.lastPrice = 0,
   });
 
   final String ticker;
@@ -277,6 +308,19 @@ class RawStockSignal {
   final double rateSensitivity;
   final double expectedStability;
   final List<RawPeerSignal> peers;
+  final double volTermStructureSlope;
+  final double frontMonthSkew;
+  final double backMonthSkew;
+  final double gammaExposure;
+  final double pinningRisk;
+  final double unusualFlowRatio;
+  final double putCallRatio;
+  final double dealerPositioning;
+  final String correlationClusterId;
+  final double correlationStrength;
+  final Map<String, int> signalFirstObservedDays;
+  final double expectedMoveEarnings;
+  final double lastPrice;
 
   Map<String, dynamic> toJson() => {
     'ticker': ticker,
@@ -319,6 +363,19 @@ class RawStockSignal {
     'rateSensitivity': rateSensitivity,
     'expectedStability': expectedStability,
     'peers': peers.map((peer) => peer.toJson()).toList(),
+    'volTermStructureSlope': volTermStructureSlope,
+    'frontMonthSkew': frontMonthSkew,
+    'backMonthSkew': backMonthSkew,
+    'gammaExposure': gammaExposure,
+    'pinningRisk': pinningRisk,
+    'unusualFlowRatio': unusualFlowRatio,
+    'putCallRatio': putCallRatio,
+    'dealerPositioning': dealerPositioning,
+    'correlationClusterId': correlationClusterId,
+    'correlationStrength': correlationStrength,
+    'signalFirstObservedDays': signalFirstObservedDays,
+    'expectedMoveEarnings': expectedMoveEarnings,
+    'lastPrice': lastPrice,
   };
 
   factory RawStockSignal.fromJson(Map<String, dynamic> json) => RawStockSignal(
@@ -364,7 +421,128 @@ class RawStockSignal {
     peers: (json['peers'] as List<dynamic>? ?? const [])
         .map((peer) => RawPeerSignal.fromJson(peer as Map<String, dynamic>))
         .toList(),
+    volTermStructureSlope: _readDoubleOr(json, 'volTermStructureSlope', 0),
+    frontMonthSkew: _readDoubleOr(json, 'frontMonthSkew', 0),
+    backMonthSkew: _readDoubleOr(json, 'backMonthSkew', 0),
+    gammaExposure: _readDoubleOr(json, 'gammaExposure', 0),
+    pinningRisk: _readDoubleOr(json, 'pinningRisk', 0),
+    unusualFlowRatio: _readDoubleOr(json, 'unusualFlowRatio', 1.0),
+    putCallRatio: _readDoubleOr(json, 'putCallRatio', 1.0),
+    dealerPositioning: _readDoubleOr(json, 'dealerPositioning', 0),
+    correlationClusterId: (json['correlationClusterId'] as String?) ?? '',
+    correlationStrength: _readDoubleOr(json, 'correlationStrength', 0),
+    signalFirstObservedDays: _readStringIntMap(json, 'signalFirstObservedDays'),
+    expectedMoveEarnings: _readDoubleOr(json, 'expectedMoveEarnings', 0),
+    lastPrice: _readDoubleOr(json, 'lastPrice', 0),
   );
+
+  RawStockSignal copyWith({
+    double? shortTrend,
+    double? mediumTrend,
+    double? longTrend,
+    double? residualStrength,
+    double? momentumPersistence,
+    double? breakoutQuality,
+    double? volumeSupport,
+    double? earningsRevisions,
+    double? earningsSurprise,
+    double? marginTrend,
+    double? revenueTrend,
+    double? freeCashFlowTrend,
+    double? balanceSheetQuality,
+    double? profitability,
+    double? leverageQuality,
+    double? earningsStability,
+    double? valuationSupport,
+    double? crowdingRisk,
+    double? impliedVolRank,
+    double? realizedImpliedGap,
+    double? putSkewChange,
+    double? eventPremium,
+    double? downsideProtectionDemand,
+    double? relativeStrengthDelta,
+    double? sectorBreadthDelta,
+    double? revisionDelta,
+    double? priceResponse,
+    double? abnormalDownVolume,
+    double? volatilityRepricing,
+    double? peerLeadership,
+    double? growthExposure,
+    double? defensiveExposure,
+    double? creditSensitivity,
+    double? rateSensitivity,
+    double? expectedStability,
+    double? volTermStructureSlope,
+    double? frontMonthSkew,
+    double? backMonthSkew,
+    double? gammaExposure,
+    double? pinningRisk,
+    double? unusualFlowRatio,
+    double? putCallRatio,
+    double? dealerPositioning,
+    double? correlationStrength,
+    double? expectedMoveEarnings,
+    double? lastPrice,
+  }) {
+    return RawStockSignal(
+      ticker: ticker,
+      company: company,
+      sector: sector,
+      industry: industry,
+      shortTrend: shortTrend ?? this.shortTrend,
+      mediumTrend: mediumTrend ?? this.mediumTrend,
+      longTrend: longTrend ?? this.longTrend,
+      residualStrength: residualStrength ?? this.residualStrength,
+      momentumPersistence: momentumPersistence ?? this.momentumPersistence,
+      breakoutQuality: breakoutQuality ?? this.breakoutQuality,
+      volumeSupport: volumeSupport ?? this.volumeSupport,
+      earningsRevisions: earningsRevisions ?? this.earningsRevisions,
+      earningsSurprise: earningsSurprise ?? this.earningsSurprise,
+      marginTrend: marginTrend ?? this.marginTrend,
+      revenueTrend: revenueTrend ?? this.revenueTrend,
+      freeCashFlowTrend: freeCashFlowTrend ?? this.freeCashFlowTrend,
+      balanceSheetQuality: balanceSheetQuality ?? this.balanceSheetQuality,
+      profitability: profitability ?? this.profitability,
+      leverageQuality: leverageQuality ?? this.leverageQuality,
+      earningsStability: earningsStability ?? this.earningsStability,
+      valuationSupport: valuationSupport ?? this.valuationSupport,
+      crowdingRisk: crowdingRisk ?? this.crowdingRisk,
+      impliedVolRank: impliedVolRank ?? this.impliedVolRank,
+      realizedImpliedGap: realizedImpliedGap ?? this.realizedImpliedGap,
+      putSkewChange: putSkewChange ?? this.putSkewChange,
+      eventPremium: eventPremium ?? this.eventPremium,
+      downsideProtectionDemand:
+          downsideProtectionDemand ?? this.downsideProtectionDemand,
+      relativeStrengthDelta:
+          relativeStrengthDelta ?? this.relativeStrengthDelta,
+      sectorBreadthDelta: sectorBreadthDelta ?? this.sectorBreadthDelta,
+      revisionDelta: revisionDelta ?? this.revisionDelta,
+      priceResponse: priceResponse ?? this.priceResponse,
+      abnormalDownVolume: abnormalDownVolume ?? this.abnormalDownVolume,
+      volatilityRepricing: volatilityRepricing ?? this.volatilityRepricing,
+      peerLeadership: peerLeadership ?? this.peerLeadership,
+      growthExposure: growthExposure ?? this.growthExposure,
+      defensiveExposure: defensiveExposure ?? this.defensiveExposure,
+      creditSensitivity: creditSensitivity ?? this.creditSensitivity,
+      rateSensitivity: rateSensitivity ?? this.rateSensitivity,
+      expectedStability: expectedStability ?? this.expectedStability,
+      peers: peers,
+      volTermStructureSlope:
+          volTermStructureSlope ?? this.volTermStructureSlope,
+      frontMonthSkew: frontMonthSkew ?? this.frontMonthSkew,
+      backMonthSkew: backMonthSkew ?? this.backMonthSkew,
+      gammaExposure: gammaExposure ?? this.gammaExposure,
+      pinningRisk: pinningRisk ?? this.pinningRisk,
+      unusualFlowRatio: unusualFlowRatio ?? this.unusualFlowRatio,
+      putCallRatio: putCallRatio ?? this.putCallRatio,
+      dealerPositioning: dealerPositioning ?? this.dealerPositioning,
+      correlationClusterId: correlationClusterId,
+      correlationStrength: correlationStrength ?? this.correlationStrength,
+      signalFirstObservedDays: signalFirstObservedDays,
+      expectedMoveEarnings: expectedMoveEarnings ?? this.expectedMoveEarnings,
+      lastPrice: lastPrice ?? this.lastPrice,
+    );
+  }
 }
 
 class RawPeerSignal {
@@ -462,4 +640,43 @@ class ValidationOutcome {
 
 double _readDouble(Map<String, dynamic> json, String key) {
   return (json[key] as num).toDouble();
+}
+
+double _readDoubleOr(Map<String, dynamic> json, String key, double fallback) {
+  final raw = json[key];
+  if (raw is num) {
+    return raw.toDouble();
+  }
+  return fallback;
+}
+
+int _readIntOr(Map<String, dynamic> json, String key, int fallback) {
+  final raw = json[key];
+  if (raw is num) {
+    return raw.toInt();
+  }
+  return fallback;
+}
+
+Map<String, double> _readStringDoubleMap(
+  Map<String, dynamic> json,
+  String key,
+) {
+  final raw = json[key];
+  if (raw is Map<String, dynamic>) {
+    return raw.map(
+      (entry, value) => MapEntry(entry, value is num ? value.toDouble() : 0.0),
+    );
+  }
+  return const {};
+}
+
+Map<String, int> _readStringIntMap(Map<String, dynamic> json, String key) {
+  final raw = json[key];
+  if (raw is Map<String, dynamic>) {
+    return raw.map(
+      (entry, value) => MapEntry(entry, value is num ? value.toInt() : 0),
+    );
+  }
+  return const {};
 }

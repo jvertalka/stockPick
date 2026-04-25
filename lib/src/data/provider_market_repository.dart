@@ -1,15 +1,21 @@
 import '../engine/market_intelligence_engine.dart';
 import '../engine/market_metric_history_builder.dart';
 import '../engine/validation_engine.dart';
+import '../engine/recommendation_trust_gate.dart';
 import '../models/intelligence_app_state.dart';
 import 'alpha_vantage_market_feed_provider.dart';
+import 'finnhub_feed_provider.dart';
+import 'fred_macro_feed_provider.dart';
 import 'live_market_feed_provider.dart';
+import 'local_secrets.dart' as local;
 import 'market_data_configuration.dart';
 import 'market_feed_provider.dart';
 import 'market_intelligence_repository.dart';
 import 'market_snapshot_archive.dart';
 import 'market_snapshot_archive_factory.dart';
 import 'raw_market_data.dart';
+import 'stooq_feed_provider.dart';
+import 'yahoo_finance_feed_provider.dart';
 
 class ProviderMarketRepository implements MarketIntelligenceRepository {
   ProviderMarketRepository({
@@ -92,6 +98,20 @@ class ProviderMarketRepository implements MarketIntelligenceRepository {
       configuration: configuration,
       fallbackProvider: fixtureProvider,
     );
+    final finnhubProvider = FinnhubFeedProvider(
+      apiKey: configuration.finnhubApiKey ?? local.kFinnhubApiKey,
+      symbols: configuration.alphaVantageSymbols.isNotEmpty
+          ? configuration.alphaVantageSymbols.take(20).toList()
+          : const <String>['AAPL', 'MSFT', 'SPY'],
+    );
+    final macroProvider = FredMacroFeedProvider(
+      apiKey: configuration.fredApiKey ?? local.kFredApiKey,
+      fallbackProvider: liveProvider,
+    );
+    final stockProvider = FinnhubFundamentalsOverlayStockProvider(
+      fallbackProvider: liveProvider,
+      finnhubProvider: finnhubProvider,
+    );
 
     final dataTitle = switch (configuration.mode) {
       MarketDataMode.fixtureOnly => 'Provider-backed research repository',
@@ -139,10 +159,10 @@ class ProviderMarketRepository implements MarketIntelligenceRepository {
     };
 
     return ProviderMarketRepository(
-      marketEnvironmentProvider: liveProvider,
+      marketEnvironmentProvider: macroProvider,
       styleSignalProvider: liveProvider,
       sectorSignalProvider: liveProvider,
-      stockSignalProvider: liveProvider,
+      stockSignalProvider: stockProvider,
       validationWindowProvider: liveProvider,
       historicalMarketStateProvider: liveProvider,
       archive:
@@ -178,15 +198,115 @@ class ProviderMarketRepository implements MarketIntelligenceRepository {
       fallbackProvider: fixtureProvider,
     );
 
+    // Probe Yahoo + Stooq with a small sample of the universe so the UI shows
+    // their availability. These are not yet wired into the scoring pipeline;
+    // they prove the app can reach them and records the connection for later.
+    final probeSymbols = configuration.alphaVantageSymbols.isNotEmpty
+        ? configuration.alphaVantageSymbols.take(5).toList()
+        : const <String>['AAPL', 'MSFT', 'SPY'];
+    final yahooProvider = YahooFinanceFeedProvider(
+      symbols: probeSymbols,
+      corsProxyPrefix: local.kCorsProxyPrefix,
+    );
+    final stooqProvider = StooqFeedProvider(symbols: probeSymbols);
+    final finnhubProvider = FinnhubFeedProvider(
+      apiKey: configuration.finnhubApiKey ?? local.kFinnhubApiKey,
+      symbols: probeSymbols,
+    );
+    final macroProvider = FredMacroFeedProvider(
+      apiKey: configuration.fredApiKey ?? local.kFredApiKey,
+      fallbackProvider: alphaVantageProvider,
+    );
+    final stockProvider = FinnhubFundamentalsOverlayStockProvider(
+      fallbackProvider: alphaVantageProvider,
+      finnhubProvider: finnhubProvider,
+    );
+
+    Future<List<DataFeedStatus>> supplementalLoader() async {
+      final primary = await alphaVantageProvider.loadSupplementalFeedStatuses();
+      final extra = <DataFeedStatus>[];
+      try {
+        final yahooSlice = await yahooProvider.loadUniverse(rangeDays: 60);
+        extra.add(
+          DataFeedStatus(
+            name: 'Yahoo Finance (secondary)',
+            availability: yahooSlice.availability,
+            refreshCadence: yahooSlice.refreshCadence,
+            detail: yahooSlice.detail,
+            lastUpdated: yahooSlice.asOf,
+          ),
+        );
+      } catch (_) {
+        extra.add(
+          const DataFeedStatus(
+            name: 'Yahoo Finance (secondary)',
+            availability: FeedAvailability.missing,
+            refreshCadence: FeedRefreshCadence.daily,
+            detail:
+                'Yahoo Finance is unreachable. Configure kCorsProxyPrefix in local_secrets.dart or run the app server-side.',
+          ),
+        );
+      }
+      try {
+        final stooqSlice = await stooqProvider.loadUniverse();
+        extra.add(
+          DataFeedStatus(
+            name: 'Stooq (secondary)',
+            availability: stooqSlice.availability,
+            refreshCadence: stooqSlice.refreshCadence,
+            detail: stooqSlice.detail,
+            lastUpdated: stooqSlice.asOf,
+          ),
+        );
+      } catch (_) {
+        extra.add(
+          const DataFeedStatus(
+            name: 'Stooq (secondary)',
+            availability: FeedAvailability.missing,
+            refreshCadence: FeedRefreshCadence.daily,
+            detail:
+                'Stooq did not respond. May be rate-limited or temporarily unavailable.',
+          ),
+        );
+      }
+      try {
+        final finnhubSlice = await finnhubProvider.probe();
+        extra.add(
+          DataFeedStatus(
+            name: 'Finnhub fundamentals',
+            availability: finnhubSlice.availability,
+            refreshCadence: finnhubSlice.refreshCadence,
+            detail: finnhubSlice.detail,
+            lastUpdated: finnhubSlice.asOf,
+          ),
+        );
+      } catch (_) {
+        extra.add(
+          const DataFeedStatus(
+            name: 'Finnhub fundamentals',
+            availability: FeedAvailability.missing,
+            refreshCadence: FeedRefreshCadence.intraday,
+            detail:
+                'Finnhub request failed. Check the API key and rate limits.',
+          ),
+        );
+      }
+      extra.add(
+        FredMacroStatusProvider(
+          apiKey: configuration.fredApiKey ?? local.kFredApiKey,
+        ).status(),
+      );
+      return [...primary, ...extra];
+    }
+
     return ProviderMarketRepository(
-      marketEnvironmentProvider: alphaVantageProvider,
+      marketEnvironmentProvider: macroProvider,
       styleSignalProvider: alphaVantageProvider,
       sectorSignalProvider: alphaVantageProvider,
-      stockSignalProvider: alphaVantageProvider,
+      stockSignalProvider: stockProvider,
       validationWindowProvider: alphaVantageProvider,
       historicalMarketStateProvider: alphaVantageProvider,
-      supplementalFeedStatusesLoader:
-          alphaVantageProvider.loadSupplementalFeedStatuses,
+      supplementalFeedStatusesLoader: supplementalLoader,
       archive:
           archive ??
           createDefaultMarketSnapshotArchive(
@@ -282,7 +402,7 @@ class ProviderMarketRepository implements MarketIntelligenceRepository {
       stockUniverseCount: currentState.stocks.length,
     );
     final archivedSnapshots = await _archive.loadSnapshots();
-    final snapshot = withHistoricalInsights(
+    final snapshotWithHistory = withHistoricalInsights(
       snapshot: evaluation.snapshot,
       historicalSnapshots: archivedSnapshots,
       engine: _engine,
@@ -301,6 +421,48 @@ class ProviderMarketRepository implements MarketIntelligenceRepository {
     final supplementalFeedStatuses =
         await _supplementalFeedStatusesLoader?.call() ??
         const <DataFeedStatus>[];
+    final primaryDataFeedStatuses = feedStatuses
+        .map(
+          (feed) => DataFeedStatus(
+            name: feed.name,
+            availability: feed.availability,
+            refreshCadence: feed.refreshCadence,
+            detail: feed.detail,
+            lastUpdated: feed.asOf,
+          ),
+        )
+        .toList();
+    final archiveStatus = DataFeedStatus(
+      name: 'Point-in-time archive',
+      availability: archiveSummary.hasSnapshots
+          ? FeedAvailability.connected
+          : FeedAvailability.missing,
+      refreshCadence: FeedRefreshCadence.onDemand,
+      detail: archiveSummary.hasSnapshots
+          ? 'Snapshots from the provider-backed repository are archived locally, and fixture mode primes that archive with research replay history so trends have durable local depth.'
+          : 'Archive wiring exists, but no provider-backed snapshots have been stored yet.',
+      lastUpdated: archiveSummary.latestSnapshotAsOf,
+    );
+    final providerCoverageStatus = DataFeedStatus(
+      name: 'Provider coverage',
+      availability: adapterAvailability,
+      refreshCadence: adapterAvailability == FeedAvailability.connected
+          ? FeedRefreshCadence.intraday
+          : FeedRefreshCadence.planned,
+      detail:
+          'Overall coverage across the feed rows above. Connected means every required feed is live; Fixture means at least one input is still using fixture or fallback data.',
+      lastUpdated: _latestOptionalAsOf(feedStatuses.map((feed) => feed.asOf)),
+    );
+    final dataFeedStatuses = [
+      ...primaryDataFeedStatuses,
+      archiveStatus,
+      providerCoverageStatus,
+      ...supplementalFeedStatuses,
+    ];
+    final snapshot = const RecommendationTrustGate().apply(
+      snapshot: snapshotWithHistory,
+      feeds: dataFeedStatuses,
+    );
     final hydratedHistoryCount = historicalStates.length;
     final runtimeSummary =
         '$dataSummary The current run scored ${evaluation.scoredStocks.length} stocks and hydrated $hydratedHistoryCount historical market snapshots before archiving the latest state.';
@@ -314,41 +476,7 @@ class ProviderMarketRepository implements MarketIntelligenceRepository {
         archiveSummary: archiveSummary.summaryText,
         archiveSnapshotCount: archiveSummary.snapshotCount,
         latestArchive: archiveSummary.latestSnapshotAsOf,
-        feeds: [
-          ...feedStatuses.map(
-            (feed) => DataFeedStatus(
-              name: feed.name,
-              availability: feed.availability,
-              refreshCadence: feed.refreshCadence,
-              detail: feed.detail,
-              lastUpdated: feed.asOf,
-            ),
-          ),
-          DataFeedStatus(
-            name: 'Point-in-time archive',
-            availability: archiveSummary.hasSnapshots
-                ? FeedAvailability.connected
-                : FeedAvailability.missing,
-            refreshCadence: FeedRefreshCadence.onDemand,
-            detail: archiveSummary.hasSnapshots
-                ? 'Snapshots from the provider-backed repository are archived locally, and fixture mode primes that archive with research replay history so trends have durable local depth.'
-                : 'Archive wiring exists, but no provider-backed snapshots have been stored yet.',
-            lastUpdated: archiveSummary.latestSnapshotAsOf,
-          ),
-          DataFeedStatus(
-            name: 'Provider coverage',
-            availability: adapterAvailability,
-            refreshCadence: adapterAvailability == FeedAvailability.connected
-                ? FeedRefreshCadence.intraday
-                : FeedRefreshCadence.planned,
-            detail:
-                'Overall coverage across the feed rows above. Connected means every required feed is live; Fixture means at least one input is still using fixture or fallback data.',
-            lastUpdated: _latestOptionalAsOf(
-              feedStatuses.map((feed) => feed.asOf),
-            ),
-          ),
-          ...supplementalFeedStatuses,
-        ],
+        feeds: dataFeedStatuses,
       ),
       engineStatus: EngineStatusReport(
         title: 'Deterministic committee engine',

@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../../models/market_intelligence.dart';
+import '../../models/recommendation_ledger_models.dart';
 import '../../models/workflow_models.dart';
 import '../../theme/app_theme.dart';
 import '../widgets/insight_widgets.dart';
@@ -10,6 +11,7 @@ class WorkflowHubView extends StatelessWidget {
     super.key,
     required this.snapshot,
     required this.workflowState,
+    required this.ledger,
     required this.onOpenStock,
     required this.onToggleWatchlist,
     required this.onToggleSavedIdea,
@@ -18,6 +20,7 @@ class WorkflowHubView extends StatelessWidget {
 
   final MarketIntelligenceSnapshot snapshot;
   final WorkflowState workflowState;
+  final RecommendationLedger ledger;
   final ValueChanged<String> onOpenStock;
   final ValueChanged<String> onToggleWatchlist;
   final ValueChanged<String> onToggleSavedIdea;
@@ -25,7 +28,9 @@ class WorkflowHubView extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final stockMap = {for (final stock in snapshot.rankedUniverse) stock.ticker: stock};
+    final stockMap = {
+      for (final stock in snapshot.rankedUniverse) stock.ticker: stock,
+    };
     final alertMap = {
       for (final alert in snapshot.sellAlerts) alert.ticker: alert,
     };
@@ -165,12 +170,184 @@ class WorkflowHubView extends StatelessWidget {
                       actions: workflowState.recentActions,
                     ),
                   ),
+                  SizedBox(
+                    width: constraints.maxWidth,
+                    child: _RecommendationLedgerCard(
+                      ledger: ledger,
+                      onOpenStock: onOpenStock,
+                    ),
+                  ),
                 ],
               ),
             ],
           );
         },
       ),
+    );
+  }
+}
+
+class _RecommendationLedgerCard extends StatelessWidget {
+  const _RecommendationLedgerCard({
+    required this.ledger,
+    required this.onOpenStock,
+  });
+
+  final RecommendationLedger ledger;
+  final ValueChanged<String> onOpenStock;
+
+  @override
+  Widget build(BuildContext context) {
+    final recent = ledger.recent.take(18).toList();
+    final measured = ledger.records
+        .where(
+          (record) =>
+              record.outcome5d?.status == OutcomeStatus.measured ||
+              record.outcome20d?.status == OutcomeStatus.measured ||
+              record.outcome60d?.status == OutcomeStatus.measured,
+        )
+        .length;
+    return InsightCard(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const Icon(
+                Icons.receipt_long_rounded,
+                color: AppTheme.mint,
+                size: 22,
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  'Recommendation ledger',
+                  style: Theme.of(context).textTheme.headlineMedium,
+                ),
+              ),
+              TonePill(
+                label: '${ledger.records.length} records | $measured measured',
+                tone: SignalTone.neutral,
+              ),
+            ],
+          ),
+          const SizedBox(height: 10),
+          Text(
+            'Every ranked snapshot is stored locally with action, trust level, score, thesis, and later 5/20/60-day outcome slots when price coverage is available.',
+            style: Theme.of(context).textTheme.bodyMedium,
+          ),
+          const SizedBox(height: 14),
+          if (recent.isEmpty)
+            const EmptyStateCard(
+              icon: Icons.receipt_long_outlined,
+              title: 'No ledger records yet.',
+              message:
+                  'The ledger fills automatically after the first scored snapshot renders.',
+            )
+          else
+            ...recent.map(
+              (record) => Padding(
+                padding: const EdgeInsets.only(bottom: 10),
+                child: _LedgerRecordRow(
+                  record: record,
+                  onOpenStock: onOpenStock,
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+class _LedgerRecordRow extends StatelessWidget {
+  const _LedgerRecordRow({required this.record, required this.onOpenStock});
+
+  final RecommendationRecord record;
+  final ValueChanged<String> onOpenStock;
+
+  @override
+  Widget build(BuildContext context) {
+    final actionTint = actionColor(record.action);
+    return InkWell(
+      borderRadius: BorderRadius.circular(14),
+      onTap: () => onOpenStock(record.ticker),
+      child: Container(
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+          color: Colors.white.withValues(alpha: 0.03),
+          borderRadius: BorderRadius.circular(14),
+          border: Border.all(color: Colors.white.withValues(alpha: 0.08)),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                SizedBox(
+                  width: 78,
+                  child: Text(
+                    record.ticker,
+                    style: Theme.of(context).textTheme.titleMedium,
+                  ),
+                ),
+                Expanded(
+                  child: Text(
+                    '${record.action.label} | ${record.trustLevel.label} | ${record.regime.label}',
+                    style: Theme.of(
+                      context,
+                    ).textTheme.bodySmall?.copyWith(color: actionTint),
+                  ),
+                ),
+                Text(
+                  record.opportunityScore.round().toString(),
+                  style: Theme.of(
+                    context,
+                  ).textTheme.titleMedium?.copyWith(color: AppTheme.mint),
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                _OutcomePill(label: '5d', outcome: record.outcome5d),
+                _OutcomePill(label: '20d', outcome: record.outcome20d),
+                _OutcomePill(label: '60d', outcome: record.outcome60d),
+                TonePill(
+                  label: formatAsOf(record.asOf),
+                  tone: SignalTone.neutral,
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _OutcomePill extends StatelessWidget {
+  const _OutcomePill({required this.label, required this.outcome});
+
+  final String label;
+  final RecommendationOutcome? outcome;
+
+  @override
+  Widget build(BuildContext context) {
+    final current = outcome;
+    if (current == null) {
+      return TonePill(label: '$label pending', tone: SignalTone.neutral);
+    }
+    if (current.status == OutcomeStatus.priceMissing) {
+      return TonePill(label: '$label price missing', tone: SignalTone.caution);
+    }
+    final positive = current.returnPct >= 0;
+    return TonePill(
+      label:
+          '$label ${positive ? '+' : ''}${current.returnPct.toStringAsFixed(1)}%',
+      tone: positive ? SignalTone.positive : SignalTone.negative,
     );
   }
 }

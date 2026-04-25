@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import '../../models/market_intelligence.dart';
 import '../../theme/app_theme.dart';
 import '../widgets/insight_widgets.dart';
+import '../widgets/oracle_widgets.dart';
 
 class SellAlertsView extends StatelessWidget {
   const SellAlertsView({super.key, required this.alerts});
@@ -19,7 +20,8 @@ class SellAlertsView extends StatelessWidget {
           children: [
             ViewHeader(
               eyebrow: 'Sell Alerts',
-              title: 'Clusters of deterioration matter more than one indicator.',
+              title:
+                  'Clusters of deterioration matter more than one indicator.',
               subtitle:
                   'This board stays quiet until enough evidence accumulates to justify trimming, de-risking, or exiting.',
               trailing: TonePill(
@@ -47,6 +49,9 @@ class SellAlertsView extends StatelessWidget {
     final trimCount = alerts
         .where((alert) => alert.action == RecommendationAction.trim)
         .length;
+    final deRiskCount = alerts
+        .where((alert) => alert.action == RecommendationAction.deRisk)
+        .length;
     final exitCount = alerts
         .where((alert) => alert.action == RecommendationAction.exit)
         .length;
@@ -60,7 +65,7 @@ class SellAlertsView extends StatelessWidget {
         builder: (context, constraints) {
           final statWidth = adaptivePanelWidth(
             constraints.maxWidth,
-            maxColumns: 3,
+            maxColumns: 4,
             minWidth: 220,
           );
 
@@ -115,6 +120,20 @@ class SellAlertsView extends StatelessWidget {
                       tone: SignalTone.caution,
                       definition:
                           'Ideas where the thesis is not fully broken, but the reward has shrunk enough that smaller size makes more sense.',
+                    ),
+                  ),
+                  SizedBox(
+                    width: statWidth,
+                    child: MetricTile(
+                      label: 'De-risk alerts',
+                      value: '$deRiskCount',
+                      detail:
+                          'Stories where the evidence has weakened enough to cut exposure more meaningfully.',
+                      tone: deRiskCount > 0
+                          ? SignalTone.caution
+                          : SignalTone.neutral,
+                      definition:
+                          'De-risk means the thesis still has pieces working, but the cluster of warnings is now strong enough to reduce exposure aggressively.',
                     ),
                   ),
                   SizedBox(
@@ -229,7 +248,38 @@ class SellAlertsView extends StatelessWidget {
                           items: alert.triggers,
                           accent: AppTheme.coral,
                         ),
-                        const SizedBox(height: 8),
+                        const SizedBox(height: 10),
+                        LabelValueRow(
+                          label: 'Effective cluster weight',
+                          value: alert.effectiveClusterWeight.toStringAsFixed(
+                            2,
+                          ),
+                          highlight: AppTheme.amber,
+                          definition:
+                              'Time-decayed sum of deterioration signal weights. A fresh signal contributes ~1.0; a signal older than ~7 sessions contributes ~0.5.',
+                        ),
+                        LabelValueRow(
+                          label: 'Exit probability',
+                          value: '${alert.exitProbability.round()}%',
+                          highlight: AppTheme.coral,
+                          definition:
+                              'Rough probability that this turns into an outright exit within the next few sessions given current evidence.',
+                        ),
+                        const SizedBox(height: 12),
+                        if (alert.decayedTriggers.isNotEmpty) ...[
+                          DecayedTriggersCard(signals: alert.decayedTriggers),
+                          const SizedBox(height: 12),
+                        ],
+                        if (alert.macroGates.isNotEmpty) ...[
+                          MacroGatesCard(gates: alert.macroGates),
+                          const SizedBox(height: 12),
+                        ],
+                        if (alert.correlationCluster != null) ...[
+                          CorrelationClusterCard(
+                            cluster: alert.correlationCluster!,
+                          ),
+                          const SizedBox(height: 12),
+                        ],
                         Text(
                           'Next check: ${alert.nextCheck}',
                           style: Theme.of(

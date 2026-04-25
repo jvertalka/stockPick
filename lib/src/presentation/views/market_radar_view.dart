@@ -4,6 +4,7 @@ import '../../models/intelligence_app_state.dart';
 import '../../models/market_intelligence.dart';
 import '../../theme/app_theme.dart';
 import '../widgets/insight_widgets.dart';
+import '../widgets/oracle_widgets.dart';
 
 class MarketRadarView extends StatelessWidget {
   const MarketRadarView({
@@ -40,13 +41,11 @@ class MarketRadarView extends StatelessWidget {
             children: [
               ViewHeader(
                 eyebrow: 'Market Radar',
-                title:
-                    'The current tape is constructive, but now the system tells the truth about itself too.',
-                subtitle:
-                    'This view starts with the regime and internals, then shows the current state of the data repository and the validation stack behind the dashboard.',
+                title: _radarHeaderTitle(radar),
+                subtitle: _radarHeaderSubtitle(radar),
                 trailing: TonePill(
                   label: radar.regime.label,
-                  tone: SignalTone.positive,
+                  tone: _regimeTone(radar.regime),
                 ),
               ),
               const PlainEnglishGuideCard(
@@ -538,6 +537,14 @@ class MarketRadarView extends StatelessWidget {
                   ),
                 ],
               ),
+              const SizedBox(height: 18),
+              RegimeTransitionCard(
+                distribution: radar.regimeDistribution,
+                transition: radar.regimeTransition,
+                stability: radar.regimeStability,
+              ),
+              const SizedBox(height: 18),
+              BreadthDecompositionCard(rows: radar.breadthDecomposition),
             ],
           );
         },
@@ -638,6 +645,42 @@ SignalTone _feedTone(FeedAvailability availability) => switch (availability) {
   FeedAvailability.planned => SignalTone.caution,
   FeedAvailability.missing => SignalTone.negative,
 };
+
+SignalTone _regimeTone(MarketRegimeType regime) => switch (regime) {
+  MarketRegimeType.riskOn ||
+  MarketRegimeType.washoutRecovery => SignalTone.positive,
+  MarketRegimeType.neutral => SignalTone.neutral,
+  MarketRegimeType.euphoricMeltUp ||
+  MarketRegimeType.inflationStress ||
+  MarketRegimeType.growthScare => SignalTone.caution,
+  MarketRegimeType.riskOff ||
+  MarketRegimeType.creditDeterioration => SignalTone.negative,
+};
+
+String _radarHeaderTitle(MarketRadar radar) {
+  return switch (radar.regime) {
+    MarketRegimeType.riskOn =>
+      'Risk appetite is still in control, but confirmation matters.',
+    MarketRegimeType.neutral =>
+      'The tape is mixed enough that selectivity matters most.',
+    MarketRegimeType.riskOff =>
+      'The market is defensive, so capital preservation comes first.',
+    MarketRegimeType.inflationStress =>
+      'Inflation stress is reshaping the opportunity set.',
+    MarketRegimeType.growthScare =>
+      'Growth fear is rising, and fragile upside needs proof.',
+    MarketRegimeType.creditDeterioration =>
+      'Credit deterioration is forcing the market to care about balance-sheet risk.',
+    MarketRegimeType.euphoricMeltUp =>
+      'Momentum is powerful, but crowding is becoming the tax.',
+    MarketRegimeType.washoutRecovery =>
+      'Recovery signals are appearing, but the repair still needs confirmation.',
+  };
+}
+
+String _radarHeaderSubtitle(MarketRadar radar) {
+  return 'Current read: ${radar.regime.label} with ${radar.regimeConfidence.round()}% confidence and ${radar.internalHealth.label.toLowerCase()} underneath. This view ties the regime and internals to the repository coverage and validation stack behind the dashboard.';
+}
 
 class _SplitSummaryCard extends StatelessWidget {
   const _SplitSummaryCard({required this.split});

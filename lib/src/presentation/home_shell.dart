@@ -1,11 +1,16 @@
 import 'package:flutter/material.dart';
 
+import '../data/app_settings_store.dart';
 import '../data/portfolio_store.dart';
+import '../data/recommendation_ledger_store.dart';
 import '../data/user_workflow_store.dart';
 import '../engine/portfolio_decision_engine.dart';
+import '../engine/portfolio_universe_expander.dart';
+import '../models/app_settings_models.dart';
 import '../models/intelligence_app_state.dart';
 import '../models/market_intelligence.dart';
 import '../models/portfolio_models.dart';
+import '../models/recommendation_ledger_models.dart';
 import '../models/workflow_models.dart';
 import '../theme/app_theme.dart';
 import 'views/decision_desk_view.dart';
@@ -13,6 +18,7 @@ import 'views/market_radar_view.dart';
 import 'views/opportunity_board_view.dart';
 import 'views/scenario_lab_view.dart';
 import 'views/sell_alerts_view.dart';
+import 'views/settings_view.dart';
 import 'views/stock_intelligence_view.dart';
 import 'views/workflow_hub_view.dart';
 import 'widgets/insight_widgets.dart';
@@ -25,6 +31,7 @@ enum AppView {
   sellAlerts,
   scenarioLab,
   workflowHub,
+  settings,
 }
 
 extension AppViewMeta on AppView {
@@ -36,6 +43,7 @@ extension AppViewMeta on AppView {
     AppView.sellAlerts => 'Sell Alerts',
     AppView.scenarioLab => 'Scenario Lab',
     AppView.workflowHub => 'Workflow Hub',
+    AppView.settings => 'Settings',
   };
 
   IconData get icon => switch (this) {
@@ -46,6 +54,7 @@ extension AppViewMeta on AppView {
     AppView.sellAlerts => Icons.warning_amber_rounded,
     AppView.scenarioLab => Icons.science_rounded,
     AppView.workflowHub => Icons.bookmarks_rounded,
+    AppView.settings => Icons.tune_rounded,
   };
 }
 
@@ -66,23 +75,36 @@ class HomeShell extends StatefulWidget {
 }
 
 class _HomeShellState extends State<HomeShell> {
-  AppView _selectedView = AppView.marketRadar;
+  AppView _selectedView = AppView.decisionDesk;
   String? _selectedTicker;
   ScenarioType? _selectedScenario;
+  final AppSettingsStore _settingsStore = SharedPreferencesAppSettingsStore();
+  final RecommendationLedgerStore _ledgerStore =
+      SharedPreferencesRecommendationLedgerStore();
   final UserWorkflowStore _workflowStore = SharedPreferencesUserWorkflowStore();
   final PortfolioStore _portfolioStore = SharedPreferencesPortfolioStore();
   final PortfolioDecisionEngine _decisionEngine =
       const PortfolioDecisionEngine();
+  final PortfolioUniverseExpander _universeExpander =
+      const PortfolioUniverseExpander();
   WorkflowState _workflowState = WorkflowState.empty;
   PortfolioState _portfolioState = PortfolioState.empty;
+  AppSettings _appSettings = AppSettings.empty;
+  RecommendationLedger _recommendationLedger = RecommendationLedger.empty;
 
-  MarketIntelligenceSnapshot get _snapshot => widget.state.snapshot;
+  MarketIntelligenceSnapshot get _snapshot =>
+      _universeExpander.expand(widget.state.snapshot, [
+        ..._portfolioState.holdings.map((h) => h.ticker),
+        ..._appSettings.customUniverseTickers,
+      ]);
 
   @override
   void initState() {
     super.initState();
     _selectedTicker = _defaultTicker();
     _selectedScenario = _defaultScenario();
+    _loadAppSettings();
+    _loadRecommendationLedger();
     _loadWorkflowState();
     _loadPortfolioState();
   }
@@ -101,6 +123,9 @@ class _HomeShellState extends State<HomeShell> {
           (scenario) => scenario.type == _selectedScenario,
         )) {
       _selectedScenario = _defaultScenario();
+    }
+    if (oldWidget.state.snapshot.asOf != widget.state.snapshot.asOf) {
+      _recordRecommendationSnapshot();
     }
   }
 
@@ -226,6 +251,46 @@ class _HomeShellState extends State<HomeShell> {
     setState(() {
       _workflowState = state;
     });
+  }
+
+  Future<void> _loadAppSettings() async {
+    final settings = await _settingsStore.load();
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _appSettings = settings;
+    });
+  }
+
+  Future<void> _persistAppSettings(AppSettings settings) async {
+    setState(() {
+      _appSettings = settings;
+    });
+    await _settingsStore.save(settings);
+  }
+
+  Future<void> _loadRecommendationLedger() async {
+    final ledger = await _ledgerStore.load();
+    if (!mounted) {
+      return;
+    }
+    final next = ledger.upsertSnapshot(widget.state.snapshot);
+    setState(() {
+      _recommendationLedger = next;
+    });
+    await _ledgerStore.save(next);
+  }
+
+  Future<void> _recordRecommendationSnapshot() async {
+    final next = _recommendationLedger.upsertSnapshot(widget.state.snapshot);
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _recommendationLedger = next;
+    });
+    await _ledgerStore.save(next);
   }
 
   Future<void> _persistWorkflowState(WorkflowState state) async {
@@ -376,6 +441,7 @@ class _HomeShellState extends State<HomeShell> {
       AppView.scenarioLab => ScenarioLabView(
         scenarios: _snapshot.scenarios,
         selectedScenario: _selectedScenario,
+        rankedUniverse: _snapshot.rankedUniverse,
         onSelectScenario: (scenario) {
           setState(() {
             _selectedScenario = scenario;
@@ -385,6 +451,7 @@ class _HomeShellState extends State<HomeShell> {
       AppView.workflowHub => WorkflowHubView(
         snapshot: _snapshot,
         workflowState: _workflowState,
+        ledger: _recommendationLedger,
         onOpenStock: _openStock,
         onToggleWatchlist: (ticker) {
           _toggleWatchlist(ticker);
@@ -395,6 +462,12 @@ class _HomeShellState extends State<HomeShell> {
         onToggleAlertSubscription: (ticker) {
           _toggleAlertSubscription(ticker);
         },
+      ),
+      AppView.settings => SettingsView(
+        settings: _appSettings,
+        dataStatus: widget.state.dataStatus,
+        engineStatus: widget.state.engineStatus,
+        onSettingsChanged: _persistAppSettings,
       ),
     };
   }

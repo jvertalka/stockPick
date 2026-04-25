@@ -79,21 +79,31 @@ class OpportunityBoardView extends StatelessWidget {
               ),
             ),
             const SizedBox(height: 18),
-            ...stocks.map(
-              (stock) => Padding(
-                padding: const EdgeInsets.only(bottom: 16),
-                child: _OpportunityCard(
-                  stock: stock,
-                  isHighlighted: highlightedTickers.contains(stock.ticker),
-                  workflowState: workflowState,
-                  onOpen: () => onOpenStock(stock.ticker),
-                  onToggleWatchlist: () => onToggleWatchlist(stock.ticker),
-                  onToggleSavedIdea: () => onToggleSavedIdea(stock.ticker),
-                  onToggleAlertSubscription: () =>
-                      onToggleAlertSubscription(stock.ticker),
+            ...stocks
+                .take(50)
+                .map(
+                  (stock) => Padding(
+                    padding: const EdgeInsets.only(bottom: 16),
+                    child: _OpportunityCard(
+                      stock: stock,
+                      isHighlighted: highlightedTickers.contains(stock.ticker),
+                      workflowState: workflowState,
+                      onOpen: () => onOpenStock(stock.ticker),
+                      onToggleWatchlist: () => onToggleWatchlist(stock.ticker),
+                      onToggleSavedIdea: () => onToggleSavedIdea(stock.ticker),
+                      onToggleAlertSubscription: () =>
+                          onToggleAlertSubscription(stock.ticker),
+                    ),
+                  ),
+                ),
+            if (stocks.length > 50)
+              Padding(
+                padding: const EdgeInsets.only(top: 4, bottom: 12),
+                child: Text(
+                  '+${stocks.length - 50} more ranked — use the Decision Desk action filters or Stock Intelligence search to drill into lower-ranked names.',
+                  style: Theme.of(context).textTheme.bodySmall,
                 ),
               ),
-            ),
           ],
         ],
       ),
@@ -160,6 +170,8 @@ class _OpportunityCard extends StatelessWidget {
                                 const SizedBox(width: 12),
                               ],
                               ActionBadge(action: stock.action),
+                              const SizedBox(width: 8),
+                              DecisionTrustBadge(trust: stock.decisionTrust),
                             ],
                           ),
                           const SizedBox(height: 6),

@@ -384,6 +384,127 @@ class SeverityBadge extends StatelessWidget {
   }
 }
 
+class DecisionTrustBadge extends StatelessWidget {
+  const DecisionTrustBadge({super.key, required this.trust});
+
+  final DecisionTrustReport trust;
+
+  @override
+  Widget build(BuildContext context) {
+    final color = decisionTrustColor(trust.level);
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.16),
+        borderRadius: BorderRadius.circular(999),
+        border: Border.all(color: color.withValues(alpha: 0.3)),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(decisionTrustIcon(trust.level), size: 14, color: color),
+          const SizedBox(width: 6),
+          Text(
+            trust.level.label,
+            style: Theme.of(
+              context,
+            ).textTheme.labelLarge?.copyWith(color: color),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class DecisionTrustCard extends StatelessWidget {
+  const DecisionTrustCard({super.key, required this.trust});
+
+  final DecisionTrustReport trust;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final color = decisionTrustColor(trust.level);
+    return InsightCard(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(decisionTrustIcon(trust.level), color: color, size: 22),
+              const SizedBox(width: 8),
+              Text('Decision trust', style: theme.textTheme.headlineMedium),
+              const Spacer(),
+              DecisionTrustBadge(trust: trust),
+            ],
+          ),
+          const SizedBox(height: 10),
+          Text(trust.summary, style: theme.textTheme.bodyMedium),
+          if (trust.actionWasGated) ...[
+            const SizedBox(height: 10),
+            Text(
+              'Raw action: ${trust.originalAction!.label} | gated action: ${trust.gatedAction!.label}',
+              style: theme.textTheme.bodySmall?.copyWith(color: color),
+            ),
+          ],
+          const SizedBox(height: 14),
+          ...trust.components.map(
+            (component) => Padding(
+              padding: const EdgeInsets.only(bottom: 10),
+              child: _ProvenanceComponentRow(component: component),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _ProvenanceComponentRow extends StatelessWidget {
+  const _ProvenanceComponentRow({required this.component});
+
+  final SignalProvenanceComponent component;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final color = signalProvenanceColor(component.provenance);
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: Colors.white.withValues(alpha: 0.03),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: Colors.white.withValues(alpha: 0.08)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Expanded(
+                child: Text(component.label, style: theme.textTheme.titleSmall),
+              ),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                decoration: BoxDecoration(
+                  color: color.withValues(alpha: 0.16),
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: Text(
+                  component.provenance.label,
+                  style: theme.textTheme.labelSmall?.copyWith(color: color),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          Text(component.detail, style: theme.textTheme.bodySmall),
+        ],
+      ),
+    );
+  }
+}
+
 class MetricTile extends StatelessWidget {
   const MetricTile({
     super.key,
@@ -869,6 +990,27 @@ Color severityColor(AlertSeverity severity) => switch (severity) {
   AlertSeverity.high => const Color(0xFFFFA05F),
   AlertSeverity.critical => AppTheme.coral,
 };
+
+Color decisionTrustColor(DecisionTrustLevel level) => switch (level) {
+  DecisionTrustLevel.actionable => AppTheme.mint,
+  DecisionTrustLevel.researchOnly => AppTheme.amber,
+  DecisionTrustLevel.insufficientData => AppTheme.coral,
+};
+
+IconData decisionTrustIcon(DecisionTrustLevel level) => switch (level) {
+  DecisionTrustLevel.actionable => Icons.verified_rounded,
+  DecisionTrustLevel.researchOnly => Icons.manage_search_rounded,
+  DecisionTrustLevel.insufficientData => Icons.report_problem_outlined,
+};
+
+Color signalProvenanceColor(SignalProvenance provenance) =>
+    switch (provenance) {
+      SignalProvenance.live => AppTheme.mint,
+      SignalProvenance.cached => AppTheme.sky,
+      SignalProvenance.derived => AppTheme.amber,
+      SignalProvenance.fixture => const Color(0xFFFFA05F),
+      SignalProvenance.missing => AppTheme.coral,
+    };
 
 int adaptiveColumns(
   double maxWidth, {

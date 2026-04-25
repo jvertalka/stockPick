@@ -1,5 +1,6 @@
 import '../models/intelligence_app_state.dart';
 import 'fixture_market_repository.dart';
+import 'raw_data_enrichment.dart';
 import 'raw_market_data.dart';
 
 class FeedSlice<T> {
@@ -66,15 +67,17 @@ class FixtureMarketFeedProvider
            );
 
   final FixtureMarketRepository _repository;
+  static const RawDataEnrichment _enrichment = RawDataEnrichment();
 
   @override
   Future<FeedSlice<RawMarketEnvironment>> loadMarketEnvironment() async {
     final state = _repository.currentMarketState();
+    final enriched = _enrichment.enrichEnvironment(state.environment);
     return FeedSlice(
       name: 'Market and breadth',
       source: 'fixture-market-feed',
       asOf: state.asOf,
-      data: state.environment,
+      data: enriched,
       availability: FeedAvailability.fixture,
       refreshCadence: FeedRefreshCadence.intraday,
       detail:
@@ -115,15 +118,19 @@ class FixtureMarketFeedProvider
   @override
   Future<FeedSlice<List<RawStockSignal>>> loadStockSignals() async {
     final state = _repository.currentMarketState();
+    final enrichedEnv = _enrichment.enrichEnvironment(state.environment);
+    final enriched = state.stocks
+        .map((stock) => _enrichment.enrichStock(stock, enrichedEnv))
+        .toList();
     return FeedSlice(
       name: 'Stock, revisions, and options signals',
       source: 'fixture-stock-feed',
       asOf: state.asOf,
-      data: state.stocks,
+      data: enriched,
       availability: FeedAvailability.fixture,
       refreshCadence: FeedRefreshCadence.daily,
       detail:
-          'Single-name trend, revisions, quality, valuation, peer, and options-style inputs are still fixture-backed.',
+          'Single-name trend, revisions, quality, valuation, peer, and options-style inputs are fixture-backed; enrichment layer derives options depth, correlation clusters, and decayed signal ages.',
     );
   }
 
@@ -147,7 +154,10 @@ class FixtureMarketFeedProvider
 
   @override
   Future<FeedSlice<List<RawMarketState>>> loadHistoricalMarketStates() async {
-    final history = _repository.historicalReplayStates();
+    final history = _repository
+        .historicalReplayStates()
+        .map(_enrichment.enrichState)
+        .toList();
     final asOf = history.isEmpty
         ? _repository.currentMarketState().asOf
         : history.last.asOf;

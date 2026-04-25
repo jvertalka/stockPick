@@ -4,6 +4,7 @@ import '../../models/market_intelligence.dart';
 import '../../models/workflow_models.dart';
 import '../../theme/app_theme.dart';
 import '../widgets/insight_widgets.dart';
+import '../widgets/oracle_widgets.dart';
 
 class StockIntelligenceView extends StatelessWidget {
   const StockIntelligenceView({
@@ -95,7 +96,14 @@ class StockIntelligenceView extends StatelessWidget {
                 title: '${selected.ticker} inside its current regime context.',
                 subtitle:
                     'This page explains why the stock ranks where it does, what assumptions support the thesis, and what evidence would tell you the story is breaking.',
-                trailing: ActionBadge(action: selected.action),
+                trailing: Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: [
+                    ActionBadge(action: selected.action),
+                    DecisionTrustBadge(trust: selected.decisionTrust),
+                  ],
+                ),
               ),
               const PlainEnglishGuideCard(
                 summary:
@@ -112,15 +120,23 @@ class StockIntelligenceView extends StatelessWidget {
               Wrap(
                 spacing: 10,
                 runSpacing: 10,
-                children: stocks
-                    .map(
-                      (stock) => ChoiceChip(
-                        selected: stock.ticker == selected.ticker,
-                        label: Text(stock.ticker),
-                        onSelected: (_) => onSelectTicker(stock.ticker),
-                      ),
-                    )
-                    .toList(),
+                children: [
+                  // Always keep the selected ticker + its nearest 40 peers on
+                  // screen for quick hopping; larger universes get a search
+                  // pattern via the Opportunity Board.
+                  ...(_chipSlice(stocks, selected.ticker)).map(
+                    (stock) => ChoiceChip(
+                      selected: stock.ticker == selected.ticker,
+                      label: Text(stock.ticker),
+                      onSelected: (_) => onSelectTicker(stock.ticker),
+                    ),
+                  ),
+                  if (stocks.length > 40)
+                    Chip(
+                      label: Text('+${stocks.length - 40} more ranked'),
+                      avatar: const Icon(Icons.more_horiz, size: 16),
+                    ),
+                ],
               ),
               const SizedBox(height: 14),
               Wrap(
@@ -209,6 +225,8 @@ class StockIntelligenceView extends StatelessWidget {
                   ],
                 ),
               ),
+              const SizedBox(height: 18),
+              DecisionTrustCard(trust: selected.decisionTrust),
               const SizedBox(height: 18),
               Wrap(
                 spacing: 16,
@@ -558,11 +576,44 @@ class StockIntelligenceView extends StatelessWidget {
                   ),
                 ],
               ),
+              const SizedBox(height: 18),
+              ProbabilityForecastCard(forecasts: selected.forecasts),
+              const SizedBox(height: 18),
+              ConfidenceBreakdownCard(breakdown: selected.confidenceBreakdown),
+              const SizedBox(height: 18),
+              CounterfactualSensitivityCard(
+                counterfactuals: selected.counterfactuals,
+              ),
+              const SizedBox(height: 18),
+              PeerContrastCard(contrasts: selected.peerContrast),
+              const SizedBox(height: 18),
+              OptionsDepthCard(signal: selected.optionsSignal),
+              if (selected.correlationCluster != null) ...[
+                const SizedBox(height: 18),
+                CorrelationClusterCard(cluster: selected.correlationCluster!),
+              ],
+              if (selected.macroGates.isNotEmpty) ...[
+                const SizedBox(height: 18),
+                MacroGatesCard(gates: selected.macroGates),
+              ],
             ],
           );
         },
       ),
     );
+  }
+
+  /// Keeps the selected ticker plus up to 40 of its nearest-ranked peers so
+  /// the chip bar stays navigable when the universe grows to hundreds of
+  /// names.
+  List<StockInsight> _chipSlice(List<StockInsight> stocks, String? selected) {
+    if (stocks.length <= 40) return stocks;
+    final selectedIndex = stocks.indexWhere(
+      (stock) => stock.ticker == selected,
+    );
+    final anchor = selectedIndex < 0 ? 0 : selectedIndex;
+    final start = (anchor - 20).clamp(0, stocks.length - 40).toInt();
+    return stocks.sublist(start, start + 40);
   }
 }
 

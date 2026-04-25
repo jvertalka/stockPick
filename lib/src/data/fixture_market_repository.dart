@@ -5,6 +5,7 @@ import '../models/intelligence_app_state.dart';
 import 'market_snapshot_archive.dart';
 import 'market_snapshot_archive_factory.dart';
 import 'market_intelligence_repository.dart';
+import 'raw_data_enrichment.dart';
 import 'raw_market_data.dart';
 
 class FixtureMarketRepository implements MarketIntelligenceRepository {
@@ -31,15 +32,17 @@ class FixtureMarketRepository implements MarketIntelligenceRepository {
   final int _historicalSnapshotLimit;
   final ValidationEngine _validationEngine;
 
+  static const RawDataEnrichment _enrichment = RawDataEnrichment();
+
   @override
   Future<IntelligenceAppState> loadState() async {
     final syncTime = DateTime.now();
-    final currentState = currentMarketState();
+    final currentState = _enrichment.enrichState(currentMarketState());
     final windows = validationWindows();
     final historicalReplay = historicalReplayStates(
       currentState: currentState,
       validationWindows: windows,
-    );
+    ).map(_enrichment.enrichState).toList();
     final evaluation = _engine.evaluate(currentState);
     await _archive.saveSnapshots(
       historicalReplay,

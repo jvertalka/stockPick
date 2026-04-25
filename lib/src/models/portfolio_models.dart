@@ -6,19 +6,28 @@ class PortfolioHolding {
     required this.shares,
     required this.addedAt,
     this.averageCostBasis,
+    this.currentPrice,
+    this.currentValue,
     this.note,
   }) : ticker = normalizePortfolioTicker(ticker);
 
   final String ticker;
   final double shares;
   final double? averageCostBasis;
+  final double? currentPrice;
+  final double? currentValue;
   final String? note;
   final DateTime addedAt;
+
+  double? get effectivePrice =>
+      currentPrice ?? (currentValue != null ? currentValue! / shares : null);
 
   PortfolioHolding copyWith({
     String? ticker,
     double? shares,
     double? averageCostBasis,
+    double? currentPrice,
+    double? currentValue,
     String? note,
     DateTime? addedAt,
   }) {
@@ -26,6 +35,8 @@ class PortfolioHolding {
       ticker: ticker ?? this.ticker,
       shares: shares ?? this.shares,
       averageCostBasis: averageCostBasis ?? this.averageCostBasis,
+      currentPrice: currentPrice ?? this.currentPrice,
+      currentValue: currentValue ?? this.currentValue,
       note: note ?? this.note,
       addedAt: addedAt ?? this.addedAt,
     );
@@ -35,6 +46,8 @@ class PortfolioHolding {
     'ticker': ticker,
     'shares': shares,
     'averageCostBasis': averageCostBasis,
+    'currentPrice': currentPrice,
+    'currentValue': currentValue,
     'note': note,
     'addedAt': addedAt.toIso8601String(),
   };
@@ -44,6 +57,8 @@ class PortfolioHolding {
       ticker: json['ticker'] as String? ?? '',
       shares: _readDouble(json['shares']) ?? 0,
       averageCostBasis: _readDouble(json['averageCostBasis']),
+      currentPrice: _readDouble(json['currentPrice']),
+      currentValue: _readDouble(json['currentValue']),
       note: json['note'] as String?,
       addedAt:
           DateTime.tryParse(json['addedAt'] as String? ?? '') ?? DateTime.now(),
@@ -52,15 +67,49 @@ class PortfolioHolding {
 }
 
 class PortfolioState {
-  const PortfolioState({required this.holdings});
+  const PortfolioState({required this.holdings, this.cashBalance});
 
-  static const empty = PortfolioState(holdings: <PortfolioHolding>[]);
+  static const empty = PortfolioState(
+    holdings: <PortfolioHolding>[],
+    cashBalance: null,
+  );
+
+  static const _unset = Object();
 
   final List<PortfolioHolding> holdings;
+  final double? cashBalance;
 
-  bool get isEmpty => holdings.isEmpty;
+  bool get hasCashBalance => cashBalance != null && cashBalance! > 0;
+
+  bool get isEmpty => holdings.isEmpty && !hasCashBalance;
+
+  double get trackedHoldingsValue =>
+      holdings.fold(0, (sum, holding) => sum + (holding.currentValue ?? 0));
+
+  double? get trackedAccountValue {
+    final holdingsValue = trackedHoldingsValue;
+    if (hasCashBalance && holdingsValue > 0) {
+      return cashBalance! + holdingsValue;
+    }
+    if (hasCashBalance) {
+      return cashBalance;
+    }
+    return holdingsValue > 0 ? holdingsValue : null;
+  }
 
   Set<String> get tickers => holdings.map((holding) => holding.ticker).toSet();
+
+  PortfolioState copyWith({
+    List<PortfolioHolding>? holdings,
+    Object? cashBalance = _unset,
+  }) {
+    return PortfolioState(
+      holdings: holdings ?? this.holdings,
+      cashBalance: identical(cashBalance, _unset)
+          ? this.cashBalance
+          : cashBalance as double?,
+    );
+  }
 
   PortfolioHolding? holdingByTicker(String ticker) {
     final normalized = normalizePortfolioTicker(ticker);
@@ -79,7 +128,7 @@ class PortfolioState {
         if (existing.ticker != normalized) existing,
       holding,
     ]..sort((a, b) => a.ticker.compareTo(b.ticker));
-    return PortfolioState(holdings: next);
+    return PortfolioState(holdings: next, cashBalance: cashBalance);
   }
 
   PortfolioState removeHolding(String ticker) {
@@ -88,12 +137,14 @@ class PortfolioState {
       holdings: holdings
           .where((holding) => holding.ticker != normalized)
           .toList(),
+      cashBalance: cashBalance,
     );
   }
 
   String toJson() {
     return jsonEncode({
       'holdings': holdings.map((holding) => holding.toJson()).toList(),
+      'cashBalance': cashBalance,
     });
   }
 
@@ -120,6 +171,9 @@ class PortfolioState {
               )
               .toList()
             ..sort((a, b) => a.ticker.compareTo(b.ticker)),
+      cashBalance: _readDouble(
+        decoded is Map<String, dynamic> ? decoded['cashBalance'] : null,
+      ),
     );
   }
 }
@@ -129,13 +183,17 @@ class PortfolioImportResult {
     required this.state,
     required this.importedCount,
     required this.skippedRows,
+    this.importedCashBalance,
   });
 
   final PortfolioState state;
   final int importedCount;
   final int skippedRows;
+  final double? importedCashBalance;
 
-  bool get importedAny => importedCount > 0;
+  bool get importedAny =>
+      importedCount > 0 ||
+      (importedCashBalance != null && importedCashBalance! > 0);
 }
 
 PortfolioImportResult parsePortfolioHoldingsCsv(
@@ -158,6 +216,8 @@ PortfolioImportResult parsePortfolioHoldingsCsv(
   var state = existing;
   var importedCount = 0;
   var skippedRows = 0;
+  var importedCashBalance = 0.0;
+  var sawCashRow = false;
   final addedAt = importedAt ?? DateTime.now();
 
   for (final row in dataRows) {
@@ -178,7 +238,47 @@ PortfolioImportResult parsePortfolioHoldingsCsv(
       'currentquantity',
     ], fallbackIndex: 1);
     final ticker = normalizePortfolioTicker(tickerText ?? '');
+    final currentValueText = _cellValue(row, header, const [
+      'currentvalue',
+      'marketvalue',
+      'positionvalue',
+      'value',
+    ]);
+    final currentValue = _parseLooseNumber(currentValueText);
+    final currentPriceText = _cellValue(row, header, const [
+      'lastprice',
+      'price',
+      'currentprice',
+      'marketprice',
+    ]);
+    final currentPrice = _parseLooseNumber(currentPriceText);
+    final descriptionText = _cellValue(row, header, const [
+      'description',
+      'securitydescription',
+      'name',
+    ]);
+    final typeText = _cellValue(row, header, const [
+      'type',
+      'securitytype',
+      'assettype',
+    ]);
     final shares = _parseLooseNumber(sharesText);
+
+    if (_looksLikeCashRow(
+      ticker: ticker,
+      description: descriptionText,
+      type: typeText,
+      shares: shares,
+      currentValue: currentValue,
+    )) {
+      if (currentValue != null && currentValue > 0) {
+        importedCashBalance += currentValue;
+        sawCashRow = true;
+      } else {
+        skippedRows++;
+      }
+      continue;
+    }
 
     if (ticker.isEmpty || shares == null || shares <= 0) {
       skippedRows++;
@@ -211,16 +311,23 @@ PortfolioImportResult parsePortfolioHoldingsCsv(
         ticker: ticker,
         shares: shares,
         averageCostBasis: averageCostBasis,
+        currentPrice: currentPrice,
+        currentValue: currentValue,
         addedAt: addedAt,
       ),
     );
     importedCount++;
   }
 
+  if (sawCashRow) {
+    state = state.copyWith(cashBalance: importedCashBalance);
+  }
+
   return PortfolioImportResult(
     state: state,
     importedCount: importedCount,
     skippedRows: skippedRows,
+    importedCashBalance: sawCashRow ? importedCashBalance : null,
   );
 }
 
@@ -323,6 +430,32 @@ String? _cellValue(
 
 String _normalizeHeader(String value) {
   return value.toLowerCase().replaceAll(RegExp(r'[^a-z0-9]'), '');
+}
+
+bool _looksLikeCashRow({
+  required String ticker,
+  required String? description,
+  required String? type,
+  required double? shares,
+  required double? currentValue,
+}) {
+  final normalizedTicker = ticker.toUpperCase();
+  final normalizedDescription = (description ?? '').toUpperCase();
+  final normalizedType = (type ?? '').toUpperCase();
+
+  final looksLikeCashTicker =
+      normalizedTicker.startsWith('SPAXX') || normalizedTicker.contains('CASH');
+  final looksLikeCashDescription =
+      normalizedDescription.contains('MONEY MARKET') ||
+      normalizedDescription.contains('CASH RESERVE');
+  final looksLikeCashType = normalizedType.contains('CASH');
+  final missingShareCount = shares == null || shares <= 0;
+
+  return currentValue != null &&
+      currentValue > 0 &&
+      (looksLikeCashTicker ||
+          looksLikeCashDescription ||
+          (looksLikeCashType && missingShareCount));
 }
 
 double? _parseLooseNumber(String? raw) {
