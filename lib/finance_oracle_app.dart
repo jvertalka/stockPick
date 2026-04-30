@@ -144,9 +144,16 @@ class _FinanceOracleAppState extends State<FinanceOracleApp> {
   }
 
   Future<IntelligenceAppState> _buildFastStartFallback() async {
+    final configuration = MarketDataConfiguration.fromEnvironment();
+    final fastStartUniverseLimit = configuration.stockUniverseLimit < 220
+        ? configuration.stockUniverseLimit
+        : 220;
+    final fastStartHistoryLimit = configuration.historicalSnapshotLimit < 240
+        ? configuration.historicalSnapshotLimit
+        : 240;
     final fallback = await ProviderMarketRepository.fixtureBacked(
-      stockUniverseLimit: 80,
-      historicalSnapshotLimit: 240,
+      stockUniverseLimit: fastStartUniverseLimit,
+      historicalSnapshotLimit: fastStartHistoryLimit,
     ).loadState();
     return IntelligenceAppState(
       snapshot: fallback.snapshot,
@@ -227,9 +234,40 @@ class _StatusScaffold extends StatelessWidget {
 class _DefaultRepository implements MarketIntelligenceRepository {
   const _DefaultRepository();
 
+  static const int _startupUniverseLimit = 220;
+  static const int _startupHistoryLimit = 240;
+
   @override
   Future<IntelligenceAppState> loadState() {
     final configuration = MarketDataConfiguration.fromEnvironment();
+    return _buildRepository(_startupConfiguration(configuration)).loadState();
+  }
+
+  @override
+  Future<IntelligenceAppState> refreshState() {
+    return _buildRepository(
+      MarketDataConfiguration.fromEnvironment(),
+    ).loadState();
+  }
+
+  MarketDataConfiguration _startupConfiguration(
+    MarketDataConfiguration configuration,
+  ) {
+    return configuration.copyWith(
+      stockUniverseLimit:
+          configuration.stockUniverseLimit < _startupUniverseLimit
+          ? configuration.stockUniverseLimit
+          : _startupUniverseLimit,
+      historicalSnapshotLimit:
+          configuration.historicalSnapshotLimit < _startupHistoryLimit
+          ? configuration.historicalSnapshotLimit
+          : _startupHistoryLimit,
+    );
+  }
+
+  MarketIntelligenceRepository _buildRepository(
+    MarketDataConfiguration configuration,
+  ) {
     final repository = switch (configuration.mode) {
       MarketDataMode.fixtureOnly => ProviderMarketRepository.fixtureBacked(
         stockUniverseLimit: configuration.stockUniverseLimit,
@@ -242,11 +280,6 @@ class _DefaultRepository implements MarketIntelligenceRepository {
       MarketDataMode.livePreferred || MarketDataMode.liveRequired =>
         ProviderMarketRepository.liveConfigured(configuration: configuration),
     };
-    return repository.loadState();
-  }
-
-  @override
-  Future<IntelligenceAppState> refreshState() {
-    return loadState();
+    return repository;
   }
 }

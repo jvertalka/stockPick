@@ -1,4 +1,5 @@
 import 'local_secrets.dart' as local;
+import 'default_symbol_universe.dart';
 
 enum MarketDataMode { fixtureOnly, livePreferred, liveRequired, alphaVantage }
 
@@ -45,6 +46,45 @@ class MarketDataConfiguration {
   final int historicalSnapshotLimit;
 
   bool get hasBaseUrl => baseUrl != null && baseUrl!.trim().isNotEmpty;
+
+  MarketDataConfiguration copyWith({
+    MarketDataMode? mode,
+    String? baseUrl,
+    String? apiToken,
+    String? alphaVantageApiKey,
+    String? alphaVantageProxyUrl,
+    String? corsProxyPrefix,
+    List<String>? alphaVantageSymbols,
+    String? alphaVantageBenchmarkSymbol,
+    String? finnhubApiKey,
+    String? fredApiKey,
+    int? alphaVantageDailyRequestLimit,
+    int? alphaVantageSyncIntervalMinutes,
+    int? stockUniverseLimit,
+    int? historicalSnapshotLimit,
+  }) {
+    return MarketDataConfiguration(
+      mode: mode ?? this.mode,
+      baseUrl: baseUrl ?? this.baseUrl,
+      apiToken: apiToken ?? this.apiToken,
+      alphaVantageApiKey: alphaVantageApiKey ?? this.alphaVantageApiKey,
+      alphaVantageProxyUrl: alphaVantageProxyUrl ?? this.alphaVantageProxyUrl,
+      corsProxyPrefix: corsProxyPrefix ?? this.corsProxyPrefix,
+      alphaVantageSymbols: alphaVantageSymbols ?? this.alphaVantageSymbols,
+      alphaVantageBenchmarkSymbol:
+          alphaVantageBenchmarkSymbol ?? this.alphaVantageBenchmarkSymbol,
+      finnhubApiKey: finnhubApiKey ?? this.finnhubApiKey,
+      fredApiKey: fredApiKey ?? this.fredApiKey,
+      alphaVantageDailyRequestLimit:
+          alphaVantageDailyRequestLimit ?? this.alphaVantageDailyRequestLimit,
+      alphaVantageSyncIntervalMinutes:
+          alphaVantageSyncIntervalMinutes ??
+          this.alphaVantageSyncIntervalMinutes,
+      stockUniverseLimit: stockUniverseLimit ?? this.stockUniverseLimit,
+      historicalSnapshotLimit:
+          historicalSnapshotLimit ?? this.historicalSnapshotLimit,
+    );
+  }
 
   factory MarketDataConfiguration.fromEnvironment() {
     const modeValue = String.fromEnvironment(
@@ -111,7 +151,7 @@ class MarketDataConfiguration {
     final resolvedKey =
         envKey ?? _normalizeOptionalValue(local.kAlphaVantageApiKey);
     final resolvedSymbols = alphaVantageSymbolsEnv.trim().isEmpty
-        ? local.kSymbolUniverse
+        ? mergeSymbolUniverses([kDefaultSymbolUniverse, local.kSymbolUniverse])
         : _parseSymbolList(alphaVantageSymbolsEnv);
     final resolvedBenchmark =
         _normalizeTicker(alphaVantageBenchmarkSymbolValue) ??
@@ -124,7 +164,7 @@ class MarketDataConfiguration {
               : 25);
     final resolvedUniverseLimit = stockUniverseLimitValue > 0
         ? stockUniverseLimitValue
-        : (local.kStockUniverseLimit > 0 ? local.kStockUniverseLimit : 40);
+        : _maxInt([local.kStockUniverseLimit, kDefaultStockUniverseLimit]);
     final resolvedHistoryLimit = historicalSnapshotLimitValue > 0
         ? historicalSnapshotLimitValue
         : (local.kHistoricalSnapshotLimit > 0
@@ -207,5 +247,15 @@ class MarketDataConfiguration {
   static String? _normalizeTicker(String value) {
     final normalized = value.trim().toUpperCase();
     return normalized.isEmpty ? null : normalized;
+  }
+
+  static int _maxInt(Iterable<int> values) {
+    var maxValue = 0;
+    for (final value in values) {
+      if (value > maxValue) {
+        maxValue = value;
+      }
+    }
+    return maxValue;
   }
 }

@@ -21,14 +21,15 @@ const String kFredApiKey = '';
 /// --dart-define=ORACLE_CORS_PROXY_PREFIX=http://127.0.0.1:8787/proxy?url=
 const String kCorsProxyPrefix = 'http://127.0.0.1:8787/proxy?url=';
 
-/// Stocks to track. S&P 100 is a good starter universe.
+/// Optional tickers to add on top of the tracked default universe in
+/// `default_symbol_universe.dart`. Keep this short and personal: holdings,
+/// watchlist names, or niche ETFs you care about.
 const List<String> kSymbolUniverse = <String>[
-  'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META', 'NVDA', 'TSLA',
-  // ...
+  // 'AAPL', 'MSFT', 'NVDA', 'SPY',
 ];
 
 const String kBenchmarkSymbol = 'SPY';
 
 const int kAlphaVantageDailyRequestLimit = 25;
-const int kStockUniverseLimit = 100;
+const int kStockUniverseLimit = 420;
 const int kHistoricalSnapshotLimit = 500;

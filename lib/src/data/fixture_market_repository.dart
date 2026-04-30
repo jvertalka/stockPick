@@ -2,6 +2,7 @@ import '../engine/market_intelligence_engine.dart';
 import '../engine/market_metric_history_builder.dart';
 import '../engine/validation_engine.dart';
 import '../models/intelligence_app_state.dart';
+import 'default_symbol_universe.dart';
 import 'market_snapshot_archive.dart';
 import 'market_snapshot_archive_factory.dart';
 import 'market_intelligence_repository.dart';
@@ -1674,9 +1675,39 @@ class FixtureMarketRepository implements MarketIntelligenceRepository {
 
     final stocks = [...baseState.stocks];
     final existingTickers = stocks.map((stock) => stock.ticker).toSet();
+    final defaultProfiles = kDefaultSymbolUniverse
+        .map(defaultSymbolProfileFor)
+        .whereType<DefaultSymbolProfile>()
+        .toList();
+    final defaultBlueprints =
+        [
+          ...defaultProfiles.where(
+            (profile) => isCoreEtfSymbol(profile.symbol),
+          ),
+          ...defaultProfiles.where(
+            (profile) => !isCoreEtfSymbol(profile.symbol),
+          ),
+        ].map(
+          (profile) => _SyntheticStockBlueprint(
+            ticker: profile.symbol,
+            company: profile.displayName,
+            sector: profile.sector,
+            industry: profile.industry,
+            templateTicker: profile.templateTicker,
+            momentumBias: profile.momentumBias,
+            qualityBias: profile.qualityBias,
+            valuationBias: profile.valuationBias,
+            riskBias: profile.riskBias,
+            growthBias: profile.growthBias,
+            defensiveBias: profile.defensiveBias,
+            creditBias: profile.creditBias,
+            rateBias: profile.rateBias,
+          ),
+        );
     final blueprintPool = [
       ..._syntheticStockBlueprints,
-      for (var index = 1; index <= 80; index++)
+      ...defaultBlueprints,
+      for (var index = 1; index <= cappedLimit; index++)
         _SyntheticStockBlueprint(
           ticker: 'FX${index.toString().padLeft(2, '0')}',
           company: 'Fixture Expansion $index',

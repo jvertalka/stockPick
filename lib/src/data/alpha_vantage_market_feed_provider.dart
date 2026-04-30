@@ -6,6 +6,7 @@ import '../models/intelligence_app_state.dart';
 import 'alpha_vantage_models.dart';
 import 'alpha_vantage_store.dart';
 import 'alpha_vantage_store_factory.dart';
+import 'default_symbol_universe.dart';
 import 'market_data_configuration.dart';
 import 'market_feed_provider.dart';
 import 'raw_market_data.dart';
@@ -412,13 +413,15 @@ class AlphaVantageMarketFeedProvider
         ? math.min(_configuration.stockUniverseLimit, maxFreshSymbols)
         : _configuration.stockUniverseLimit;
 
-    return candidateSymbols
+    final uniqueSymbols = candidateSymbols
         .map((symbol) => symbol.trim().toUpperCase())
         .where((symbol) => symbol.isNotEmpty)
         .where((symbol) => symbol != benchmarkSymbol)
         .toSet()
-        .take(limit)
         .toList();
+    final coreEtfs = uniqueSymbols.where(isCoreEtfSymbol);
+    final rest = uniqueSymbols.where((symbol) => !isCoreEtfSymbol(symbol));
+    return [...coreEtfs, ...rest].take(limit).toList();
   }
 
   /// After the Alpha Vantage pass, try Yahoo Finance for any requested symbol

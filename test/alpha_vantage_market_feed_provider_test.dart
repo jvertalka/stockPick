@@ -156,6 +156,47 @@ void main() {
     expect(requests.first.queryParameters['apikey'], 'demo-key');
   });
 
+  test('Alpha Vantage keeps core ETFs inside capped active scans', () async {
+    final requests = <Uri>[];
+    final client = MockClient((request) async {
+      requests.add(request.url);
+      return http.Response(
+        _dailySeriesJson(
+          symbol: request.url.queryParameters['symbol']!,
+          startClose: 100,
+          dailyStep: 0.7,
+        ),
+        200,
+        headers: {'content-type': 'application/json'},
+      );
+    });
+
+    final provider = AlphaVantageMarketFeedProvider(
+      configuration: const MarketDataConfiguration(
+        mode: MarketDataMode.alphaVantage,
+        alphaVantageApiKey: 'demo-key',
+        alphaVantageSymbols: ['AAPL', 'MSFT', 'QQQ', 'XLK'],
+        alphaVantageBenchmarkSymbol: 'SPY',
+        stockUniverseLimit: 2,
+      ),
+      fallbackProvider: FixtureMarketFeedProvider(),
+      client: client,
+      cacheStore: AlphaVantagePriceCacheStore(
+        priceCacheKey: 'test_core_etf_priority_price_cache',
+        quotaCacheKey: 'test_core_etf_priority_quota',
+      ),
+    );
+
+    final feed = await provider.loadStockSignals();
+
+    expect(feed.data.map((stock) => stock.ticker), ['QQQ', 'XLK']);
+    expect(requests.map((uri) => uri.queryParameters['symbol']), [
+      'SPY',
+      'QQQ',
+      'XLK',
+    ]);
+  });
+
   test('Alpha Vantage sync cooldown avoids repeated quota burns', () async {
     var requestCount = 0;
     final client = MockClient((request) async {
