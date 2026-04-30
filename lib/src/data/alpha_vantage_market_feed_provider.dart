@@ -430,7 +430,7 @@ class AlphaVantageMarketFeedProvider
   /// the configured CORS proxy works around.
   ///
   /// Requests run in batches of 10 concurrent calls to keep total wall time
-  /// under a minute even for 300-symbol universes.
+  /// under a minute even for larger universes.
   Future<int> _backfillFromYahoo({
     required Iterable<String> requestedSymbols,
     required Map<String, AlphaVantageDailySeries> seriesBySymbol,

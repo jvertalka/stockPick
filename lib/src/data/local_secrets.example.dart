@@ -31,5 +31,5 @@ const List<String> kSymbolUniverse = <String>[
 const String kBenchmarkSymbol = 'SPY';
 
 const int kAlphaVantageDailyRequestLimit = 25;
-const int kStockUniverseLimit = 420;
+const int kStockUniverseLimit = 900;
 const int kHistoricalSnapshotLimit = 500;

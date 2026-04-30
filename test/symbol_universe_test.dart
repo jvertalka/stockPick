@@ -14,8 +14,14 @@ void main() {
 
   test('default universe tracks a broad stock and ETF catalog', () {
     final symbols = kDefaultSymbolUniverse.toSet();
+    final etfCount = symbols
+        .where((symbol) => defaultSymbolProfileFor(symbol)?.isEtf ?? false)
+        .length;
+    final stockCount = symbols.length - etfCount;
 
-    expect(symbols.length, greaterThanOrEqualTo(575));
+    expect(symbols.length, greaterThanOrEqualTo(1300));
+    expect(stockCount, greaterThanOrEqualTo(1000));
+    expect(etfCount, greaterThanOrEqualTo(250));
     expect(symbols.containsAll(['AAPL', 'NVDA', 'JPM', 'LLY']), isTrue);
     expect(symbols.containsAll(['SPY', 'QQQ', 'XLK', 'HYG', 'TLT']), isTrue);
 
