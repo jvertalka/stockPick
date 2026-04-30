@@ -37,8 +37,9 @@ class YahooFinanceFeedProvider {
         '$_chartBase${Uri.encodeComponent(symbol)}?interval=1d&range=${rangeDays}d';
     final url = _wrap(raw);
     try {
-      final response =
-          await _client.get(Uri.parse(url)).timeout(const Duration(seconds: 12));
+      final response = await _client
+          .get(Uri.parse(url))
+          .timeout(const Duration(seconds: 5));
       if (response.statusCode != 200) {
         return null;
       }
@@ -52,8 +53,8 @@ class YahooFinanceFeedProvider {
       final timestamps =
           (entry['timestamp'] as List<dynamic>?)?.cast<int>() ?? const [];
       final indicators = entry['indicators'] as Map<String, dynamic>?;
-      final quoteList =
-          (indicators?['quote'] as List<dynamic>?)?.cast<Map<String, dynamic>>();
+      final quoteList = (indicators?['quote'] as List<dynamic>?)
+          ?.cast<Map<String, dynamic>>();
       if (timestamps.isEmpty || quoteList == null || quoteList.isEmpty) {
         return null;
       }
@@ -71,9 +72,9 @@ class YahooFinanceFeedProvider {
         if (close == null) continue;
         bars.add(
           YahooBar(
-            date:
-                DateTime.fromMillisecondsSinceEpoch(timestamps[i] * 1000)
-                    .toUtc(),
+            date: DateTime.fromMillisecondsSinceEpoch(
+              timestamps[i] * 1000,
+            ).toUtc(),
             open: _doubleOr(opens, i, close.toDouble()),
             high: _doubleOr(highs, i, close.toDouble()),
             low: _doubleOr(lows, i, close.toDouble()),
@@ -97,13 +98,14 @@ class YahooFinanceFeedProvider {
       }
     }
     final latest = loaded.values
-        .map((series) => series.bars.isEmpty
-            ? DateTime.now()
-            : series.bars.last.date)
+        .map(
+          (series) =>
+              series.bars.isEmpty ? DateTime.now() : series.bars.last.date,
+        )
         .fold<DateTime?>(
-      null,
-      (prev, next) => prev == null || next.isAfter(prev) ? next : prev,
-    );
+          null,
+          (prev, next) => prev == null || next.isAfter(prev) ? next : prev,
+        );
     return FeedSlice(
       name: 'Yahoo Finance daily OHLCV',
       source: 'yahoo-finance',

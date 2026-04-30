@@ -34,20 +34,34 @@ class RecommendationTrustGate {
     final sector = _find(feeds, 'Sector sponsorship');
     final validation = _find(feeds, 'Research labels and windows');
     final finnhub = _find(feeds, 'Finnhub fundamentals');
+    final sec = _find(feeds, 'SEC EDGAR fundamentals');
     final fred = _find(feeds, 'FRED macro');
+    final treasury = _find(feeds, 'U.S. Treasury Fiscal Data');
+    final gdelt = _find(feeds, 'GDELT event risk');
 
     final priceProvenance = _availabilityToProvenance(stock?.availability);
-    final macroProvenance = fred?.availability == FeedAvailability.connected
+    final macroProvenance =
+        fred?.availability == FeedAvailability.connected ||
+            treasury?.availability == FeedAvailability.connected
         ? SignalProvenance.live
         : _macroProvenance(market);
     final fundamentalsProvenance =
-        finnhub?.availability == FeedAvailability.connected
+        sec?.availability == FeedAvailability.connected ||
+            finnhub?.availability == FeedAvailability.connected
         ? SignalProvenance.live
         : _fallbackProvenance(stock);
     final revisionProvenance =
         finnhub?.availability == FeedAvailability.connected
         ? SignalProvenance.live
+        : sec?.availability == FeedAvailability.connected
+        ? SignalProvenance.cached
         : _fallbackProvenance(stock);
+    final eventRiskProvenance =
+        gdelt?.availability == FeedAvailability.connected
+        ? SignalProvenance.live
+        : sec?.availability == FeedAvailability.connected
+        ? SignalProvenance.cached
+        : SignalProvenance.derived;
     final optionsProvenance = _optionsProvenance(feeds);
 
     return [
@@ -63,9 +77,10 @@ class RecommendationTrustGate {
         label: 'Macro and regime',
         provenance: macroProvenance,
         detail:
-            fred?.detail ??
+            _joinDetails([fred?.detail, treasury?.detail, market?.detail]) ??
             market?.detail ??
             'No macro provider was reported for this snapshot.',
+        blocksStrongActions: !macroProvenance.isReal,
       ),
       SignalProvenanceComponent(
         label: 'Style rotation',
@@ -85,24 +100,32 @@ class RecommendationTrustGate {
         label: 'Fundamentals',
         provenance: fundamentalsProvenance,
         detail:
-            finnhub?.detail ??
+            _joinDetails([sec?.detail, finnhub?.detail]) ??
             'Fundamental fields are still fallback or derived estimates.',
         blocksStrongActions: !fundamentalsProvenance.isReal,
       ),
       SignalProvenanceComponent(
-        label: 'Estimate revisions',
+        label: 'Fundamental direction',
         provenance: revisionProvenance,
         detail:
             finnhub?.detail ??
-            'Revision fields are still fallback or derived estimates.',
+            sec?.detail ??
+            'Fundamental-direction fields are still fallback or derived estimates.',
         blocksStrongActions: !revisionProvenance.isReal,
+      ),
+      SignalProvenanceComponent(
+        label: 'Event risk',
+        provenance: eventRiskProvenance,
+        detail:
+            _joinDetails([gdelt?.detail, sec?.detail]) ??
+            'Event risk is inferred from price and existing risk fields.',
       ),
       SignalProvenanceComponent(
         label: 'Options surface',
         provenance: optionsProvenance,
-        detail:
-            'Options risk is currently an inferred surface until a chain, skew, or volatility provider is connected.',
-        blocksStrongActions: !optionsProvenance.isReal,
+        detail: optionsProvenance.isReal
+            ? 'Options chain, skew, or volatility data is connected.'
+            : 'Options risk is currently inferred from price, volatility, filing, and event pressure. Add a real options provider to upgrade this component.',
       ),
       SignalProvenanceComponent(
         label: 'Forward outcomes',
@@ -237,7 +260,7 @@ class RecommendationTrustGate {
         : ' The raw ${originalAction.label} action was gated to ${gatedAction.label}.';
     return switch (level) {
       DecisionTrustLevel.actionable =>
-        'The required price, fundamental, revision, and options inputs are sufficiently covered for this action.',
+        'The required price, macro, fundamental-direction, and event-risk inputs are sufficiently covered for this action. Options may still be inferred unless the options component is marked live.',
       DecisionTrustLevel.researchOnly =>
         'Treat this as research-only until $blockedLabels are upgraded to connected or cached feeds.$actionText',
       DecisionTrustLevel.insufficientData =>
@@ -282,6 +305,17 @@ class RecommendationTrustGate {
       return _availabilityToProvenance(options.availability);
     }
     return SignalProvenance.derived;
+  }
+
+  String? _joinDetails(List<String?> details) {
+    final present = details
+        .where((detail) => detail != null && detail.trim().isNotEmpty)
+        .cast<String>()
+        .toList();
+    if (present.isEmpty) {
+      return null;
+    }
+    return present.join(' ');
   }
 
   SignalProvenance _availabilityToProvenance(FeedAvailability? availability) {

@@ -993,6 +993,10 @@ class _DecisionCard extends StatelessWidget {
           ],
           const SizedBox(height: 14),
           _ScoreStrip(decision: decision),
+          if (!decision.stock.forecasts.isEmpty) ...[
+            const SizedBox(height: 14),
+            _PredictionStrip(decision: decision),
+          ],
           const SizedBox(height: 14),
           Text(
             'Why this decision',
@@ -1059,6 +1063,96 @@ class _ScoreStrip extends StatelessWidget {
           color: AppTheme.coral,
         ),
       ],
+    );
+  }
+}
+
+class _PredictionStrip extends StatelessWidget {
+  const _PredictionStrip({required this.decision});
+
+  final PortfolioDecision decision;
+
+  @override
+  Widget build(BuildContext context) {
+    final forecasts = decision.stock.forecasts;
+    final forward20 = forecasts.forwardReturn20d;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text('Prediction read', style: Theme.of(context).textTheme.titleMedium),
+        const SizedBox(height: 8),
+        Wrap(
+          spacing: 10,
+          runSpacing: 10,
+          children: [
+            _PredictionChip(
+              label: 'Outperform sector',
+              value: '${forecasts.outperformSectorProbability.round()}%',
+              color: AppTheme.mint,
+            ),
+            _PredictionChip(
+              label: '8% drawdown risk',
+              value: '${forecasts.drawdownOver8pctProbability.round()}%',
+              color: AppTheme.coral,
+            ),
+            _PredictionChip(
+              label: 'Breakout persists',
+              value: '${forecasts.breakoutPersistenceProbability.round()}%',
+              color: AppTheme.sky,
+            ),
+            _PredictionChip(
+              label: '20d median return',
+              value: _formatSignedPercentValue(forward20.p50),
+              color: forward20.p50 >= 0 ? AppTheme.mint : AppTheme.coral,
+            ),
+          ],
+        ),
+        const SizedBox(height: 6),
+        Text(
+          decision.stock.decisionTrust.isActionable
+              ? 'These are rules-engine probabilities, useful for ranking decisions today. They are not yet trained model forecasts.'
+              : 'These probabilities are capped because the current evidence stack is not fully decision-ready.',
+          style: Theme.of(context).textTheme.bodySmall,
+        ),
+      ],
+    );
+  }
+}
+
+class _PredictionChip extends StatelessWidget {
+  const _PredictionChip({
+    required this.label,
+    required this.value,
+    required this.color,
+  });
+
+  final String label;
+  final String value;
+  final Color color;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: 142,
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.08),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: color.withValues(alpha: 0.18)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            value,
+            style: Theme.of(
+              context,
+            ).textTheme.titleLarge?.copyWith(color: color),
+          ),
+          const SizedBox(height: 2),
+          Text(label, style: Theme.of(context).textTheme.bodySmall),
+        ],
+      ),
     );
   }
 }
@@ -1173,6 +1267,11 @@ String _formatMoneyCompact(double value) {
 
 String _formatPercent(double value) {
   return '${(value * 100).toStringAsFixed(1)}%';
+}
+
+String _formatSignedPercentValue(double value) {
+  final sign = value > 0 ? '+' : '';
+  return '$sign${value.toStringAsFixed(1)}%';
 }
 
 String _portfolioStatusLabel(PortfolioState state) {

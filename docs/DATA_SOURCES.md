@@ -11,6 +11,10 @@ what each source provides, its limits, and how to expand coverage.
 | **Alpha Vantage** | API key | Free: 25 req/day · Premium: 75+/min | Daily OHLCV; FX, crypto, some fundamentals on paid tiers | Primary |
 | **Yahoo Finance** | None | Generous, unofficial | Daily OHLCV, intraday on most symbols | Probe / secondary |
 | **Stooq** | None | Gentle | Daily OHLCV via CSV | Probe / secondary |
+| **FRED** | Free API key | Light-use public API | VIX, yield curve, credit spreads, financial conditions, breakevens | Macro regime |
+| **U.S. Treasury Fiscal Data** | None | Public API | Average Treasury financing-rate pressure | Macro confirmation |
+| **SEC EDGAR** | None | Public API; use respectful refreshes | XBRL company facts, recent 10-Q/10-K/8-K/Form 4 filing activity | Fundamentals overlay |
+| **GDELT** | None | Public API; noisy but broad | Company news pressure and negative event-risk spikes | Event-risk overlay |
 | **Fixture** | None | n/a | Hardcoded universe + research replay history | Fallback |
 
 The Universe today is **100 S&P 100 names** in `lib/src/data/local_secrets.dart`
@@ -40,15 +44,32 @@ To break out of the rotation throttle, in priority order:
 |---|---|---|
 | Daily prices, volume | Alpha Vantage (where covered) → fixture | Alpha Vantage Premium / Polygon / Tiingo |
 | Sector / industry classification | Hardcoded in fixture | Refinitiv / FactSet / Polygon ticker reference |
-| Earnings revisions, estimates | Faked from existing values via enrichment | FactSet / Refinitiv / Zacks / Estimize |
-| Margin / FCF / balance sheet | Faked from enrichment | SEC EDGAR (free!) / FactSet / FMP |
+| Earnings revisions, estimates | SEC fundamental direction + Finnhub if configured | FactSet / Refinitiv / Zacks / Estimize |
+| Margin / FCF / balance sheet | SEC EDGAR XBRL when reachable | SEC EDGAR (free!) / FactSet / FMP |
 | IV rank / skew / gamma / flow | Faked from enrichment | CBOE DataShop / OPRA / broker chains |
-| Macro (credit spreads, conditions) | Hardcoded fixture | FRED (free) + ICE / Markit |
+| Macro (credit spreads, conditions) | FRED + Treasury where reachable | FRED (free) + ICE / Markit |
+| News / event risk | GDELT + SEC filing activity | Licensed news + filings + event calendars |
 | Forward returns (validation labels) | Hardcoded fixture | Computed point-in-time from real prices |
 
 Anywhere "faked from enrichment" appears, the values are deterministic
 derivations from existing fields — internally consistent but not real
 market data. Replacing those is the gating work for trained models.
+
+## Free decision layer
+
+The free layer is designed for daily decisions now:
+
+1. FRED + Treasury classify the macro regime and rate pressure.
+2. SEC EDGAR replaces fallback quality fields with official filing-derived
+   revenue, margin, free cash flow, leverage, dilution, and event-risk inputs.
+3. GDELT adds free news-pressure warnings. It is noisy, so it affects risk and
+   fragility more than upside.
+4. The Decision Desk groups the ranked universe into buy, hold, watch, trim,
+   and sell, then shows rule-based prediction probabilities for each decision.
+
+The app still flags options as inferred until a real options provider is
+connected. Free-source decisions are useful for discipline and ranking, while
+IV skew, term structure, and flow remain the next paid upgrade.
 
 ## Setting up local secrets
 

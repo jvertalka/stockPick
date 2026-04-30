@@ -12,7 +12,8 @@ const String kFinnhubApiKey = '';
 const String kFredApiKey = '';
 
 /// Optional CORS proxy for providers that don't send browser CORS headers
-/// (Yahoo Finance, Stooq). Example: 'https://corsproxy.io/?'.
+/// (Yahoo Finance, Stooq, SEC EDGAR in Flutter web). Example:
+/// 'https://corsproxy.io/?'.
 /// Leave empty to disable those providers in Chrome.
 const String kCorsProxyPrefix = '';
 

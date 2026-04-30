@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import '../engine/market_intelligence_engine.dart';
 import '../engine/market_metric_history_builder.dart';
 import '../engine/validation_engine.dart';
@@ -6,6 +8,7 @@ import '../models/intelligence_app_state.dart';
 import 'alpha_vantage_market_feed_provider.dart';
 import 'finnhub_feed_provider.dart';
 import 'fred_macro_feed_provider.dart';
+import 'gdelt_event_feed_provider.dart';
 import 'live_market_feed_provider.dart';
 import 'local_secrets.dart' as local;
 import 'market_data_configuration.dart';
@@ -14,7 +17,9 @@ import 'market_intelligence_repository.dart';
 import 'market_snapshot_archive.dart';
 import 'market_snapshot_archive_factory.dart';
 import 'raw_market_data.dart';
+import 'sec_edgar_feed_provider.dart';
 import 'stooq_feed_provider.dart';
+import 'treasury_fiscal_feed_provider.dart';
 import 'yahoo_finance_feed_provider.dart';
 
 class ProviderMarketRepository implements MarketIntelligenceRepository {
@@ -108,9 +113,31 @@ class ProviderMarketRepository implements MarketIntelligenceRepository {
       apiKey: configuration.fredApiKey ?? local.kFredApiKey,
       fallbackProvider: liveProvider,
     );
-    final stockProvider = FinnhubFundamentalsOverlayStockProvider(
+    final treasuryProvider = TreasuryFiscalFeedProvider(
+      fallbackProvider: macroProvider,
+    );
+    final symbols = configuration.alphaVantageSymbols.isNotEmpty
+        ? configuration.alphaVantageSymbols
+        : const <String>['AAPL', 'MSFT', 'SPY'];
+    final secProvider = SecEdgarFeedProvider(
+      symbols: symbols,
+      corsProxyPrefix: local.kCorsProxyPrefix,
+    );
+    final gdeltProvider = GdeltEventFeedProvider(
+      symbols: symbols,
+      corsProxyPrefix: local.kCorsProxyPrefix,
+    );
+    final finnhubStockProvider = FinnhubFundamentalsOverlayStockProvider(
       fallbackProvider: liveProvider,
       finnhubProvider: finnhubProvider,
+    );
+    final secStockProvider = SecEdgarFundamentalsOverlayStockProvider(
+      fallbackProvider: finnhubStockProvider,
+      secProvider: secProvider,
+    );
+    final stockProvider = GdeltEventRiskOverlayStockProvider(
+      fallbackProvider: secStockProvider,
+      gdeltProvider: gdeltProvider,
     );
 
     final dataTitle = switch (configuration.mode) {
@@ -159,7 +186,7 @@ class ProviderMarketRepository implements MarketIntelligenceRepository {
     };
 
     return ProviderMarketRepository(
-      marketEnvironmentProvider: macroProvider,
+      marketEnvironmentProvider: treasuryProvider,
       styleSignalProvider: liveProvider,
       sectorSignalProvider: liveProvider,
       stockSignalProvider: stockProvider,
@@ -174,12 +201,12 @@ class ProviderMarketRepository implements MarketIntelligenceRepository {
       dataTitle: dataTitle,
       dataSummary: dataSummary,
       engineSummary:
-          'A rules-based ensemble now consumes provider-backed feeds to derive the regime read, stock ranking, sell alerts, and scenarios. Live adapters can now sit in front of the same engine contract.',
+          'A rules-based ensemble now consumes provider-backed feeds plus the free macro, SEC, Treasury, and event-risk layer to derive regime reads, stock rankings, buy/hold/sell guidance, sell alerts, and scenarios.',
       engineCaveats: engineCaveats,
       engineNextSteps: const [
-        'Connect real market, fundamental, and options endpoints to the live provider contract.',
+        'Promote the free-source overlays into a server-backed cache so daily decisions are faster and less exposed to browser CORS limits.',
+        'Connect a real options endpoint for IV skew, term structure, and flow confirmation.',
         'Promote the local archive into a durable point-in-time history store.',
-        'Run leakage-safe backtests and shadow mode on connected feeds before training ML models.',
       ],
     );
   }
@@ -217,9 +244,28 @@ class ProviderMarketRepository implements MarketIntelligenceRepository {
       apiKey: configuration.fredApiKey ?? local.kFredApiKey,
       fallbackProvider: alphaVantageProvider,
     );
-    final stockProvider = FinnhubFundamentalsOverlayStockProvider(
+    final treasuryProvider = TreasuryFiscalFeedProvider(
+      fallbackProvider: macroProvider,
+    );
+    final secProvider = SecEdgarFeedProvider(
+      symbols: probeSymbols,
+      corsProxyPrefix: local.kCorsProxyPrefix,
+    );
+    final gdeltProvider = GdeltEventFeedProvider(
+      symbols: probeSymbols,
+      corsProxyPrefix: local.kCorsProxyPrefix,
+    );
+    final finnhubStockProvider = FinnhubFundamentalsOverlayStockProvider(
       fallbackProvider: alphaVantageProvider,
       finnhubProvider: finnhubProvider,
+    );
+    final secStockProvider = SecEdgarFundamentalsOverlayStockProvider(
+      fallbackProvider: finnhubStockProvider,
+      secProvider: secProvider,
+    );
+    final stockProvider = GdeltEventRiskOverlayStockProvider(
+      fallbackProvider: secStockProvider,
+      gdeltProvider: gdeltProvider,
     );
 
     Future<List<DataFeedStatus>> supplementalLoader() async {
@@ -296,11 +342,68 @@ class ProviderMarketRepository implements MarketIntelligenceRepository {
           apiKey: configuration.fredApiKey ?? local.kFredApiKey,
         ).status(),
       );
+      try {
+        extra.add(await treasuryProvider.status());
+      } catch (_) {
+        extra.add(
+          const DataFeedStatus(
+            name: 'U.S. Treasury Fiscal Data',
+            availability: FeedAvailability.missing,
+            refreshCadence: FeedRefreshCadence.daily,
+            detail:
+                'Treasury Fiscal Data did not respond. FRED and price-derived rate proxies remain active.',
+          ),
+        );
+      }
+      try {
+        final secSlice = await secProvider.probe();
+        extra.add(
+          DataFeedStatus(
+            name: 'SEC EDGAR fundamentals',
+            availability: secSlice.availability,
+            refreshCadence: secSlice.refreshCadence,
+            detail: secSlice.detail,
+            lastUpdated: secSlice.asOf,
+          ),
+        );
+      } catch (_) {
+        extra.add(
+          const DataFeedStatus(
+            name: 'SEC EDGAR fundamentals',
+            availability: FeedAvailability.missing,
+            refreshCadence: FeedRefreshCadence.eventDriven,
+            detail:
+                'SEC EDGAR request failed. Browser builds may need kCorsProxyPrefix because data.sec.gov does not support browser CORS.',
+          ),
+        );
+      }
+      try {
+        final gdeltSlice = await gdeltProvider.probe();
+        extra.add(
+          DataFeedStatus(
+            name: 'GDELT event risk',
+            availability: gdeltSlice.availability,
+            refreshCadence: gdeltSlice.refreshCadence,
+            detail: gdeltSlice.detail,
+            lastUpdated: gdeltSlice.asOf,
+          ),
+        );
+      } catch (_) {
+        extra.add(
+          const DataFeedStatus(
+            name: 'GDELT event risk',
+            availability: FeedAvailability.missing,
+            refreshCadence: FeedRefreshCadence.eventDriven,
+            detail:
+                'GDELT request failed. Event-risk scoring will rely on price, SEC filings, and existing risk fields.',
+          ),
+        );
+      }
       return [...primary, ...extra];
     }
 
     return ProviderMarketRepository(
-      marketEnvironmentProvider: macroProvider,
+      marketEnvironmentProvider: treasuryProvider,
       styleSignalProvider: alphaVantageProvider,
       sectorSignalProvider: alphaVantageProvider,
       stockSignalProvider: stockProvider,
@@ -315,19 +418,19 @@ class ProviderMarketRepository implements MarketIntelligenceRepository {
       engine: engine,
       dataTitle: 'Alpha Vantage price spine',
       dataSummary:
-          'Daily OHLCV prices from Alpha Vantage now drive the real price-history spine when an API key and quota are available. The app syncs that history into a local store first, then reads trend, volatility, breadth, relative-strength, stock-score history, and chart provenance from local coverage where possible; fundamentals, analyst revisions, options-style signals, and labeled outcomes remain clearly marked fallback inputs until those feeds are connected.',
+          'Daily OHLCV prices from Alpha Vantage drive the real price-history spine when an API key and quota are available. The app syncs that history into a local store first, then layers in the free-source macro, Treasury, SEC EDGAR, and GDELT evidence where reachable; options-style signals remain inferred until an options chain provider is connected.',
       engineSummary:
-          'A rules-based ensemble now consumes Alpha Vantage price history where available to derive regime reads, stock rankings, buy/hold/sell guidance, sell alerts, and scenario views. It is a stronger decision engine foundation, but it is still not a trained or calibrated ML stack.',
+          'A rules-based ensemble now consumes Alpha Vantage price history plus free macro, filing, and event-risk evidence where available to derive regime reads, stock rankings, buy/hold/sell guidance, sell alerts, and scenario views. It is decision-ready as a rules engine, but not yet a trained or calibrated ML stack.',
       engineCaveats: const [
         'This is still not a trained model stack.',
-        'Alpha Vantage currently supplies daily price and volume history only.',
-        'Fundamentals, revisions, options-style fields, and validation labels still need connected point-in-time feeds.',
+        'Free-source SEC and GDELT coverage can be delayed or blocked by browser CORS unless a proxy/server layer is used.',
+        'Options-style fields remain inferred until a real options provider is connected.',
         'Probabilities in the UI are still implied by rules, not calibrated forecasts.',
       ],
       engineNextSteps: const [
-        'Add a portfolio/account import so buy, hold, trim, and sell calls are tied to real positions.',
-        'Connect fundamentals, earnings estimates, and options-risk feeds beside the price spine.',
-        'Build a point-in-time research dataset for leakage-safe backtests before training ML models.',
+        'Use the Decision Desk daily: review new buys, holds, trims, exits, and the evidence that would change them.',
+        'Move free-source SEC, Treasury, and GDELT calls behind a backend cache for reliability.',
+        'Connect a paid options provider when IV skew, term structure, and flow need to stop being inferred.',
       ],
     );
   }
@@ -348,19 +451,27 @@ class ProviderMarketRepository implements MarketIntelligenceRepository {
   final String engineSummary;
   final List<String> engineCaveats;
   final List<String> engineNextSteps;
+  static const Duration _supplementalFeedStatusTimeout = Duration(seconds: 12);
 
   @override
   Future<IntelligenceAppState> loadState() async {
     final syncTime = DateTime.now();
-    final environmentFeed = await _marketEnvironmentProvider
+    final environmentFeedFuture = _marketEnvironmentProvider
         .loadMarketEnvironment();
-    final styleFeed = await _styleSignalProvider.loadStyleSignals();
-    final sectorFeed = await _sectorSignalProvider.loadSectorSignals();
-    final stockFeed = await _stockSignalProvider.loadStockSignals();
-    final validationFeed = await _validationWindowProvider
+    final styleFeedFuture = _styleSignalProvider.loadStyleSignals();
+    final sectorFeedFuture = _sectorSignalProvider.loadSectorSignals();
+    final stockFeedFuture = _stockSignalProvider.loadStockSignals();
+    final validationFeedFuture = _validationWindowProvider
         .loadValidationWindows();
-    final historicalFeed = await _historicalMarketStateProvider
+    final historicalFeedFuture = _historicalMarketStateProvider
         .loadHistoricalMarketStates();
+
+    final environmentFeed = await environmentFeedFuture;
+    final styleFeed = await styleFeedFuture;
+    final sectorFeed = await sectorFeedFuture;
+    final stockFeed = await stockFeedFuture;
+    final validationFeed = await validationFeedFuture;
+    final historicalFeed = await historicalFeedFuture;
 
     final currentState = RawMarketState(
       asOf: _latestAsOf([
@@ -418,9 +529,7 @@ class ProviderMarketRepository implements MarketIntelligenceRepository {
     final adapterAvailability = _adapterAvailability(
       feedStatuses.map((feed) => feed.availability),
     );
-    final supplementalFeedStatuses =
-        await _supplementalFeedStatusesLoader?.call() ??
-        const <DataFeedStatus>[];
+    final supplementalFeedStatuses = await _loadSupplementalFeedStatuses();
     final primaryDataFeedStatuses = feedStatuses
         .map(
           (feed) => DataFeedStatus(
@@ -493,6 +602,36 @@ class ProviderMarketRepository implements MarketIntelligenceRepository {
   @override
   Future<IntelligenceAppState> refreshState() {
     return loadState();
+  }
+
+  Future<List<DataFeedStatus>> _loadSupplementalFeedStatuses() async {
+    final loader = _supplementalFeedStatusesLoader;
+    if (loader == null) {
+      return const <DataFeedStatus>[];
+    }
+    try {
+      return await loader().timeout(_supplementalFeedStatusTimeout);
+    } on TimeoutException {
+      return const [
+        DataFeedStatus(
+          name: 'Supplemental free-source status probes',
+          availability: FeedAvailability.missing,
+          refreshCadence: FeedRefreshCadence.onDemand,
+          detail:
+              'Free-source status probes took longer than 12 seconds. The decision layer loaded without waiting and will try those checks again on refresh.',
+        ),
+      ];
+    } catch (_) {
+      return const [
+        DataFeedStatus(
+          name: 'Supplemental free-source status probes',
+          availability: FeedAvailability.missing,
+          refreshCadence: FeedRefreshCadence.onDemand,
+          detail:
+              'Free-source status probes failed. The decision layer loaded from the primary market state and available overlays.',
+        ),
+      ];
+    }
   }
 
   FeedAvailability _adapterAvailability(

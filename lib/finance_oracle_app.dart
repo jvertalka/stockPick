@@ -23,16 +23,18 @@ class _FinanceOracleAppState extends State<FinanceOracleApp> {
   late Future<IntelligenceAppState> _stateFuture;
   bool _isRefreshing = false;
   Timer? _syncTimer;
+  IntelligenceAppState? _lastGoodState;
 
   /// How often the app silently refreshes in the background. 20 minutes is
   /// compatible with Alpha Vantage's free 25/day quota while still feeling
   /// fresh during the trading session.
   static const Duration _autoSyncInterval = Duration(minutes: 20);
+  static const Duration _interactiveLoadTimeout = Duration(seconds: 35);
 
   @override
   void initState() {
     super.initState();
-    _stateFuture = widget._repository.loadState();
+    _stateFuture = _loadRepositoryState();
     _startAutoSync();
   }
 
@@ -77,6 +79,7 @@ class _FinanceOracleAppState extends State<FinanceOracleApp> {
             );
           }
 
+          _lastGoodState = snapshot.data!;
           return HomeShell(
             state: snapshot.data!,
             isRefreshing: _isRefreshing,
@@ -95,7 +98,7 @@ class _FinanceOracleAppState extends State<FinanceOracleApp> {
     setState(() {
       _isRefreshing = true;
     });
-    final future = widget._repository.refreshState();
+    final future = _loadRepositoryState(refresh: true);
     if (!silent) {
       setState(() {
         _stateFuture = future;
@@ -118,6 +121,56 @@ class _FinanceOracleAppState extends State<FinanceOracleApp> {
         });
       }
     }
+  }
+
+  Future<IntelligenceAppState> _loadRepositoryState({
+    bool refresh = false,
+  }) async {
+    try {
+      final state = await Future<IntelligenceAppState>(
+        () => refresh
+            ? widget._repository.refreshState()
+            : widget._repository.loadState(),
+      ).timeout(_interactiveLoadTimeout);
+      _lastGoodState = state;
+      return state;
+    } on TimeoutException {
+      final lastGood = _lastGoodState;
+      if (lastGood != null) {
+        return lastGood;
+      }
+      return _buildFastStartFallback();
+    }
+  }
+
+  Future<IntelligenceAppState> _buildFastStartFallback() async {
+    final fallback = await ProviderMarketRepository.fixtureBacked(
+      stockUniverseLimit: 80,
+      historicalSnapshotLimit: 240,
+    ).loadState();
+    return IntelligenceAppState(
+      snapshot: fallback.snapshot,
+      dataStatus: DataStatusReport(
+        title: 'Fast-start fallback',
+        summary:
+            'The live/free-source data layer took longer than ${_interactiveLoadTimeout.inSeconds} seconds, so the app opened with the local rules-engine fallback. Press Refresh to retry live Alpha Vantage, Treasury, SEC EDGAR, and GDELT inputs.',
+        lastRefresh: DateTime.now(),
+        archiveSummary: fallback.dataStatus.archiveSummary,
+        archiveSnapshotCount: fallback.dataStatus.archiveSnapshotCount,
+        latestArchive: fallback.dataStatus.latestArchive,
+        feeds: [
+          const DataFeedStatus(
+            name: 'Live/free-source startup',
+            availability: FeedAvailability.missing,
+            refreshCadence: FeedRefreshCadence.onDemand,
+            detail:
+                'Initial live data load timed out before the first dashboard render. The app stayed usable and will retry on refresh.',
+          ),
+          ...fallback.dataStatus.feeds,
+        ],
+      ),
+      engineStatus: fallback.engineStatus,
+    );
   }
 }
 

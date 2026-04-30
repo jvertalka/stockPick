@@ -68,6 +68,10 @@ class AlphaVantageMarketFeedProvider
   final AlphaVantagePriceCacheStore _cacheStore;
   Future<_PriceBundle>? _bundleFuture;
 
+  static const Duration _alphaVantageRequestTimeout = Duration(seconds: 5);
+  static const int _maxAlphaVantageNetworkRequestsPerRefresh = 6;
+  static const int _maxYahooBackfillSymbolsPerRefresh = 16;
+
   @override
   Future<List<DataFeedStatus>> loadSupplementalFeedStatuses() async {
     final snapshot = await _cacheStore.loadSnapshot();
@@ -296,8 +300,18 @@ class AlphaVantageMarketFeedProvider
     var networkRequests = 0;
     var successfulFetches = 0;
 
+    var networkCapMessageAdded = false;
     for (final symbol in requestedSymbols) {
-      final result = await _loadSeries(symbol, allowNetwork: allowNetwork);
+      final canUseNetwork =
+          allowNetwork &&
+          networkRequests < _maxAlphaVantageNetworkRequestsPerRefresh;
+      if (allowNetwork && !canUseNetwork && !networkCapMessageAdded) {
+        messages.add(
+          'Alpha Vantage network sync is capped at $_maxAlphaVantageNetworkRequestsPerRefresh symbols per interactive refresh so the dashboard opens quickly.',
+        );
+        networkCapMessageAdded = true;
+      }
+      final result = await _loadSeries(symbol, allowNetwork: canUseNetwork);
       if (result.series != null) {
         seriesBySymbol[symbol] = result.series!;
       }
@@ -418,8 +432,11 @@ class AlphaVantageMarketFeedProvider
     required Map<String, AlphaVantageDailySeries> seriesBySymbol,
     required DateTime now,
   }) async {
-    final missing = requestedSymbols
+    final allMissing = requestedSymbols
         .where((symbol) => !seriesBySymbol.containsKey(symbol))
+        .toList();
+    final missing = allMissing
+        .take(_maxYahooBackfillSymbolsPerRefresh)
         .toList();
     if (missing.isEmpty) return 0;
 
@@ -506,7 +523,9 @@ class AlphaVantageMarketFeedProvider
         'outputsize': 'compact',
         'apikey': apiKey,
       });
-      final response = await _client.get(uri);
+      final response = await _client
+          .get(uri)
+          .timeout(_alphaVantageRequestTimeout);
       await _recordQuotaUse();
       if (response.statusCode < 200 || response.statusCode >= 300) {
         return _SeriesLoadResult(
