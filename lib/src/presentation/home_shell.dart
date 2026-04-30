@@ -13,6 +13,7 @@ import '../models/portfolio_models.dart';
 import '../models/recommendation_ledger_models.dart';
 import '../models/workflow_models.dart';
 import '../theme/app_theme.dart';
+import 'views/daily_decision_brief_view.dart';
 import 'views/decision_desk_view.dart';
 import 'views/market_radar_view.dart';
 import 'views/opportunity_board_view.dart';
@@ -24,6 +25,7 @@ import 'views/workflow_hub_view.dart';
 import 'widgets/insight_widgets.dart';
 
 enum AppView {
+  dailyBrief,
   marketRadar,
   decisionDesk,
   opportunityBoard,
@@ -36,6 +38,7 @@ enum AppView {
 
 extension AppViewMeta on AppView {
   String get label => switch (this) {
+    AppView.dailyBrief => 'Daily Brief',
     AppView.marketRadar => 'Market Radar',
     AppView.decisionDesk => 'Decision Desk',
     AppView.opportunityBoard => 'Opportunity Board',
@@ -47,6 +50,7 @@ extension AppViewMeta on AppView {
   };
 
   IconData get icon => switch (this) {
+    AppView.dailyBrief => Icons.today_rounded,
     AppView.marketRadar => Icons.radar_rounded,
     AppView.decisionDesk => Icons.fact_check_rounded,
     AppView.opportunityBoard => Icons.view_list_rounded,
@@ -75,7 +79,7 @@ class HomeShell extends StatefulWidget {
 }
 
 class _HomeShellState extends State<HomeShell> {
-  AppView _selectedView = AppView.decisionDesk;
+  AppView _selectedView = AppView.dailyBrief;
   String? _selectedTicker;
   ScenarioType? _selectedScenario;
   final AppSettingsStore _settingsStore = SharedPreferencesAppSettingsStore();
@@ -205,19 +209,9 @@ class _HomeShellState extends State<HomeShell> {
         ),
         bottomNavigationBar: showRail
             ? null
-            : NavigationBar(
-                selectedIndex: AppView.values.indexOf(_selectedView),
-                onDestinationSelected: (index) {
-                  _handleViewChange(AppView.values[index]);
-                },
-                destinations: AppView.values
-                    .map(
-                      (view) => NavigationDestination(
-                        icon: Icon(view.icon),
-                        label: view.label,
-                      ),
-                    )
-                    .toList(),
+            : _MobileNavBar(
+                selectedView: _selectedView,
+                onSelect: _handleViewChange,
               ),
       ),
     );
@@ -384,6 +378,15 @@ class _HomeShellState extends State<HomeShell> {
 
   Widget _buildView() {
     return switch (_selectedView) {
+      AppView.dailyBrief => DailyDecisionBriefView(
+        snapshot: _snapshot,
+        report: _decisionEngine.build(
+          snapshot: _snapshot,
+          portfolio: _portfolioState,
+        ),
+        ledger: _recommendationLedger,
+        onOpenStock: _openStock,
+      ),
       AppView.marketRadar => MarketRadarView(
         radar: _snapshot.marketRadar,
         dataStatus: widget.state.dataStatus,
@@ -470,6 +473,107 @@ class _HomeShellState extends State<HomeShell> {
         onSettingsChanged: _persistAppSettings,
       ),
     };
+  }
+}
+
+class _MobileNavBar extends StatelessWidget {
+  const _MobileNavBar({required this.selectedView, required this.onSelect});
+
+  final AppView selectedView;
+  final ValueChanged<AppView> onSelect;
+
+  @override
+  Widget build(BuildContext context) {
+    return SafeArea(
+      top: false,
+      child: Container(
+        height: 86,
+        decoration: BoxDecoration(
+          color: AppTheme.surface.withValues(alpha: 0.96),
+          border: Border(
+            top: BorderSide(color: Colors.white.withValues(alpha: 0.08)),
+          ),
+        ),
+        child: SingleChildScrollView(
+          scrollDirection: Axis.horizontal,
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+          child: Row(
+            children: AppView.values
+                .map(
+                  (view) => _MobileNavItem(
+                    view: view,
+                    selected: view == selectedView,
+                    onTap: () => onSelect(view),
+                  ),
+                )
+                .toList(),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _MobileNavItem extends StatelessWidget {
+  const _MobileNavItem({
+    required this.view,
+    required this.selected,
+    required this.onTap,
+  });
+
+  final AppView view;
+  final bool selected;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final color = selected ? AppTheme.mint : AppTheme.textMuted;
+
+    return Tooltip(
+      message: view.label,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 3),
+        child: InkWell(
+          borderRadius: BorderRadius.circular(16),
+          onTap: onTap,
+          child: AnimatedContainer(
+            duration: const Duration(milliseconds: 180),
+            width: 74,
+            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 7),
+            decoration: BoxDecoration(
+              color: selected
+                  ? AppTheme.mint.withValues(alpha: 0.14)
+                  : Colors.transparent,
+              borderRadius: BorderRadius.circular(16),
+              border: Border.all(
+                color: selected
+                    ? AppTheme.mint.withValues(alpha: 0.25)
+                    : Colors.transparent,
+              ),
+            ),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(view.icon, size: 22, color: color),
+                const SizedBox(height: 5),
+                Text(
+                  view.label,
+                  textAlign: TextAlign.center,
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                    color: color,
+                    fontSize: 10.5,
+                    height: 1.1,
+                    fontWeight: selected ? FontWeight.w700 : FontWeight.w600,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
   }
 }
 

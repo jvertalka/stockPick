@@ -29,7 +29,7 @@ class _FinanceOracleAppState extends State<FinanceOracleApp> {
   /// compatible with Alpha Vantage's free 25/day quota while still feeling
   /// fresh during the trading session.
   static const Duration _autoSyncInterval = Duration(minutes: 20);
-  static const Duration _interactiveLoadTimeout = Duration(seconds: 35);
+  static const Duration _interactiveLoadTimeout = Duration(seconds: 12);
 
   @override
   void initState() {
