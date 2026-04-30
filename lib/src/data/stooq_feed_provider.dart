@@ -10,20 +10,23 @@ import 'market_feed_provider.dart';
 class StooqFeedProvider {
   StooqFeedProvider({
     required this.symbols,
+    this.corsProxyPrefix = '',
     http.Client? client,
   }) : _client = client ?? http.Client();
 
   final List<String> symbols;
+  final String corsProxyPrefix;
   final http.Client _client;
 
   /// Stooq uses lowercase symbols with a `.us` suffix for US equities and a
   /// daily CSV endpoint: https://stooq.com/q/d/l/?s=aapl.us&i=d
   Future<StooqBarSeries?> loadDailyBars(String symbol) async {
     final stooqSymbol = _toStooqSymbol(symbol);
-    final url = 'https://stooq.com/q/d/l/?s=$stooqSymbol&i=d';
+    final url = _wrap('https://stooq.com/q/d/l/?s=$stooqSymbol&i=d');
     try {
-      final response =
-          await _client.get(Uri.parse(url)).timeout(const Duration(seconds: 12));
+      final response = await _client
+          .get(Uri.parse(url))
+          .timeout(const Duration(seconds: 5));
       if (response.statusCode != 200) return null;
       final body = response.body.trim();
       if (body.isEmpty || !body.contains('Date')) return null;
@@ -66,9 +69,9 @@ class StooqFeedProvider {
     final latest = loaded.values
         .map((series) => series.bars.last.date)
         .fold<DateTime?>(
-      null,
-      (prev, next) => prev == null || next.isAfter(prev) ? next : prev,
-    );
+          null,
+          (prev, next) => prev == null || next.isAfter(prev) ? next : prev,
+        );
     return FeedSlice(
       name: 'Stooq daily OHLCV',
       source: 'stooq',
@@ -88,6 +91,16 @@ class StooqFeedProvider {
     // BRK.B etc — Stooq expects dots replaced with hyphens.
     final normalized = symbol.toLowerCase().replaceAll('.', '-');
     return '$normalized.us';
+  }
+
+  String _wrap(String url) {
+    if (corsProxyPrefix.isEmpty) {
+      return url;
+    }
+    if (corsProxyPrefix.contains('url=')) {
+      return '$corsProxyPrefix${Uri.encodeComponent(url)}';
+    }
+    return '$corsProxyPrefix$url';
   }
 }
 

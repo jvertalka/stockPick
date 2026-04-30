@@ -15,6 +15,7 @@ what each source provides, its limits, and how to expand coverage.
 | **U.S. Treasury Fiscal Data** | None | Public API | Average Treasury financing-rate pressure | Macro confirmation |
 | **SEC EDGAR** | None | Public API; use respectful refreshes | XBRL company facts, recent 10-Q/10-K/8-K/Form 4 filing activity | Fundamentals overlay |
 | **GDELT** | None | Public API; noisy but broad | Company news pressure and negative event-risk spikes | Event-risk overlay |
+| **Local backend cache** | None | Your machine | CORS-safe cached proxy for Yahoo, Stooq, SEC, GDELT, Treasury, FRED, Alpha Vantage | Recommended runtime |
 | **Fixture** | None | n/a | Hardcoded universe + research replay history | Fallback |
 
 The Universe today is **100 S&P 100 names** in `lib/src/data/local_secrets.dart`
@@ -71,12 +72,51 @@ The app still flags options as inferred until a real options provider is
 connected. Free-source decisions are useful for discipline and ranking, while
 IV skew, term structure, and flow remain the next paid upgrade.
 
+## Local backend cache
+
+Browser-only Flutter builds cannot reliably call every free market-data source
+directly. Some endpoints block CORS, some return large SEC payloads that public
+proxies reject, and some are slow enough to stall a daily workflow. The local
+backend cache fixes that.
+
+Build the app with the local proxy prefix:
+
+```powershell
+flutter build web --release --dart-define=ORACLE_CORS_PROXY_PREFIX=http://127.0.0.1:8787/proxy?url=
+```
+
+Then run the cache/server:
+
+```powershell
+dart run tool/backend_cache_server.dart --port 8787 --web-root build/web
+```
+
+Open:
+
+```text
+http://127.0.0.1:8787
+```
+
+Useful endpoints:
+
+```text
+http://127.0.0.1:8787/health
+http://127.0.0.1:8787/cache/status
+```
+
+The cache stores responses under `.dart_tool/market_data_cache`, which is
+already ignored by git. It only proxies an allow-list of market-data hosts and
+uses different TTLs by source: shorter for prices/news, longer for SEC and
+macro data.
+
 ## Setting up local secrets
 
 1. Copy `lib/src/data/local_secrets.example.dart` to
    `lib/src/data/local_secrets.dart`.
 2. Fill in your keys.
-3. Restart the app. The configuration loader auto-detects keys at startup.
+3. Keep `kCorsProxyPrefix` pointed at the local backend cache, or pass
+   `ORACLE_CORS_PROXY_PREFIX` at build time.
+4. Restart the app. The configuration loader auto-detects keys at startup.
 
 The file is gitignored — never committed.
 

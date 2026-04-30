@@ -18,6 +18,7 @@ class MarketDataConfiguration {
     this.apiToken,
     this.alphaVantageApiKey,
     this.alphaVantageProxyUrl,
+    this.corsProxyPrefix = '',
     this.alphaVantageSymbols = const [],
     this.alphaVantageBenchmarkSymbol = 'SPY',
     this.finnhubApiKey,
@@ -33,6 +34,7 @@ class MarketDataConfiguration {
   final String? apiToken;
   final String? alphaVantageApiKey;
   final String? alphaVantageProxyUrl;
+  final String corsProxyPrefix;
   final List<String> alphaVantageSymbols;
   final String alphaVantageBenchmarkSymbol;
   final String? finnhubApiKey;
@@ -63,6 +65,10 @@ class MarketDataConfiguration {
     );
     const alphaVantageProxyUrlValue = String.fromEnvironment(
       'ORACLE_ALPHA_VANTAGE_PROXY_URL',
+      defaultValue: '',
+    );
+    const corsProxyPrefixValue = String.fromEnvironment(
+      'ORACLE_CORS_PROXY_PREFIX',
       defaultValue: '',
     );
     const alphaVantageSymbolsEnv = String.fromEnvironment(
@@ -139,6 +145,10 @@ class MarketDataConfiguration {
       apiToken: _normalizeOptionalValue(apiTokenValue),
       alphaVantageApiKey: resolvedKey,
       alphaVantageProxyUrl: _normalizeOptionalValue(alphaVantageProxyUrlValue),
+      corsProxyPrefix:
+          _normalizeOptionalValue(corsProxyPrefixValue) ??
+          _normalizeOptionalValue(local.kCorsProxyPrefix) ??
+          '',
       alphaVantageSymbols: resolvedSymbols,
       alphaVantageBenchmarkSymbol: resolvedBenchmark,
       finnhubApiKey:

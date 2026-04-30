@@ -121,11 +121,11 @@ class ProviderMarketRepository implements MarketIntelligenceRepository {
         : const <String>['AAPL', 'MSFT', 'SPY'];
     final secProvider = SecEdgarFeedProvider(
       symbols: symbols,
-      corsProxyPrefix: local.kCorsProxyPrefix,
+      corsProxyPrefix: configuration.corsProxyPrefix,
     );
     final gdeltProvider = GdeltEventFeedProvider(
       symbols: symbols,
-      corsProxyPrefix: local.kCorsProxyPrefix,
+      corsProxyPrefix: configuration.corsProxyPrefix,
     );
     final finnhubStockProvider = FinnhubFundamentalsOverlayStockProvider(
       fallbackProvider: liveProvider,
@@ -233,9 +233,12 @@ class ProviderMarketRepository implements MarketIntelligenceRepository {
         : const <String>['AAPL', 'MSFT', 'SPY'];
     final yahooProvider = YahooFinanceFeedProvider(
       symbols: probeSymbols,
-      corsProxyPrefix: local.kCorsProxyPrefix,
+      corsProxyPrefix: configuration.corsProxyPrefix,
     );
-    final stooqProvider = StooqFeedProvider(symbols: probeSymbols);
+    final stooqProvider = StooqFeedProvider(
+      symbols: probeSymbols,
+      corsProxyPrefix: configuration.corsProxyPrefix,
+    );
     final finnhubProvider = FinnhubFeedProvider(
       apiKey: configuration.finnhubApiKey ?? local.kFinnhubApiKey,
       symbols: probeSymbols,
@@ -249,11 +252,11 @@ class ProviderMarketRepository implements MarketIntelligenceRepository {
     );
     final secProvider = SecEdgarFeedProvider(
       symbols: probeSymbols,
-      corsProxyPrefix: local.kCorsProxyPrefix,
+      corsProxyPrefix: configuration.corsProxyPrefix,
     );
     final gdeltProvider = GdeltEventFeedProvider(
       symbols: probeSymbols,
-      corsProxyPrefix: local.kCorsProxyPrefix,
+      corsProxyPrefix: configuration.corsProxyPrefix,
     );
     final finnhubStockProvider = FinnhubFundamentalsOverlayStockProvider(
       fallbackProvider: alphaVantageProvider,

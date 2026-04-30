@@ -11,11 +11,15 @@ const String kFinnhubApiKey = '';
 /// FRED API key (optional). https://fredaccount.stlouisfed.org/apikey
 const String kFredApiKey = '';
 
-/// Optional CORS proxy for providers that don't send browser CORS headers
-/// (Yahoo Finance, Stooq, SEC EDGAR in Flutter web). Example:
-/// 'https://corsproxy.io/?'.
-/// Leave empty to disable those providers in Chrome.
-const String kCorsProxyPrefix = '';
+/// Optional CORS proxy/cache for providers that don't send browser CORS headers
+/// (Yahoo Finance, Stooq, SEC EDGAR in Flutter web).
+///
+/// Recommended local cache:
+/// 'http://127.0.0.1:8787/proxy?url='
+///
+/// You can also override this at build time:
+/// --dart-define=ORACLE_CORS_PROXY_PREFIX=http://127.0.0.1:8787/proxy?url=
+const String kCorsProxyPrefix = 'http://127.0.0.1:8787/proxy?url=';
 
 /// Stocks to track. S&P 100 is a good starter universe.
 const List<String> kSymbolUniverse = <String>[

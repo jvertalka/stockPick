@@ -25,6 +25,8 @@ The app now runs through a structured fixture repository and a deterministic int
 - a point-in-time snapshot archive now stores repository states locally
 - an Alpha Vantage adapter can populate the daily price-history spine with
   connected OHLCV data under a quota-aware cache
+- a local backend cache can serve the Flutter web build and proxy/cache the
+  free data layer so Chrome is not blocked by CORS
 - Alpha Vantage now syncs into a durable local store with cached coverage and
   sync-cadence metadata so the app can read from local history first
 - a fixture walk-forward validation pass reports hit rate, alpha, and drawdown stats
@@ -74,20 +76,19 @@ research outcomes are still explicit fallback inputs until those feeds are
 connected.
 
 For Flutter web/Chrome, run the local proxy first because Alpha Vantage does not
-send browser-friendly CORS headers:
+send browser-friendly CORS headers and several free sources are easier to use
+through one cache:
 
 ```bash
-dart run tool/alpha_vantage_proxy_server.dart --port=8081
+flutter build web --release \
+  --dart-define=ORACLE_CORS_PROXY_PREFIX=http://127.0.0.1:8787/proxy?url=
 
-flutter run -d web-server \
-  --web-hostname 127.0.0.1 \
-  --web-port 54123 \
-  --dart-define=ORACLE_DATA_MODE=alpha-vantage \
-  --dart-define=ORACLE_ALPHA_VANTAGE_API_KEY=your-alpha-vantage-key \
-  --dart-define=ORACLE_ALPHA_VANTAGE_PROXY_URL=http://127.0.0.1:8081/query \
-  --dart-define=ORACLE_ALPHA_VANTAGE_DAILY_LIMIT=25 \
-  --dart-define=ORACLE_ALPHA_VANTAGE_SYNC_INTERVAL_MINUTES=20
+dart run tool/backend_cache_server.dart --port 8787 --web-root build/web
 ```
+
+Then open `http://127.0.0.1:8787`. The backend cache exposes
+`/proxy?url=...`, `/health`, and `/cache/status`, and stores cached responses
+under `.dart_tool/market_data_cache`.
 
 Available modes:
 

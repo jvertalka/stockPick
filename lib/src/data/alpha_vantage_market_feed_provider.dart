@@ -6,7 +6,6 @@ import '../models/intelligence_app_state.dart';
 import 'alpha_vantage_models.dart';
 import 'alpha_vantage_store.dart';
 import 'alpha_vantage_store_factory.dart';
-import 'local_secrets.dart' as local;
 import 'market_data_configuration.dart';
 import 'market_feed_provider.dart';
 import 'raw_market_data.dart';
@@ -328,11 +327,13 @@ class AlphaVantageMarketFeedProvider
 
     // Yahoo Finance fallback for symbols Alpha Vantage couldn't provide.
     // Covers the 75+ stocks/day beyond AV's free-tier quota.
-    final yahooBackfilled = await _backfillFromYahoo(
-      requestedSymbols: requestedSymbols,
-      seriesBySymbol: seriesBySymbol,
-      now: now,
-    );
+    final yahooBackfilled = _hasAlphaVantageKey
+        ? await _backfillFromYahoo(
+            requestedSymbols: requestedSymbols,
+            seriesBySymbol: seriesBySymbol,
+            now: now,
+          )
+        : 0;
     if (yahooBackfilled > 0) {
       messages.add(
         'Yahoo Finance filled $yahooBackfilled symbol(s) that were beyond the Alpha Vantage daily quota.',
@@ -442,7 +443,7 @@ class AlphaVantageMarketFeedProvider
 
     final yahoo = YahooFinanceFeedProvider(
       symbols: missing,
-      corsProxyPrefix: local.kCorsProxyPrefix,
+      corsProxyPrefix: _configuration.corsProxyPrefix,
     );
 
     const concurrency = 10;
@@ -552,6 +553,11 @@ class AlphaVantageMarketFeedProvider
     }
   }
 
+  bool get _hasAlphaVantageKey {
+    final apiKey = _configuration.alphaVantageApiKey;
+    return apiKey != null && apiKey.isNotEmpty;
+  }
+
   Future<void> _recordQuotaUse() async {
     try {
       await _cacheStore.recordRequest();
@@ -578,9 +584,23 @@ class AlphaVantageMarketFeedProvider
   }
 
   Uri _alphaVantageUri(Map<String, String> queryParameters) {
+    final directUri = Uri.https(
+      'www.alphavantage.co',
+      '/query',
+      queryParameters,
+    );
     final proxyUrl = _configuration.alphaVantageProxyUrl;
     if (proxyUrl == null || proxyUrl.isEmpty) {
-      return Uri.https('www.alphavantage.co', '/query', queryParameters);
+      final corsProxyPrefix = _configuration.corsProxyPrefix;
+      if (corsProxyPrefix.isEmpty) {
+        return directUri;
+      }
+      if (corsProxyPrefix.contains('url=')) {
+        return Uri.parse(
+          '$corsProxyPrefix${Uri.encodeComponent(directUri.toString())}',
+        );
+      }
+      return Uri.parse('$corsProxyPrefix$directUri');
     }
 
     final baseUri = Uri.parse(proxyUrl);
