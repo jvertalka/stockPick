@@ -90,6 +90,38 @@ Then open `http://127.0.0.1:8787`. The backend cache exposes
 `/proxy?url=...`, `/health`, and `/cache/status`, and stores cached responses
 under `.dart_tool/market_data_cache`.
 
+## Desktop app track
+
+The project also has a native Windows desktop track. This uses the same Flutter
+codebase and same decision engine, but runs as `FinanceOracle.exe` instead of a
+Chrome-served web build.
+
+Windows desktop builds require Visual Studio with the **Desktop development
+with C++** workload installed. `flutter doctor -v` will report this under
+`Visual Studio - develop Windows apps`.
+
+```powershell
+.\tool\run_windows_desktop.ps1
+```
+
+To create a release build:
+
+```powershell
+.\tool\build_windows_desktop.ps1
+```
+
+The release executable is written to:
+
+```text
+build\windows\x64\runner\Release\FinanceOracle.exe
+```
+
+Desktop builds do not need the browser CORS proxy by default. If
+`ORACLE_CORS_PROXY_PREFIX` is not explicitly supplied, the native app calls free
+data sources directly and stores Alpha Vantage history plus market snapshots in
+the platform application-support directory. The Chrome/web track can keep using
+the local proxy/cache for browser compatibility.
+
 Available modes:
 
 - `fixture`

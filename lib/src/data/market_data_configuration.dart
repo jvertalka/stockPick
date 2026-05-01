@@ -1,3 +1,5 @@
+import 'package:flutter/foundation.dart';
+
 import 'local_secrets.dart' as local;
 import 'default_symbol_universe.dart';
 
@@ -178,6 +180,10 @@ class MarketDataConfiguration {
               ? MarketDataMode.alphaVantage
               : MarketDataMode.livePreferred)
         : parseMode(modeValue);
+    final resolvedCorsProxyPrefix =
+        _normalizeOptionalValue(corsProxyPrefixValue) ??
+        (kIsWeb ? _normalizeOptionalValue(local.kCorsProxyPrefix) : null) ??
+        '';
 
     return MarketDataConfiguration(
       mode: resolvedMode,
@@ -185,10 +191,7 @@ class MarketDataConfiguration {
       apiToken: _normalizeOptionalValue(apiTokenValue),
       alphaVantageApiKey: resolvedKey,
       alphaVantageProxyUrl: _normalizeOptionalValue(alphaVantageProxyUrlValue),
-      corsProxyPrefix:
-          _normalizeOptionalValue(corsProxyPrefixValue) ??
-          _normalizeOptionalValue(local.kCorsProxyPrefix) ??
-          '',
+      corsProxyPrefix: resolvedCorsProxyPrefix,
       alphaVantageSymbols: resolvedSymbols,
       alphaVantageBenchmarkSymbol: resolvedBenchmark,
       finnhubApiKey:
