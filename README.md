@@ -122,6 +122,36 @@ data sources directly and stores Alpha Vantage history plus market snapshots in
 the platform application-support directory. The Chrome/web track can keep using
 the local proxy/cache for browser compatibility.
 
+## JavaScript desktop workstation track
+
+The repo now also includes a separate JavaScript desktop approach under
+`desktop-js`. This is not a Flutter runner. It is a Tauri + React + TypeScript +
+Vite workstation intended for the richer desktop product: dense buy/hold/sell
+boards, regime-conditioned opportunity ranking, deterioration clusters, and
+future local analytics APIs.
+
+```powershell
+cd desktop-js
+npm install
+npm run dev
+```
+
+The React/Vite shell can be built today with:
+
+```powershell
+npm run build
+```
+
+The native desktop shell uses Tauri:
+
+```powershell
+npm run desktop:dev
+npm run desktop:build
+```
+
+Tauri native commands require Rust/Cargo. Install Rust from `https://rustup.rs`
+before building the JavaScript workstation as a Windows desktop executable.
+
 Available modes:
 
 - `fixture`
