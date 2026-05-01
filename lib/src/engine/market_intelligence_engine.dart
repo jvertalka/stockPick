@@ -29,16 +29,25 @@ class DerivedStockSignal {
 }
 
 class MarketIntelligenceEngine {
-  MarketEvaluation evaluate(RawMarketState state) {
+  MarketEvaluation evaluate(
+    RawMarketState state, {
+    bool includeDiagnostics = true,
+  }) {
     final regimeContext = _analyzeRegime(state);
     final sectorMap = {
       for (final sector in state.sectors) sector.sector.toLowerCase(): sector,
     };
 
-    final rawScored = state.stocks
-        .map((stock) => _scoreStockRaw(stock, state, regimeContext, sectorMap))
-        .toList()
-      ..sort((left, right) => right.opportunityScore.compareTo(left.opportunityScore));
+    final rawScored =
+        state.stocks
+            .map(
+              (stock) => _scoreStockRaw(stock, state, regimeContext, sectorMap),
+            )
+            .toList()
+          ..sort(
+            (left, right) =>
+                right.opportunityScore.compareTo(left.opportunityScore),
+          );
 
     final rankIndex = {
       for (int index = 0; index < rawScored.length; index++)
@@ -60,17 +69,27 @@ class MarketIntelligenceEngine {
             regimeContext,
             correlationClusters,
             sectorMedians,
+            includeDiagnostics,
           ),
         )
         .toList();
 
-    final sellAlerts = scoredStocks
-        .map((signal) => _buildSellAlert(signal, state, regimeContext, correlationClusters))
-        .whereType<SellAlert>()
-        .toList()
-      ..sort(
-        (left, right) => right.thesisDamageScore.compareTo(left.thesisDamageScore),
-      );
+    final sellAlerts =
+        scoredStocks
+            .map(
+              (signal) => _buildSellAlert(
+                signal,
+                state,
+                regimeContext,
+                correlationClusters,
+              ),
+            )
+            .whereType<SellAlert>()
+            .toList()
+          ..sort(
+            (left, right) =>
+                right.thesisDamageScore.compareTo(left.thesisDamageScore),
+          );
 
     final rankedUniverse = scoredStocks.map((item) => item.insight).toList();
     final opportunities = rankedUniverse.take(6).toList();
@@ -97,12 +116,13 @@ class MarketIntelligenceEngine {
     final shocked = _applyScenarioShock(state, scenario);
     final evaluation = evaluate(shocked);
     final baseline = evaluate(state);
+    final baselineByTicker = {
+      for (final stock in baseline.snapshot.rankedUniverse) stock.ticker: stock,
+    };
     final fullBoardImpacts = <ScenarioStockImpact>[];
     for (final shockedInsight in evaluation.snapshot.rankedUniverse) {
-      final baselineInsight = baseline.snapshot.rankedUniverse.firstWhere(
-        (candidate) => candidate.ticker == shockedInsight.ticker,
-        orElse: () => shockedInsight,
-      );
+      final baselineInsight =
+          baselineByTicker[shockedInsight.ticker] ?? shockedInsight;
       final delta =
           shockedInsight.opportunityScore - baselineInsight.opportunityScore;
       fullBoardImpacts.add(
@@ -116,9 +136,8 @@ class MarketIntelligenceEngine {
       );
     }
     fullBoardImpacts.sort(
-      (left, right) => right.deltaOpportunity.abs().compareTo(
-        left.deltaOpportunity.abs(),
-      ),
+      (left, right) =>
+          right.deltaOpportunity.abs().compareTo(left.deltaOpportunity.abs()),
     );
 
     final customOutcome = ScenarioOutcome(
@@ -128,16 +147,17 @@ class MarketIntelligenceEngine {
       regimeImpact:
           'Custom shocks applied. Positive deltas mean the name looks better under the shock, negatives mean it looks worse.',
       favoredExposures: _favoredExposuresFromImpacts(fullBoardImpacts, true),
-      vulnerableExposures: _favoredExposuresFromImpacts(fullBoardImpacts, false),
+      vulnerableExposures: _favoredExposuresFromImpacts(
+        fullBoardImpacts,
+        false,
+      ),
       stockImpacts: fullBoardImpacts.take(6).toList(),
       fullBoardImpacts: fullBoardImpacts,
       label: scenario.label,
       probability: 0,
     );
 
-    return evaluation.snapshot.copyWith(
-      customScenarios: [customOutcome],
-    );
+    return evaluation.snapshot.copyWith(customScenarios: [customOutcome]);
   }
 
   _RawStockScore _scoreStockRaw(
@@ -268,6 +288,7 @@ class MarketIntelligenceEngine {
     _RegimeContext regimeContext,
     Map<String, CorrelationCluster> clusters,
     Map<String, _SectorMedianSet> sectorMedians,
+    bool includeDiagnostics,
   ) {
     final stock = scored.raw;
     final fragilityScore = scored.fragilityScore;
@@ -295,19 +316,23 @@ class MarketIntelligenceEngine {
 
     final forecasts = _forecastPack(scored, regimeContext, state.environment);
 
-    final counterfactuals = _counterfactuals(
-      scored,
-      state,
-      regimeContext,
-      sectorMap,
-      rankIndex,
-      allStocks,
-    );
+    final counterfactuals = includeDiagnostics
+        ? _counterfactuals(
+            scored,
+            state,
+            regimeContext,
+            sectorMap,
+            rankIndex,
+            allStocks,
+          )
+        : const <CounterfactualSensitivity>[];
 
-    final peerContrast = _peerContrast(
-      scored,
-      sectorMedians[stock.sector] ?? _SectorMedianSet.empty(),
-    );
+    final peerContrast = includeDiagnostics
+        ? _peerContrast(
+            scored,
+            sectorMedians[stock.sector] ?? _SectorMedianSet.empty(),
+          )
+        : const <PeerContrast>[];
 
     final whyItRanks = _topNarratives([
       _NarrativeScore(
@@ -442,8 +467,9 @@ class MarketIntelligenceEngine {
       insight: insight,
       opportunityScore: opportunityScore,
       fragilityScore: fragilityScore,
-      deteriorationSignals:
-          decayedSignals.map((signal) => signal.label).toList(),
+      deteriorationSignals: decayedSignals
+          .map((signal) => signal.label)
+          .toList(),
       decayedSignals: decayedSignals,
     );
   }
@@ -452,8 +478,8 @@ class MarketIntelligenceEngine {
     final flow = stock.unusualFlowRatio >= 1.6
         ? 'Unusual options activity: total flow is ${stock.unusualFlowRatio.toStringAsFixed(1)}x normal with put/call at ${stock.putCallRatio.toStringAsFixed(2)}.'
         : stock.dealerPositioning < -20
-            ? 'Dealer positioning is short gamma, which tends to amplify moves in both directions.'
-            : 'Flow is within normal bands; no clear smart-money fingerprint yet.';
+        ? 'Dealer positioning is short gamma, which tends to amplify moves in both directions.'
+        : 'Flow is within normal bands; no clear smart-money fingerprint yet.';
 
     return OptionsSignal(
       ivRank: stock.impliedVolRank,
@@ -474,7 +500,8 @@ class MarketIntelligenceEngine {
   }
 
   double _optionsFlowStress(RawStockSignal stock) {
-    final flowComponent = ((stock.unusualFlowRatio - 1.0).clamp(0, 2) / 2) * 100;
+    final flowComponent =
+        ((stock.unusualFlowRatio - 1.0).clamp(0, 2) / 2) * 100;
     final gammaComponent =
         (stock.dealerPositioning < 0 ? (-stock.dealerPositioning) * 0.6 : 0)
             .clamp(0, 60)
@@ -533,8 +560,9 @@ class MarketIntelligenceEngine {
       ConfidenceComponent(
         label: 'Correlation risk',
         weight: 0.08,
-        value:
-            (100 - (cluster?.correlationStrength ?? 0)).clamp(0, 100).toDouble(),
+        value: (100 - (cluster?.correlationStrength ?? 0))
+            .clamp(0, 100)
+            .toDouble(),
         supporting: (cluster?.correlationStrength ?? 0) < 60,
         rationale: cluster == null
             ? 'No dominant correlation cluster detected.'
@@ -549,7 +577,9 @@ class MarketIntelligenceEngine {
     final supportingCount = components.where((c) => c.supporting).length;
     final opposingCount = components.length - supportingCount;
     final conflictScore =
-        math.min(supportingCount, opposingCount) / (components.length / 2) * 100;
+        math.min(supportingCount, opposingCount) /
+        (components.length / 2) *
+        100;
 
     final tier = _confidenceTier(composite, conflictScore);
     final summary = _confidenceSummary(tier, components);
@@ -606,8 +636,8 @@ class MarketIntelligenceEngine {
     final stock = scored.raw;
 
     // Probability of outperforming sector over 20d.
-    final outperformInput = 0.55 *
-            _normalize(scored.opportunityScore) +
+    final outperformInput =
+        0.55 * _normalize(scored.opportunityScore) +
         0.25 * _normalize(scored.regimeFit) +
         0.20 * _normalize(100 - scored.fragilityScore);
     final outperformProb = _logisticProbability(
@@ -617,7 +647,8 @@ class MarketIntelligenceEngine {
     );
 
     // Probability of drawdown > 8% over 20d.
-    final drawdownInput = 0.50 * _normalize(scored.fragilityScore) +
+    final drawdownInput =
+        0.50 * _normalize(scored.fragilityScore) +
         0.25 * _normalize(stock.putSkewChange) +
         0.15 * _normalize(environment.impliedVolatility) +
         0.10 * _normalize(stock.abnormalDownVolume);
@@ -630,8 +661,8 @@ class MarketIntelligenceEngine {
     // Probability of earnings gap > implied move.
     final earningsGapInput =
         0.45 * _normalize(stock.expectedMoveEarnings.clamp(0, 100)) +
-            0.35 * _normalize(stock.eventPremium * 10) +
-            0.20 * _normalize(stock.volatilityRepricing);
+        0.35 * _normalize(stock.eventPremium * 10) +
+        0.20 * _normalize(stock.volatilityRepricing);
     final earningsGapProb = _logisticProbability(
       earningsGapInput,
       scale: 3.0,
@@ -639,8 +670,8 @@ class MarketIntelligenceEngine {
     );
 
     // Probability of leadership rotating away from this factor bucket over 20d.
-    final rotationInput = 0.45 *
-            _normalize(100 - scored.styleAlignment) +
+    final rotationInput =
+        0.45 * _normalize(100 - scored.styleAlignment) +
         0.35 * _normalize(100 - environment.growthLeadership) +
         0.20 * _normalize(environment.creditStress);
     final rotationProb = _logisticProbability(
@@ -650,7 +681,8 @@ class MarketIntelligenceEngine {
     );
 
     // Probability of current breakout persisting.
-    final persistenceInput = 0.55 * _normalize(scored.trendQuality) +
+    final persistenceInput =
+        0.55 * _normalize(scored.trendQuality) +
         0.25 * _normalize(stock.breakoutQuality) +
         0.20 * _normalize(100 - stock.crowdingRisk);
     final persistenceProb = _logisticProbability(
@@ -662,7 +694,8 @@ class MarketIntelligenceEngine {
     // 20-day forward-return distribution in %.
     final mean20 =
         (scored.opportunityScore - 50) * 0.12 + (scored.regimeFit - 50) * 0.06;
-    final sigma20 = 2.0 +
+    final sigma20 =
+        2.0 +
         (scored.fragilityScore / 25) +
         (environment.impliedVolatility / 30);
     final forwardReturn20d = _normalDistribution(mean20, sigma20);
@@ -767,8 +800,9 @@ class MarketIntelligenceEngine {
       _CounterfactualCase(
         component: 'Crowding',
         delta: 15,
-        apply: (stock) =>
-            stock.copyWith(crowdingRisk: (stock.crowdingRisk + 15).clamp(0, 100)),
+        apply: (stock) => stock.copyWith(
+          crowdingRisk: (stock.crowdingRisk + 15).clamp(0, 100),
+        ),
       ),
     ];
 
@@ -780,7 +814,8 @@ class MarketIntelligenceEngine {
         regimeContext,
         _shockedSectorMap(sectorMap, scored.raw.sector, counter),
       );
-      final deltaOpportunity = shocked.opportunityScore - scored.opportunityScore;
+      final deltaOpportunity =
+          shocked.opportunityScore - scored.opportunityScore;
       final newRank = _projectedRank(
         shocked.opportunityScore,
         allStocks,
@@ -822,14 +857,16 @@ class MarketIntelligenceEngine {
     List<_RawStockScore> allStocks,
     String ticker,
   ) {
-    final projected = allStocks.map((s) {
-      if (s.raw.ticker == ticker) {
-        return newScore;
+    var rank = 0;
+    for (final stock in allStocks) {
+      if (stock.raw.ticker == ticker) {
+        continue;
       }
-      return s.opportunityScore;
-    }).toList()
-      ..sort((a, b) => b.compareTo(a));
-    return projected.indexOf(newScore);
+      if (stock.opportunityScore > newScore) {
+        rank += 1;
+      }
+    }
+    return rank;
   }
 
   String _counterfactualNarrative(
@@ -843,12 +880,15 @@ class MarketIntelligenceEngine {
     final rankDescription = deltaRank == 0
         ? 'the rank would hold.'
         : deltaRank < 0
-            ? 'it would climb ${deltaRank.abs()} spots.'
-            : 'it would slip $deltaRank spots.';
+        ? 'it would climb ${deltaRank.abs()} spots.'
+        : 'it would slip $deltaRank spots.';
     return 'If $component were $direction by ${deltaInput.abs().round()} pts, opportunity would shift $scoreDirection${deltaOpportunity.toStringAsFixed(1)} and $rankDescription';
   }
 
-  RawMarketState _shockedState(RawMarketState state, _CounterfactualCase counter) {
+  RawMarketState _shockedState(
+    RawMarketState state,
+    _CounterfactualCase counter,
+  ) {
     final shock = counter.environmentShock;
     if (shock == null) {
       return state;
@@ -869,9 +909,12 @@ class MarketIntelligenceEngine {
     return RawMarketEnvironment(
       indexTrend: (env.indexTrend + shock.indexTrend).clamp(0, 100).toDouble(),
       realizedVolatility: env.realizedVolatility,
-      impliedVolatility:
-          (env.impliedVolatility + shock.impliedVolatility).clamp(0, 100).toDouble(),
-      creditStress: (env.creditStress + shock.creditStress).clamp(0, 100).toDouble(),
+      impliedVolatility: (env.impliedVolatility + shock.impliedVolatility)
+          .clamp(0, 100)
+          .toDouble(),
+      creditStress: (env.creditStress + shock.creditStress)
+          .clamp(0, 100)
+          .toDouble(),
       financialConditions: (env.financialConditions + shock.financialConditions)
           .clamp(0, 100)
           .toDouble(),
@@ -912,7 +955,9 @@ class MarketIntelligenceEngine {
     }
     final shocked = RawSectorSignal(
       sector: current.sector,
-      strength: (current.strength + counter.sectorShock).clamp(0, 100).toDouble(),
+      strength: (current.strength + counter.sectorShock)
+          .clamp(0, 100)
+          .toDouble(),
       breadth: (current.breadth + counter.sectorShock).clamp(0, 100).toDouble(),
       revisions: current.revisions,
       sponsorship: current.sponsorship,
@@ -933,14 +978,20 @@ class MarketIntelligenceEngine {
         label: 'Residual strength',
         self: stock.residualStrength,
         median: medians.residualStrength,
-        rank: medians.rankOf(stock.residualStrength, _MedianAxis.residualStrength),
+        rank: medians.rankOf(
+          stock.residualStrength,
+          _MedianAxis.residualStrength,
+        ),
         total: medians.total,
       ),
       _ContrastAxis(
         label: 'Estimate revisions',
         self: stock.earningsRevisions,
         median: medians.earningsRevisions,
-        rank: medians.rankOf(stock.earningsRevisions, _MedianAxis.earningsRevisions),
+        rank: medians.rankOf(
+          stock.earningsRevisions,
+          _MedianAxis.earningsRevisions,
+        ),
         total: medians.total,
       ),
       _ContrastAxis(
@@ -954,7 +1005,11 @@ class MarketIntelligenceEngine {
         label: 'Crowding risk',
         self: stock.crowdingRisk,
         median: medians.crowdingRisk,
-        rank: medians.rankOf(stock.crowdingRisk, _MedianAxis.crowding, inverse: true),
+        rank: medians.rankOf(
+          stock.crowdingRisk,
+          _MedianAxis.crowding,
+          inverse: true,
+        ),
         total: medians.total,
       ),
     ];
@@ -965,8 +1020,8 @@ class MarketIntelligenceEngine {
       final narrative = gap.abs() < 4
           ? 'Sits near the ${stock.sector.toLowerCase()} median on ${axis.label.toLowerCase()}, so the name is neither a standout nor a drag here.'
           : gap > 0
-              ? 'Runs ${gap.toStringAsFixed(1)} points above the ${stock.sector.toLowerCase()} median on ${axis.label.toLowerCase()} — this is a real edge vs. peers.'
-              : 'Trails the ${stock.sector.toLowerCase()} median by ${gap.abs().toStringAsFixed(1)} points on ${axis.label.toLowerCase()} — a relative weakness to watch.';
+          ? 'Runs ${gap.toStringAsFixed(1)} points above the ${stock.sector.toLowerCase()} median on ${axis.label.toLowerCase()} — this is a real edge vs. peers.'
+          : 'Trails the ${stock.sector.toLowerCase()} median by ${gap.abs().toStringAsFixed(1)} points on ${axis.label.toLowerCase()} — a relative weakness to watch.';
       contrasts.add(
         PeerContrast(
           axis: axis.label,
@@ -1009,38 +1064,60 @@ class MarketIntelligenceEngine {
     }
 
     if (stock.relativeStrengthDelta < 44) {
-      emit('relative_strength', 'Relative strength is rolling over against peers.',
-          (44 - stock.relativeStrengthDelta));
+      emit(
+        'relative_strength',
+        'Relative strength is rolling over against peers.',
+        (44 - stock.relativeStrengthDelta),
+      );
     }
     if (stock.sectorBreadthDelta < 45) {
-      emit('sector_breadth', 'Sector breadth is deteriorating underneath the stock.',
-          (45 - stock.sectorBreadthDelta));
+      emit(
+        'sector_breadth',
+        'Sector breadth is deteriorating underneath the stock.',
+        (45 - stock.sectorBreadthDelta),
+      );
     }
     if (stock.revisionDelta < 43) {
-      emit('revisions', 'Revision momentum has inflected lower.',
-          (43 - stock.revisionDelta));
+      emit(
+        'revisions',
+        'Revision momentum has inflected lower.',
+        (43 - stock.revisionDelta),
+      );
     }
     if (stock.priceResponse < 42) {
-      emit('price_response', 'Price is no longer rewarding good news cleanly.',
-          (42 - stock.priceResponse));
+      emit(
+        'price_response',
+        'Price is no longer rewarding good news cleanly.',
+        (42 - stock.priceResponse),
+      );
     }
     if (stock.abnormalDownVolume > 62) {
-      emit('abnormal_volume', 'Down moves are arriving on abnormal volume.',
-          (stock.abnormalDownVolume - 62));
+      emit(
+        'abnormal_volume',
+        'Down moves are arriving on abnormal volume.',
+        (stock.abnormalDownVolume - 62),
+      );
     }
     if (stock.volatilityRepricing > 60) {
-      emit('vol_repricing',
-          'Options are repricing risk faster than price is repairing.',
-          (stock.volatilityRepricing - 60));
+      emit(
+        'vol_repricing',
+        'Options are repricing risk faster than price is repairing.',
+        (stock.volatilityRepricing - 60),
+      );
     }
     if (stock.peerLeadership < 45) {
-      emit('peer_leadership', 'Leadership has been ceded to peers.',
-          (45 - stock.peerLeadership));
+      emit(
+        'peer_leadership',
+        'Leadership has been ceded to peers.',
+        (45 - stock.peerLeadership),
+      );
     }
     if (stock.dealerPositioning < -30) {
-      emit('dealer_short',
-          'Dealers are net short gamma, which widens the tails on bad days.',
-          (-stock.dealerPositioning - 30));
+      emit(
+        'dealer_short',
+        'Dealers are net short gamma, which widens the tails on bad days.',
+        (-stock.dealerPositioning - 30),
+      );
     }
     return signals;
   }
@@ -1074,9 +1151,10 @@ class MarketIntelligenceEngine {
     gates.add(
       MacroGate(
         label: 'Credit gate',
-        isSatisfied: !(environment.creditStress >= 65 &&
-            stock.creditSensitivity >= 60),
-        rationale: (environment.creditStress >= 65 && stock.creditSensitivity >= 60)
+        isSatisfied:
+            !(environment.creditStress >= 65 && stock.creditSensitivity >= 60),
+        rationale:
+            (environment.creditStress >= 65 && stock.creditSensitivity >= 60)
             ? 'Credit stress is biting a credit-sensitive name — treat de-risking as more urgent.'
             : 'Credit backdrop is not adding urgency for this name.',
       ),
@@ -1106,7 +1184,8 @@ class MarketIntelligenceEngine {
     final clusters = <String, CorrelationCluster>{};
     grouped.forEach((id, members) {
       if (members.length < 2) return;
-      final avgStrength = members
+      final avgStrength =
+          members
               .map((m) => m.raw.correlationStrength)
               .reduce((a, b) => a + b) /
           members.length;
@@ -1130,8 +1209,7 @@ class MarketIntelligenceEngine {
 
   String _clusterLabel(String id, List<_RawStockScore> members) {
     final firstSector = members.first.raw.sector;
-    final allSameSector =
-        members.every((m) => m.raw.sector == firstSector);
+    final allSameSector = members.every((m) => m.raw.sector == firstSector);
     if (allSameSector) {
       return '${firstSector.toLowerCase()} cohort ($id)';
     }
@@ -1154,11 +1232,7 @@ class MarketIntelligenceEngine {
       return null;
     }
 
-    final macroGates = _macroGates(
-      stock.raw,
-      state.environment,
-      regimeContext,
-    );
+    final macroGates = _macroGates(stock.raw, state.environment, regimeContext);
     final satisfiedGates = macroGates.where((g) => g.isSatisfied).length;
     final gateRatio = macroGates.isEmpty
         ? 1.0
@@ -1203,8 +1277,10 @@ class MarketIntelligenceEngine {
     );
 
     final triggers = decayed
-        .map((s) =>
-            '${s.label} (${s.ageInSessions}d, weight ${s.weight.toStringAsFixed(2)})')
+        .map(
+          (s) =>
+              '${s.label} (${s.ageInSessions}d, weight ${s.weight.toStringAsFixed(2)})',
+        )
         .toList();
 
     return SellAlert(
@@ -1214,7 +1290,8 @@ class MarketIntelligenceEngine {
       severity: severity,
       thesisDamageScore: thesisDamageScore,
       clusterCount: clusterCount,
-      summary: _sellSummary(stock.raw, action) +
+      summary:
+          _sellSummary(stock.raw, action) +
           (gateRatio < 1
               ? ' Note: ${macroGates.length - satisfiedGates} macro gate(s) are not satisfied, so the action has been softened.'
               : ''),
@@ -1280,20 +1357,21 @@ class MarketIntelligenceEngine {
             .toList()
           ..sort((left, right) => right.score.compareTo(left.score));
 
-    final sectorBreadth = state.sectors
-        .map(
-          (sector) => SectorBreadthRow(
-            sector: sector.sector,
-            participation: sector.breadth,
-            leadership: sector.strength,
-            divergence: sector.breadth - sector.strength,
-            tone: _toneFor(sector.breadth),
-          ),
-        )
-        .toList()
-      ..sort(
-        (left, right) => right.participation.compareTo(left.participation),
-      );
+    final sectorBreadth =
+        state.sectors
+            .map(
+              (sector) => SectorBreadthRow(
+                sector: sector.sector,
+                participation: sector.breadth,
+                leadership: sector.strength,
+                divergence: sector.breadth - sector.strength,
+                tone: _toneFor(sector.breadth),
+              ),
+            )
+            .toList()
+          ..sort(
+            (left, right) => right.participation.compareTo(left.participation),
+          );
 
     return MarketRadar(
       regime: regimeContext.regime,
@@ -1516,15 +1594,18 @@ class MarketIntelligenceEngine {
     required double Function(DerivedStockSignal stock) deltaBuilder,
     required double probability,
   }) {
-    final ranked = stocks
-        .map(
-          (stock) => _ScenarioImpact(
-            stock: stock,
-            delta: _scenarioDelta(deltaBuilder(stock)),
-          ),
-        )
-        .toList()
-      ..sort((left, right) => right.delta.abs().compareTo(left.delta.abs()));
+    final ranked =
+        stocks
+            .map(
+              (stock) => _ScenarioImpact(
+                stock: stock,
+                delta: _scenarioDelta(deltaBuilder(stock)),
+              ),
+            )
+            .toList()
+          ..sort(
+            (left, right) => right.delta.abs().compareTo(left.delta.abs()),
+          );
 
     ScenarioStockImpact build(_ScenarioImpact impact) {
       final action = _scenarioActionFor(impact.delta.toDouble());
@@ -1565,8 +1646,11 @@ class MarketIntelligenceEngine {
     bool favored,
   ) {
     final relevant = impacts
-        .where((impact) =>
-            favored ? impact.deltaOpportunity > 0 : impact.deltaOpportunity < 0)
+        .where(
+          (impact) => favored
+              ? impact.deltaOpportunity > 0
+              : impact.deltaOpportunity < 0,
+        )
         .take(3)
         .map((impact) => impact.ticker)
         .toList();
@@ -1604,8 +1688,9 @@ class MarketIntelligenceEngine {
       smallCapLeadership: env.smallCapLeadership,
       inflationPressure: env.inflationPressure,
       breadth: (env.breadth + scenario.breadthDelta).clamp(0, 100).toDouble(),
-      advanceDecline:
-          (env.advanceDecline + scenario.breadthDelta).clamp(0, 100).toDouble(),
+      advanceDecline: (env.advanceDecline + scenario.breadthDelta)
+          .clamp(0, 100)
+          .toDouble(),
       newHighLow: env.newHighLow,
       percentAboveMajorAverages:
           (env.percentAboveMajorAverages + scenario.breadthDelta * 0.5)
@@ -1619,8 +1704,7 @@ class MarketIntelligenceEngine {
       regimeStability: env.regimeStability,
       regimePersistenceSessions: env.regimePersistenceSessions,
       volTermStructure: env.volTermStructure,
-      yieldCurveSlope:
-          (env.yieldCurveSlope + scenario.rateShockDelta / 10),
+      yieldCurveSlope: (env.yieldCurveSlope + scenario.rateShockDelta / 10),
       breadthByPhase: env.breadthByPhase,
     );
     return RawMarketState(
@@ -1729,11 +1813,7 @@ class MarketIntelligenceEngine {
       _ => InternalHealthType.washedOutReversalPotential,
     };
 
-    final transition = _regimeTransition(
-      top.key,
-      distribution,
-      env,
-    );
+    final transition = _regimeTransition(top.key, distribution, env);
 
     return _RegimeContext(
       regime: top.key,
@@ -1752,22 +1832,25 @@ class MarketIntelligenceEngine {
     const temperature = 10.0;
     final maxScore = scores.values.reduce(math.max);
     final expScores = scores.map(
-      (regime, score) => MapEntry(
-        regime,
-        math.exp((score - maxScore) / temperature),
-      ),
+      (regime, score) =>
+          MapEntry(regime, math.exp((score - maxScore) / temperature)),
     );
     final total = expScores.values.reduce((a, b) => a + b);
     final probs = expScores.map(
       (regime, value) => MapEntry(regime, (value / total) * 100),
     );
-    final list = probs.entries
-        .map(
-          (entry) =>
-              RegimeProbability(regime: entry.key, probability: entry.value),
-        )
-        .toList()
-      ..sort((left, right) => right.probability.compareTo(left.probability));
+    final list =
+        probs.entries
+            .map(
+              (entry) => RegimeProbability(
+                regime: entry.key,
+                probability: entry.value,
+              ),
+            )
+            .toList()
+          ..sort(
+            (left, right) => right.probability.compareTo(left.probability),
+          );
     return list;
   }
 
@@ -1831,7 +1914,9 @@ class MarketIntelligenceEngine {
     }
 
     if (triggers.isEmpty) {
-      triggers.add('Distribution is close enough that a shift cannot be ruled out.');
+      triggers.add(
+        'Distribution is close enough that a shift cannot be ruled out.',
+      );
     }
 
     final rationale = runnerUp.probability >= 25
@@ -2308,10 +2393,7 @@ class _CounterfactualCase {
 }
 
 class _EnvironmentShock {
-  const _EnvironmentShock({
-    this.impliedVolatility = 0,
-    this.creditStress = 0,
-  });
+  const _EnvironmentShock({this.impliedVolatility = 0, this.creditStress = 0});
 
   final double impliedVolatility;
   final double creditStress;
@@ -2338,16 +2420,16 @@ class _SectorMedianSet {
   });
 
   factory _SectorMedianSet.empty() => const _SectorMedianSet(
-        residualStrength: 50,
-        earningsRevisions: 50,
-        freeCashFlow: 50,
-        crowdingRisk: 50,
-        total: 0,
-        residualStrengthSorted: <double>[],
-        earningsRevisionsSorted: <double>[],
-        freeCashFlowSorted: <double>[],
-        crowdingSorted: <double>[],
-      );
+    residualStrength: 50,
+    earningsRevisions: 50,
+    freeCashFlow: 50,
+    crowdingRisk: 50,
+    total: 0,
+    residualStrengthSorted: <double>[],
+    earningsRevisionsSorted: <double>[],
+    freeCashFlowSorted: <double>[],
+    crowdingSorted: <double>[],
+  );
 
   factory _SectorMedianSet.fromStocks(List<RawStockSignal> stocks) {
     final rsSorted = stocks.map((s) => s.residualStrength).toList()..sort();

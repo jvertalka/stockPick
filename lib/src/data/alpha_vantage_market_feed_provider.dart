@@ -71,6 +71,10 @@ class AlphaVantageMarketFeedProvider
   static const Duration _alphaVantageRequestTimeout = Duration(seconds: 5);
   static const int _maxAlphaVantageNetworkRequestsPerRefresh = 6;
   static const int _maxYahooBackfillSymbolsPerRefresh = 16;
+  static const int _mediumUniverseHistoryThreshold = 250;
+  static const int _largeUniverseHistoryThreshold = 500;
+  static const int _mediumUniverseHistoryLimit = 140;
+  static const int _largeUniverseHistoryLimit = 90;
 
   @override
   Future<List<DataFeedStatus>> loadSupplementalFeedStatuses() async {
@@ -790,7 +794,7 @@ class AlphaVantageMarketFeedProvider
     }
 
     final dates = anchorSeries.bars.map((bar) => bar.date).toList()..sort();
-    final limit = _configuration.historicalSnapshotLimit;
+    final limit = _historicalStateLimitFor(bundle.stockSeries.length);
     final trimmedDates = dates.length > limit
         ? dates.sublist(dates.length - limit)
         : dates;
@@ -823,6 +827,17 @@ class AlphaVantageMarketFeedProvider
     }
 
     return states;
+  }
+
+  int _historicalStateLimitFor(int symbolCount) {
+    final configuredLimit = _configuration.historicalSnapshotLimit;
+    if (symbolCount >= _largeUniverseHistoryThreshold) {
+      return math.min(configuredLimit, _largeUniverseHistoryLimit);
+    }
+    if (symbolCount >= _mediumUniverseHistoryThreshold) {
+      return math.min(configuredLimit, _mediumUniverseHistoryLimit);
+    }
+    return configuredLimit;
   }
 
   RawMarketEnvironment _buildEnvironment({

@@ -206,7 +206,9 @@ class PortfolioDecisionEngine {
             stockByTicker: stockByTicker,
           );
 
-    final buyTickers = buyCandidates.map((decision) => decision.stock.ticker);
+    final buyTickers = buyCandidates
+        .map((decision) => decision.stock.ticker)
+        .toSet();
     watchDecisions.addAll(
       unownedRanked
           .where((stock) => !buyTickers.contains(stock.ticker))

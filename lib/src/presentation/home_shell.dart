@@ -96,17 +96,19 @@ class _HomeShellState extends State<HomeShell> {
   AppSettings _appSettings = AppSettings.empty;
   RecommendationLedger _recommendationLedger = RecommendationLedger.empty;
 
-  MarketIntelligenceSnapshot get _snapshot =>
-      _universeExpander.expand(widget.state.snapshot, [
-        ..._portfolioState.holdings.map((h) => h.ticker),
-        ..._appSettings.customUniverseTickers,
-      ]);
+  MarketIntelligenceSnapshot _expandedSnapshot() {
+    return _universeExpander.expand(widget.state.snapshot, [
+      ..._portfolioState.holdings.map((h) => h.ticker),
+      ..._appSettings.customUniverseTickers,
+    ]);
+  }
 
   @override
   void initState() {
     super.initState();
-    _selectedTicker = _defaultTicker();
-    _selectedScenario = _defaultScenario();
+    final snapshot = _expandedSnapshot();
+    _selectedTicker = _defaultTicker(snapshot);
+    _selectedScenario = _defaultScenario(snapshot);
     _loadAppSettings();
     _loadRecommendationLedger();
     _loadWorkflowState();
@@ -116,39 +118,41 @@ class _HomeShellState extends State<HomeShell> {
   @override
   void didUpdateWidget(covariant HomeShell oldWidget) {
     super.didUpdateWidget(oldWidget);
+    final snapshot = _expandedSnapshot();
     if (_selectedTicker == null ||
-        !_snapshot.rankedUniverse.any(
+        !snapshot.rankedUniverse.any(
           (stock) => stock.ticker == _selectedTicker,
         )) {
-      _selectedTicker = _defaultTicker();
+      _selectedTicker = _defaultTicker(snapshot);
     }
     if (_selectedScenario == null ||
-        !_snapshot.scenarios.any(
+        !snapshot.scenarios.any(
           (scenario) => scenario.type == _selectedScenario,
         )) {
-      _selectedScenario = _defaultScenario();
+      _selectedScenario = _defaultScenario(snapshot);
     }
     if (oldWidget.state.snapshot.asOf != widget.state.snapshot.asOf) {
       _recordRecommendationSnapshot();
     }
   }
 
-  String? _defaultTicker() {
-    if (_snapshot.rankedUniverse.isEmpty) {
+  String? _defaultTicker(MarketIntelligenceSnapshot snapshot) {
+    if (snapshot.rankedUniverse.isEmpty) {
       return null;
     }
-    return _snapshot.rankedUniverse.first.ticker;
+    return snapshot.rankedUniverse.first.ticker;
   }
 
-  ScenarioType? _defaultScenario() {
-    if (_snapshot.scenarios.isEmpty) {
+  ScenarioType? _defaultScenario(MarketIntelligenceSnapshot snapshot) {
+    if (snapshot.scenarios.isEmpty) {
       return null;
     }
-    return _snapshot.scenarios.first.type;
+    return snapshot.scenarios.first.type;
   }
 
   @override
   Widget build(BuildContext context) {
+    final snapshot = _expandedSnapshot();
     final width = MediaQuery.sizeOf(context).width;
     final showRail = width >= 1040;
 
@@ -178,7 +182,7 @@ class _HomeShellState extends State<HomeShell> {
                               duration: const Duration(milliseconds: 250),
                               child: KeyedSubtree(
                                 key: ValueKey<AppView>(_selectedView),
-                                child: _buildView(),
+                                child: _buildView(snapshot),
                               ),
                             ),
                           ),
@@ -200,7 +204,7 @@ class _HomeShellState extends State<HomeShell> {
                         duration: const Duration(milliseconds: 250),
                         child: KeyedSubtree(
                           key: ValueKey<AppView>(_selectedView),
-                          child: _buildView(),
+                          child: _buildView(snapshot),
                         ),
                       ),
                     ),
@@ -376,103 +380,114 @@ class _HomeShellState extends State<HomeShell> {
     );
   }
 
-  Widget _buildView() {
-    return switch (_selectedView) {
-      AppView.dailyBrief => DailyDecisionBriefView(
-        snapshot: _snapshot,
-        report: _decisionEngine.build(
-          snapshot: _snapshot,
+  Widget _buildView(MarketIntelligenceSnapshot snapshot) {
+    switch (_selectedView) {
+      case AppView.dailyBrief:
+        final report = _decisionEngine.build(
+          snapshot: snapshot,
           portfolio: _portfolioState,
-        ),
-        ledger: _recommendationLedger,
-        onOpenStock: _openStock,
-      ),
-      AppView.marketRadar => MarketRadarView(
-        radar: _snapshot.marketRadar,
-        dataStatus: widget.state.dataStatus,
-        engineStatus: widget.state.engineStatus,
-      ),
-      AppView.decisionDesk => DecisionDeskView(
-        snapshot: _snapshot,
-        portfolioState: _portfolioState,
-        report: _decisionEngine.build(
-          snapshot: _snapshot,
+        );
+        return DailyDecisionBriefView(
+          snapshot: snapshot,
+          report: report,
+          ledger: _recommendationLedger,
+          onOpenStock: _openStock,
+        );
+      case AppView.marketRadar:
+        return MarketRadarView(
+          radar: snapshot.marketRadar,
+          dataStatus: widget.state.dataStatus,
+          engineStatus: widget.state.engineStatus,
+        );
+      case AppView.decisionDesk:
+        final report = _decisionEngine.build(
+          snapshot: snapshot,
           portfolio: _portfolioState,
-        ),
-        onPortfolioChanged: (state) {
-          _persistPortfolioState(state);
-        },
-        onOpenStock: _openStock,
-      ),
-      AppView.opportunityBoard => OpportunityBoardView(
-        stocks: _snapshot.rankedUniverse,
-        highlightedTickers: _snapshot.opportunities
-            .map((stock) => stock.ticker)
-            .toSet(),
-        workflowState: _workflowState,
-        onOpenStock: _openStock,
-        onToggleWatchlist: (ticker) {
-          _toggleWatchlist(ticker);
-        },
-        onToggleSavedIdea: (ticker) {
-          _toggleSavedIdea(ticker);
-        },
-        onToggleAlertSubscription: (ticker) {
-          _toggleAlertSubscription(ticker);
-        },
-      ),
-      AppView.stockIntelligence => StockIntelligenceView(
-        stocks: _snapshot.rankedUniverse,
-        selectedTicker: _selectedTicker,
-        workflowState: _workflowState,
-        onSelectTicker: (ticker) {
-          setState(() {
-            _selectedTicker = ticker;
-          });
-        },
-        onToggleWatchlist: (ticker) {
-          _toggleWatchlist(ticker);
-        },
-        onToggleSavedIdea: (ticker) {
-          _toggleSavedIdea(ticker);
-        },
-        onToggleAlertSubscription: (ticker) {
-          _toggleAlertSubscription(ticker);
-        },
-      ),
-      AppView.sellAlerts => SellAlertsView(alerts: _snapshot.sellAlerts),
-      AppView.scenarioLab => ScenarioLabView(
-        scenarios: _snapshot.scenarios,
-        selectedScenario: _selectedScenario,
-        rankedUniverse: _snapshot.rankedUniverse,
-        onSelectScenario: (scenario) {
-          setState(() {
-            _selectedScenario = scenario;
-          });
-        },
-      ),
-      AppView.workflowHub => WorkflowHubView(
-        snapshot: _snapshot,
-        workflowState: _workflowState,
-        ledger: _recommendationLedger,
-        onOpenStock: _openStock,
-        onToggleWatchlist: (ticker) {
-          _toggleWatchlist(ticker);
-        },
-        onToggleSavedIdea: (ticker) {
-          _toggleSavedIdea(ticker);
-        },
-        onToggleAlertSubscription: (ticker) {
-          _toggleAlertSubscription(ticker);
-        },
-      ),
-      AppView.settings => SettingsView(
-        settings: _appSettings,
-        dataStatus: widget.state.dataStatus,
-        engineStatus: widget.state.engineStatus,
-        onSettingsChanged: _persistAppSettings,
-      ),
-    };
+        );
+        return DecisionDeskView(
+          snapshot: snapshot,
+          portfolioState: _portfolioState,
+          report: report,
+          onPortfolioChanged: (state) {
+            _persistPortfolioState(state);
+          },
+          onOpenStock: _openStock,
+        );
+      case AppView.opportunityBoard:
+        return OpportunityBoardView(
+          stocks: snapshot.rankedUniverse,
+          highlightedTickers: snapshot.opportunities
+              .map((stock) => stock.ticker)
+              .toSet(),
+          workflowState: _workflowState,
+          onOpenStock: _openStock,
+          onToggleWatchlist: (ticker) {
+            _toggleWatchlist(ticker);
+          },
+          onToggleSavedIdea: (ticker) {
+            _toggleSavedIdea(ticker);
+          },
+          onToggleAlertSubscription: (ticker) {
+            _toggleAlertSubscription(ticker);
+          },
+        );
+      case AppView.stockIntelligence:
+        return StockIntelligenceView(
+          stocks: snapshot.rankedUniverse,
+          selectedTicker: _selectedTicker,
+          workflowState: _workflowState,
+          onSelectTicker: (ticker) {
+            setState(() {
+              _selectedTicker = ticker;
+            });
+          },
+          onToggleWatchlist: (ticker) {
+            _toggleWatchlist(ticker);
+          },
+          onToggleSavedIdea: (ticker) {
+            _toggleSavedIdea(ticker);
+          },
+          onToggleAlertSubscription: (ticker) {
+            _toggleAlertSubscription(ticker);
+          },
+        );
+      case AppView.sellAlerts:
+        return SellAlertsView(alerts: snapshot.sellAlerts);
+      case AppView.scenarioLab:
+        return ScenarioLabView(
+          scenarios: snapshot.scenarios,
+          selectedScenario: _selectedScenario,
+          rankedUniverse: snapshot.rankedUniverse,
+          onSelectScenario: (scenario) {
+            setState(() {
+              _selectedScenario = scenario;
+            });
+          },
+        );
+      case AppView.workflowHub:
+        return WorkflowHubView(
+          snapshot: snapshot,
+          workflowState: _workflowState,
+          ledger: _recommendationLedger,
+          onOpenStock: _openStock,
+          onToggleWatchlist: (ticker) {
+            _toggleWatchlist(ticker);
+          },
+          onToggleSavedIdea: (ticker) {
+            _toggleSavedIdea(ticker);
+          },
+          onToggleAlertSubscription: (ticker) {
+            _toggleAlertSubscription(ticker);
+          },
+        );
+      case AppView.settings:
+        return SettingsView(
+          settings: _appSettings,
+          dataStatus: widget.state.dataStatus,
+          engineStatus: widget.state.engineStatus,
+          onSettingsChanged: _persistAppSettings,
+        );
+    }
   }
 }
 

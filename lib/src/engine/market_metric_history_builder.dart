@@ -294,7 +294,10 @@ List<_HistoricalEvaluation> _buildHistoricalEvaluations(
       : orderedSnapshots;
 
   return trimmedSnapshots.map((record) {
-    final evaluation = engine.evaluate(record.marketState);
+    final evaluation = engine.evaluate(
+      record.marketState,
+      includeDiagnostics: false,
+    );
     return _HistoricalEvaluation(
       asOf: record.marketState.asOf,
       provenance: _classifySource(record.source),

@@ -455,6 +455,10 @@ class ProviderMarketRepository implements MarketIntelligenceRepository {
   final List<String> engineCaveats;
   final List<String> engineNextSteps;
   static const Duration _supplementalFeedStatusTimeout = Duration(seconds: 12);
+  static const int _mediumUniverseStockThreshold = 250;
+  static const int _largeUniverseStockThreshold = 500;
+  static const int _mediumUniverseHistoryLimit = 120;
+  static const int _largeUniverseHistoryLimit = 75;
 
   @override
   Future<IntelligenceAppState> loadState() async {
@@ -516,10 +520,14 @@ class ProviderMarketRepository implements MarketIntelligenceRepository {
       stockUniverseCount: currentState.stocks.length,
     );
     final archivedSnapshots = await _archive.loadSnapshots();
+    final historyEvaluationLimit = _historyEvaluationLimitFor(
+      currentState.stocks.length,
+    );
     final snapshotWithHistory = withHistoricalInsights(
       snapshot: evaluation.snapshot,
       historicalSnapshots: archivedSnapshots,
       engine: _engine,
+      maxHistoryPoints: historyEvaluationLimit,
     );
     final feedStatuses = [
       environmentFeed,
@@ -605,6 +613,16 @@ class ProviderMarketRepository implements MarketIntelligenceRepository {
   @override
   Future<IntelligenceAppState> refreshState() {
     return loadState();
+  }
+
+  int _historyEvaluationLimitFor(int stockCount) {
+    if (stockCount >= _largeUniverseStockThreshold) {
+      return _largeUniverseHistoryLimit;
+    }
+    if (stockCount >= _mediumUniverseStockThreshold) {
+      return _mediumUniverseHistoryLimit;
+    }
+    return 240;
   }
 
   Future<List<DataFeedStatus>> _loadSupplementalFeedStatuses() async {

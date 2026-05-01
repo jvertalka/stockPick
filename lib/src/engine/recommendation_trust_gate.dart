@@ -12,12 +12,13 @@ class RecommendationTrustGate {
     final rankedUniverse = snapshot.rankedUniverse
         .map((stock) => _applyToStock(stock, components))
         .toList();
+    final rankedByTicker = {
+      for (final stock in rankedUniverse) stock.ticker: stock,
+    };
     final opportunities = snapshot.opportunities
         .map(
-          (stock) => rankedUniverse.firstWhere(
-            (candidate) => candidate.ticker == stock.ticker,
-            orElse: () => _applyToStock(stock, components),
-          ),
+          (stock) =>
+              rankedByTicker[stock.ticker] ?? _applyToStock(stock, components),
         )
         .toList();
 
