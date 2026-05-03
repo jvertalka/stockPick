@@ -1,4 +1,4 @@
-import { useMemo, useState, type ComponentType } from 'react'
+import { useEffect, useMemo, useState, type ComponentType } from 'react'
 import {
   ArrowDownRight,
   ArrowUpRight,
@@ -27,14 +27,22 @@ import {
   sortSignals,
   type Action,
   type DecisionSignal,
+  type MarketContext,
+  type RawSignal,
   type ScenarioId,
   type SortKey,
   type Tone,
 } from './data/decisionEngine'
+import {
+  loadDecisionUniverse,
+  type DecisionHistoryPoint,
+  type DecisionUniverseResponse,
+} from './data/decisionApi'
 import './App.css'
 
-type ViewId = 'decision' | 'buy' | 'sell' | 'radar' | 'scenario'
+type ViewId = 'decision' | 'buy' | 'hold' | 'sell' | 'radar' | 'scenario'
 type ActionFilter = 'All' | 'Buy' | 'Hold' | 'Risk'
+type FeedStatus = 'loading' | 'backend' | 'fallback'
 
 type NavItem = {
   id: ViewId
@@ -58,6 +66,13 @@ const navItems: NavItem[] = [
     eyebrow: 'Buy Board',
     heading: 'Highest-confidence accumulation candidates',
     icon: Target,
+  },
+  {
+    id: 'hold',
+    label: 'Hold Board',
+    eyebrow: 'Hold Board',
+    heading: 'Positions with enough evidence to stay patient',
+    icon: CheckCircle2,
   },
   {
     id: 'sell',
@@ -90,6 +105,63 @@ const sortOptions: Array<{ value: SortKey; label: string }> = [
   { value: 'risk', label: 'Risk' },
   { value: 'regimeFit', label: 'Regime fit' },
 ]
+const actionOrder: Action[] = ['Buy Now', 'Accumulate', 'Hold', 'Trim', 'Sell', 'Avoid']
+const ownedStorageKey = 'finance-oracle-owned-tickers'
+const maxTableRows = 260
+const maxBoardCards = 96
+const maxRiskRows = 140
+
+function readOwnedTickers() {
+  try {
+    const stored = window.localStorage.getItem(ownedStorageKey)
+    const decoded = stored ? (JSON.parse(stored) as unknown) : []
+    if (!Array.isArray(decoded)) return new Set<string>()
+    return new Set(decoded.map((ticker) => String(ticker).trim().toUpperCase()).filter(Boolean))
+  } catch {
+    return new Set<string>()
+  }
+}
+
+function formatFeedTime(value: string | null) {
+  if (!value) return 'pending'
+  const parsed = new Date(value)
+  if (Number.isNaN(parsed.getTime())) return 'pending'
+  return parsed.toLocaleTimeString()
+}
+
+function feedLabel(status: FeedStatus) {
+  if (status === 'loading') return 'Loading'
+  if (status === 'backend') return 'Backend cache'
+  return 'Local fallback'
+}
+
+function actionFilterFor(action: Action): ActionFilter {
+  if (action === 'Buy Now' || action === 'Accumulate') return 'Buy'
+  if (action === 'Hold') return 'Hold'
+  return 'Risk'
+}
+
+function viewForAction(action: Action): ViewId {
+  if (action === 'Buy Now' || action === 'Accumulate') return 'buy'
+  if (action === 'Hold') return 'hold'
+  return 'sell'
+}
+
+function portfolioActionFor(signal: DecisionSignal, owned: boolean) {
+  if (owned) {
+    if (signal.action === 'Buy Now' || signal.action === 'Accumulate') return 'Hold / add selectively'
+    if (signal.action === 'Hold') return 'Hold'
+    if (signal.action === 'Trim') return 'Trim'
+    if (signal.action === 'Sell') return 'Exit candidate'
+    return 'Reduce or avoid fresh exposure'
+  }
+  if (signal.action === 'Buy Now') return 'Buy candidate'
+  if (signal.action === 'Accumulate') return 'Accumulate on pullbacks'
+  if (signal.action === 'Hold') return 'Watch only'
+  if (signal.action === 'Trim') return 'Do not initiate'
+  if (signal.action === 'Sell') return 'Avoid / short-list risk'
+  return 'Avoid for now'
+}
 
 function Metric({
   label,
@@ -145,6 +217,15 @@ function SignalButton({
       <span>{label}</span>
     </button>
   )
+}
+
+function riskPriority(row: DecisionSignal) {
+  const actionPenalty = row.action === 'Sell' ? 28 : row.action === 'Trim' ? 18 : row.action === 'Avoid' ? 12 : 0
+  return row.thesisDamage * 0.45 + row.riskScore * 0.3 + row.fragilityScore * 0.18 + actionPenalty
+}
+
+function byRiskPriority(left: DecisionSignal, right: DecisionSignal) {
+  return riskPriority(right) - riskPriority(left)
 }
 
 function HeroDecisionCard({
@@ -294,23 +375,61 @@ function Controls({
   )
 }
 
+function ActionSummaryStrip({
+  rows,
+  activeFilter,
+  onActionFocus,
+}: {
+  rows: DecisionSignal[]
+  activeFilter: ActionFilter
+  onActionFocus: (action: Action) => void
+}) {
+  const counts = new Map<Action, number>()
+  rows.forEach((row) => counts.set(row.action, (counts.get(row.action) ?? 0) + 1))
+
+  return (
+    <section className="action-summary" aria-label="Action summary">
+      {actionOrder.map((action) => {
+        const filter = actionFilterFor(action)
+        const active = activeFilter === filter
+        return (
+          <button
+            className={active ? `active ${actionTone(action)}` : actionTone(action)}
+            data-testid={`summary-${action.toLowerCase().replace(/\s+/g, '-')}`}
+            key={action}
+            onClick={() => onActionFocus(action)}
+            type="button"
+          >
+            <span>{action}</span>
+            <strong>{counts.get(action) ?? 0}</strong>
+          </button>
+        )
+      })}
+    </section>
+  )
+}
+
 function DecisionTable({
   rows,
   selectedTicker,
+  sourceLabel,
   onOpen,
 }: {
   rows: DecisionSignal[]
   selectedTicker: string | null
+  sourceLabel: string
   onOpen: (signal: DecisionSignal) => void
 }) {
+  const displayedRows = rows.slice(0, maxTableRows)
+  const visibleLabel = rows.length > maxTableRows ? `${displayedRows.length} of ${rows.length}` : `${rows.length}`
   return (
     <section className="panel table-panel">
       <header className="panel-header">
         <div>
           <p>Ranked decisions</p>
-          <h2>{rows.length} visible signals</h2>
+          <h2>{visibleLabel} visible signals</h2>
         </div>
-        <span className="pill neutral">Local model</span>
+        <span className="pill neutral">{sourceLabel}</span>
       </header>
       <div className="decision-table">
         <div className="table-head">
@@ -321,7 +440,7 @@ function DecisionTable({
           <span>Forecast</span>
           <span></span>
         </div>
-        {rows.map((row) => (
+        {displayedRows.map((row) => (
           <article className={selectedTicker === row.ticker ? 'active table-row' : 'table-row'} key={row.ticker}>
             <div className="name-cell">
               <strong>{row.ticker}</strong>
@@ -350,13 +469,17 @@ function DecisionTable({
 function DetailPanel({
   signal,
   reviewed,
+  owned,
   onClose,
   onReview,
+  onToggleOwned,
 }: {
   signal: DecisionSignal | null
   reviewed: boolean
+  owned: boolean
   onClose: () => void
   onReview: (ticker: string) => void
+  onToggleOwned: (ticker: string) => void
 }) {
   if (!signal) {
     return (
@@ -386,6 +509,18 @@ function DetailPanel({
         <strong>{signal.positionPlan}</strong>
         <span>{signal.nextCheck}</span>
       </div>
+
+      <section className="portfolio-box">
+        <div>
+          <p>{owned ? 'Portfolio action' : 'Entry action'}</p>
+          <strong>{portfolioActionFor(signal, owned)}</strong>
+          <span>{owned ? 'Tracked position' : 'Not tracked as owned'}</span>
+        </div>
+        <button onClick={() => onToggleOwned(signal.ticker)} type="button">
+          <CheckCircle2 size={16} />
+          {owned ? 'Untrack' : 'Track'}
+        </button>
+      </section>
 
       <div className="detail-metrics">
         <Metric label="Opportunity" value={`${signal.opportunityScore}`} tone="positive" />
@@ -463,56 +598,103 @@ function SignalCard({
 
 function BuyBoard({ rows, onOpen }: { rows: DecisionSignal[]; onOpen: (signal: DecisionSignal) => void }) {
   const buyRows = rows.filter((row) => row.action === 'Buy Now' || row.action === 'Accumulate')
+  const displayedRows = buyRows.slice(0, maxBoardCards)
   return (
     <section className="board-grid">
       <section className="panel">
         <header className="panel-header">
           <div>
             <p>Buy focus</p>
-            <h2>{buyRows.length} candidates cleared the buy bar</h2>
+            <h2>{displayedRows.length} of {buyRows.length} candidates cleared the buy bar</h2>
           </div>
           <span className="pill positive">Ranked</span>
         </header>
-        <div className="card-grid">
-          {buyRows.map((row) => (
-            <SignalCard key={row.ticker} signal={row} onOpen={onOpen} />
-          ))}
-        </div>
+        {buyRows.length > 0 ? (
+          <div className="card-grid">
+            {displayedRows.map((row) => (
+              <SignalCard key={row.ticker} signal={row} onOpen={onOpen} />
+            ))}
+          </div>
+        ) : (
+          <InlineEmptyState message="No buy candidates match the current filters." />
+        )}
+      </section>
+    </section>
+  )
+}
+
+function HoldBoard({ rows, onOpen }: { rows: DecisionSignal[]; onOpen: (signal: DecisionSignal) => void }) {
+  const holdRows = rows.filter((row) => row.action === 'Hold')
+  const displayedRows = holdRows.slice(0, maxBoardCards)
+  return (
+    <section className="board-grid">
+      <section className="panel">
+        <header className="panel-header">
+          <div>
+            <p>Hold focus</p>
+            <h2>{displayedRows.length} of {holdRows.length} names have balanced evidence</h2>
+          </div>
+          <span className="pill neutral">Patience</span>
+        </header>
+        {holdRows.length > 0 ? (
+          <div className="card-grid">
+            {displayedRows.map((row) => (
+              <SignalCard key={row.ticker} signal={row} onOpen={onOpen} />
+            ))}
+          </div>
+        ) : (
+          <InlineEmptyState message="No hold candidates match the current filters." />
+        )}
       </section>
     </section>
   )
 }
 
 function SellBoard({ rows, onOpen }: { rows: DecisionSignal[]; onOpen: (signal: DecisionSignal) => void }) {
-  const riskRows = rows.filter((row) => row.action === 'Sell' || row.action === 'Trim' || row.action === 'Avoid')
+  const riskRows = rows
+    .filter((row) => row.action === 'Sell' || row.action === 'Trim' || row.action === 'Avoid')
+    .sort(byRiskPriority)
+  const displayedRows = riskRows.slice(0, maxRiskRows)
   return (
     <section className="panel">
       <header className="panel-header">
         <div>
           <p>Sell discipline</p>
-          <h2>{riskRows.length} names need risk-control review</h2>
+          <h2>{displayedRows.length} of {riskRows.length} names need risk-control review</h2>
         </div>
         <span className="pill danger">Deterioration</span>
       </header>
-      <div className="risk-list">
-        {riskRows.map((row) => (
-          <article key={row.ticker}>
-            <div>
-              <strong>{row.ticker}</strong>
-              <span>{row.name}</span>
-            </div>
-            <ActionPill action={row.action} />
-            <span>Damage {row.thesisDamage}</span>
-            <span>Risk {row.riskScore}</span>
-            <SignalButton context="risk" signal={row} onOpen={onOpen} />
-          </article>
-        ))}
-      </div>
+      {riskRows.length > 0 ? (
+        <div className="risk-list">
+          {displayedRows.map((row) => (
+            <article key={row.ticker}>
+              <div>
+                <strong>{row.ticker}</strong>
+                <span>{row.name}</span>
+              </div>
+              <ActionPill action={row.action} />
+              <span>Damage {row.thesisDamage}</span>
+              <span>Risk {row.riskScore}</span>
+              <SignalButton context="risk" signal={row} onOpen={onOpen} />
+            </article>
+          ))}
+        </div>
+      ) : (
+        <InlineEmptyState message="No trim, sell, or avoid signals match the current filters." />
+      )}
     </section>
   )
 }
 
-function MarketRadar({ rows }: { rows: DecisionSignal[] }) {
+function MarketRadar({
+  rows,
+  context,
+  history,
+}: {
+  rows: DecisionSignal[]
+  context: MarketContext
+  history: DecisionHistoryPoint[]
+}) {
   const sectors = sectorScores(rows)
   return (
     <section className="radar-layout">
@@ -520,20 +702,31 @@ function MarketRadar({ rows }: { rows: DecisionSignal[] }) {
         <header className="panel-header">
           <div>
             <p>Market regime</p>
-            <h2>{marketContext.regime}</h2>
+            <h2>{context.regime}</h2>
           </div>
-          <span className="pill caution">{marketContext.riskLevel}</span>
+          <span className="pill caution">{context.riskLevel}</span>
         </header>
         <div className="radar-grid">
-          <Metric label="Regime confidence" value={`${marketContext.confidence}%`} />
-          <Metric label="Breadth" value={`${marketContext.breadth}%`} />
-          <Metric label="Vol pressure" value={`${marketContext.volatilityPressure}%`} tone="caution" />
-          <Metric label="Credit stress" value={`${marketContext.creditStress}%`} />
+          <Metric label="Regime confidence" value={`${context.confidence}%`} />
+          <Metric label="Breadth" value={`${context.breadth}%`} />
+          <Metric label="Vol pressure" value={`${context.volatilityPressure}%`} tone="caution" />
+          <Metric label="Credit stress" value={`${context.creditStress}%`} />
         </div>
         <div className="market-note">
           <Sparkles size={16} />
-          <span>{marketContext.leadership}</span>
+          <span>{context.leadership}</span>
         </div>
+        {history.length > 0 ? (
+          <div className="history-list">
+            {history.slice(0, 4).map((point) => (
+              <article key={point.asOf}>
+                <span>{new Date(point.asOf).toLocaleTimeString()}</span>
+                <strong>{point.topBuy?.ticker ?? 'No buy'}</strong>
+                <small>{point.topRisk?.ticker ?? 'No risk'} risk</small>
+              </article>
+            ))}
+          </div>
+        ) : null}
       </section>
 
       <section className="panel">
@@ -566,11 +759,13 @@ function MarketRadar({ rows }: { rows: DecisionSignal[] }) {
 function ScenarioLab({
   rows,
   activeScenario,
+  sourceLabel,
   onScenarioChange,
   onOpen,
 }: {
   rows: DecisionSignal[]
   activeScenario: ScenarioId
+  sourceLabel: string
   onScenarioChange: (scenario: ScenarioId) => void
   onOpen: (signal: DecisionSignal) => void
 }) {
@@ -598,7 +793,7 @@ function ScenarioLab({
           </button>
         ))}
       </div>
-      <DecisionTable rows={rows} selectedTicker={null} onOpen={onOpen} />
+      <DecisionTable rows={rows} selectedTicker={null} sourceLabel={sourceLabel} onOpen={onOpen} />
     </section>
   )
 }
@@ -609,6 +804,15 @@ function EmptyState({ query }: { query: string }) {
       <h2>No matches</h2>
       <p>No visible securities match "{query}".</p>
     </section>
+  )
+}
+
+function InlineEmptyState({ message }: { message: string }) {
+  return (
+    <div className="inline-empty">
+      <strong>No visible signals</strong>
+      <span>{message}</span>
+    </div>
   )
 }
 
@@ -625,9 +829,19 @@ function App() {
   const [refreshCount, setRefreshCount] = useState(0)
   const [reviewedTickers, setReviewedTickers] = useState<Set<string>>(() => new Set())
   const [activeScenario, setActiveScenario] = useState<ScenarioId>('base')
+  const [signalInputs, setSignalInputs] = useState<RawSignal[] | null>(null)
+  const [decisionFeed, setDecisionFeed] = useState<DecisionUniverseResponse | null>(null)
+  const [feedStatus, setFeedStatus] = useState<FeedStatus>('loading')
+  const [dataError, setDataError] = useState<string | null>(null)
+  const [ownedTickers, setOwnedTickers] = useState<Set<string>>(() => readOwnedTickers())
 
-  const universe = useMemo(() => scoreUniverse(undefined, activeScenario), [activeScenario])
+  const ownedKey = useMemo(() => Array.from(ownedTickers).sort().join(','), [ownedTickers])
+  const universe = useMemo(() => scoreUniverse(signalInputs ?? undefined, activeScenario), [activeScenario, signalInputs])
   const sectors = useMemo(() => ['All', ...Array.from(new Set(universe.map((row) => row.sector))).sort()], [universe])
+  const activeMarketContext = useMemo(
+    () => ({ ...marketContext, ...(decisionFeed?.marketContext ?? {}) }),
+    [decisionFeed],
+  )
 
   const visibleRows = useMemo(() => {
     const normalized = query.trim().toLowerCase()
@@ -650,13 +864,52 @@ function App() {
   }, [actionFilter, highConvictionOnly, query, sector, sortKey, universe])
 
   const activeMeta = navItems.find((item) => item.id === activeView) ?? navItems[0]
-  const selectedSignal = universe.find((row) => row.ticker === selectedTicker) ?? null
+  const selectedSignal = visibleRows.find((row) => row.ticker === selectedTicker) ?? null
   const topBuy = universe.find((row) => row.action === 'Buy Now' || row.action === 'Accumulate')
-  const topRisk = universe.find((row) => row.action === 'Sell' || row.action === 'Trim' || row.action === 'Avoid')
+  const topRisk =
+    universe
+      .filter((row) => row.action === 'Sell' || row.action === 'Trim' || row.action === 'Avoid')
+      .sort(byRiskPriority)[0] ?? undefined
   const reviewed = selectedSignal ? reviewedTickers.has(selectedSignal.ticker) : false
+  const selectedOwned = selectedSignal ? ownedTickers.has(selectedSignal.ticker) : false
   const buyCount = universe.filter((row) => row.action === 'Buy Now' || row.action === 'Accumulate').length
+  const holdCount = universe.filter((row) => row.action === 'Hold').length
   const riskCount = universe.filter((row) => row.action === 'Sell' || row.action === 'Trim' || row.action === 'Avoid').length
-  const averageConfidence = Math.round(universe.reduce((sum, row) => sum + row.confidence, 0) / universe.length)
+  const averageConfidence =
+    universe.length > 0 ? Math.round(universe.reduce((sum, row) => sum + row.confidence, 0) / universe.length) : 0
+  const sourceLabel = feedLabel(feedStatus)
+
+  useEffect(() => {
+    let cancelled = false
+    const owned = ownedKey.length > 0 ? ownedKey.split(',') : []
+
+    loadDecisionUniverse({ ownedTickers: owned })
+      .then((payload) => {
+        if (cancelled) return
+        setDecisionFeed(payload)
+        setSignalInputs(payload.rawSignals)
+        setFeedStatus(payload.dataMode)
+        setDataError(payload.errorMessage ?? null)
+        setLastRefresh(new Date(payload.asOf))
+      })
+      .catch((error: unknown) => {
+        if (cancelled) return
+        setFeedStatus('fallback')
+        setDataError(error instanceof Error ? error.message : 'Decision feed failed to load')
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [ownedKey, refreshCount])
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(ownedStorageKey, JSON.stringify(Array.from(ownedTickers).sort()))
+    } catch {
+      // Local storage can be unavailable in hardened webviews.
+    }
+  }, [ownedTickers])
 
   function openSignal(signal: DecisionSignal) {
     setSelectedTicker(signal.ticker)
@@ -671,8 +924,26 @@ function App() {
   }
 
   function refreshData() {
-    setLastRefresh(new Date())
+    setFeedStatus('loading')
     setRefreshCount((count) => count + 1)
+  }
+
+  function toggleOwned(ticker: string) {
+    setFeedStatus('loading')
+    setOwnedTickers((current) => {
+      const next = new Set(current)
+      if (next.has(ticker)) {
+        next.delete(ticker)
+      } else {
+        next.add(ticker)
+      }
+      return next
+    })
+  }
+
+  function focusAction(action: Action) {
+    setActionFilter(actionFilterFor(action))
+    setActiveView(viewForAction(action))
   }
 
   function clearFilters() {
@@ -716,11 +987,17 @@ function App() {
             <p>{activeMeta.eyebrow}</p>
             <h1>{activeMeta.heading}</h1>
             <span className="sync-line">
-              Last refreshed {lastRefresh.toLocaleTimeString()} - {refreshCount} manual syncs
+              {sourceLabel} - Last feed {formatFeedTime(lastRefresh.toISOString())} - {refreshCount} manual refreshes
             </span>
           </div>
           <div className="topbar-actions">
-            <button aria-label="Refresh data" onClick={refreshData} title="Refresh data" type="button">
+            <button
+              aria-label="Refresh signals"
+              disabled={feedStatus === 'loading'}
+              onClick={refreshData}
+              title="Refresh signals"
+              type="button"
+            >
               <RefreshCcw size={17} />
               Refresh
             </button>
@@ -757,25 +1034,29 @@ function App() {
           <HeroDecisionCard label="Biggest sell or trim risk" signal={topRisk} tone="danger" onOpen={openSignal} />
           <section className="hero-card neutral">
             <p>Market posture</p>
-            <h2>{marketContext.regime}</h2>
+            <h2>{activeMarketContext.regime}</h2>
             <div className="hero-stats">
-              <span>Risk {marketContext.riskScore}</span>
-              <span>Breadth {marketContext.breadth}%</span>
-              <span>Credit {marketContext.creditStress}%</span>
+              <span>Risk {activeMarketContext.riskScore}</span>
+              <span>Breadth {activeMarketContext.breadth}%</span>
+              <span>Credit {activeMarketContext.creditStress}%</span>
             </div>
-            <p className="hero-reason">{marketContext.liquidity}</p>
+            <p className="hero-reason">{activeMarketContext.liquidity}</p>
           </section>
           <section className="hero-card caution">
             <p>Decision coverage</p>
-            <h2>{universe.length} names</h2>
+            <h2>{decisionFeed ? `${decisionFeed.returned}/${decisionFeed.universeSize}` : `${universe.length}`} names</h2>
             <div className="hero-stats">
               <span>{buyCount} buy</span>
+              <span>{holdCount} hold</span>
               <span>{riskCount} risk</span>
               <span>{averageConfidence}% confidence</span>
+              <span>{ownedTickers.size} owned</span>
             </div>
-            <p className="hero-reason">Stocks and ETFs are scored by regime fit, trend, revisions, risk, and fragility.</p>
+            <p className="hero-reason">{dataError ?? decisionFeed?.detail ?? 'Loading backend decision universe.'}</p>
           </section>
         </section>
+
+        <ActionSummaryStrip rows={universe} activeFilter={actionFilter} onActionFocus={focusAction} />
 
         <Controls
           actionFilter={actionFilter}
@@ -796,10 +1077,17 @@ function App() {
 
         {activeView === 'decision' && visibleRows.length > 0 ? (
           <section className="main-grid">
-            <DecisionTable rows={visibleRows} selectedTicker={selectedTicker} onOpen={openSignal} />
+            <DecisionTable
+              rows={visibleRows}
+              selectedTicker={selectedTicker}
+              sourceLabel={sourceLabel}
+              onOpen={openSignal}
+            />
             <DetailPanel
               onClose={() => setSelectedTicker(null)}
               onReview={markReviewed}
+              onToggleOwned={toggleOwned}
+              owned={selectedOwned}
               reviewed={reviewed}
               signal={selectedSignal}
             />
@@ -812,6 +1100,22 @@ function App() {
             <DetailPanel
               onClose={() => setSelectedTicker(null)}
               onReview={markReviewed}
+              onToggleOwned={toggleOwned}
+              owned={selectedOwned}
+              reviewed={reviewed}
+              signal={selectedSignal}
+            />
+          </section>
+        ) : null}
+
+        {activeView === 'hold' && visibleRows.length > 0 ? (
+          <section className="main-grid">
+            <HoldBoard rows={visibleRows} onOpen={openSignal} />
+            <DetailPanel
+              onClose={() => setSelectedTicker(null)}
+              onReview={markReviewed}
+              onToggleOwned={toggleOwned}
+              owned={selectedOwned}
               reviewed={reviewed}
               signal={selectedSignal}
             />
@@ -824,13 +1128,21 @@ function App() {
             <DetailPanel
               onClose={() => setSelectedTicker(null)}
               onReview={markReviewed}
+              onToggleOwned={toggleOwned}
+              owned={selectedOwned}
               reviewed={reviewed}
               signal={selectedSignal}
             />
           </section>
         ) : null}
 
-        {activeView === 'radar' ? <MarketRadar rows={universe} /> : null}
+        {activeView === 'radar' ? (
+          <MarketRadar
+            context={activeMarketContext}
+            history={decisionFeed?.history ?? []}
+            rows={universe}
+          />
+        ) : null}
 
         {activeView === 'scenario' && visibleRows.length > 0 ? (
           <section className="main-grid">
@@ -839,10 +1151,13 @@ function App() {
               onOpen={openSignal}
               onScenarioChange={setActiveScenario}
               rows={visibleRows}
+              sourceLabel={sourceLabel}
             />
             <DetailPanel
               onClose={() => setSelectedTicker(null)}
               onReview={markReviewed}
+              onToggleOwned={toggleOwned}
+              owned={selectedOwned}
               reviewed={reviewed}
               signal={selectedSignal}
             />

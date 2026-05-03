@@ -846,18 +846,18 @@ function classifyAction(scores: {
   regimeFit: number
   thesisDamage: number
 }): Action {
-  if (scores.thesisDamage >= 72 && scores.riskScore >= 60) return 'Sell'
-  if (scores.thesisDamage >= 64 || (scores.riskScore >= 68 && scores.opportunityScore < 70)) return 'Trim'
-  if (scores.riskScore >= 72 && scores.opportunityScore < 58) return 'Avoid'
+  if (scores.thesisDamage >= 58 && scores.riskScore >= 56) return 'Sell'
+  if (scores.thesisDamage >= 54 || (scores.riskScore >= 58 && scores.opportunityScore < 66)) return 'Trim'
+  if (scores.riskScore >= 70 && scores.opportunityScore < 60) return 'Avoid'
   if (
-    scores.opportunityScore >= 78 &&
-    scores.confidence >= 70 &&
-    scores.regimeFit >= 68 &&
-    scores.riskScore <= 62
+    scores.opportunityScore >= 74 &&
+    scores.confidence >= 68 &&
+    scores.regimeFit >= 62 &&
+    scores.riskScore <= 55
   ) {
     return 'Buy Now'
   }
-  if (scores.opportunityScore >= 70 && scores.confidence >= 62 && scores.riskScore <= 68) return 'Accumulate'
+  if (scores.opportunityScore >= 68 && scores.confidence >= 62 && scores.riskScore <= 64) return 'Accumulate'
   if (scores.opportunityScore < 54 && scores.regimeFit < 52) return 'Avoid'
   return 'Hold'
 }

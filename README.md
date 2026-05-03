@@ -87,8 +87,8 @@ dart run tool/backend_cache_server.dart --port 8787 --web-root build/web
 ```
 
 Then open `http://127.0.0.1:8787`. The backend cache exposes
-`/proxy?url=...`, `/health`, and `/cache/status`, and stores cached responses
-under `.dart_tool/market_data_cache`.
+`/proxy?url=...`, `/health`, `/cache/status`, and `/decision/universe`, and
+stores cached responses plus decision history under `.dart_tool/market_data_cache`.
 
 ## Desktop app track
 
@@ -140,6 +140,14 @@ The React/Vite shell can be built today with:
 
 ```powershell
 npm run build
+```
+
+For the backend-fed JavaScript workstation, run the shared cache server from the
+repo root beside Vite. The React app will call `/decision/universe` and fall
+back to the bundled local universe if the cache is offline:
+
+```powershell
+dart run tool\backend_cache_server.dart --port 8787 --web-root desktop-js\dist
 ```
 
 The native desktop shell uses Tauri:
