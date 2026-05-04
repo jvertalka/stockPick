@@ -103,6 +103,7 @@ const sortOptions: Array<{ value: SortKey; label: string }> = [
   { value: 'opportunity', label: 'Opportunity' },
   { value: 'confidence', label: 'Confidence' },
   { value: 'risk', label: 'Risk' },
+  { value: 'data', label: 'Data quality' },
   { value: 'regimeFit', label: 'Regime fit' },
 ]
 const actionOrder: Action[] = ['Buy Now', 'Accumulate', 'Hold', 'Trim', 'Sell', 'Avoid']
@@ -193,6 +194,43 @@ function portfolioActionFor(signal: DecisionSignal, owned: boolean, watched: boo
   if (signal.action === 'Trim') return 'Do not initiate'
   if (signal.action === 'Sell') return 'Avoid / short-list risk'
   return 'Avoid for now'
+}
+
+function signalReadiness(signal: DecisionSignal): { label: string; tone: Tone; detail: string } {
+  const dataConfidence = signal.dataConfidence ?? 0
+  const warnings = signal.dataWarnings ?? []
+  const missingCoreFeeds = warnings.some((warning) =>
+    ['Fundamental', 'estimate', 'Listed-options'].some((needle) => warning.includes(needle)),
+  )
+  if (dataConfidence >= 72 && !missingCoreFeeds) {
+    return {
+      label: 'Decision grade',
+      tone: 'positive',
+      detail: 'Full evidence stack is available.',
+    }
+  }
+  if (dataConfidence >= 60) {
+    return {
+      label: 'Price-backed',
+      tone: 'caution',
+      detail: 'Market-data case is live; fundamental and options confirmation are incomplete.',
+    }
+  }
+  return {
+    label: 'Research only',
+    tone: 'danger',
+    detail: 'Evidence is too thin for a high-conviction decision.',
+  }
+}
+
+function missingEvidenceCount(signal: DecisionSignal) {
+  return (signal.dataWarnings ?? []).filter((warning) =>
+    ['not connected', 'neutral', 'stale', 'Short price', 'thin'].some((needle) => warning.includes(needle)),
+  ).length
+}
+
+function actionableRows(rows: DecisionSignal[]) {
+  return rows.filter((row) => signalReadiness(row).label !== 'Research only')
 }
 
 function Metric({
@@ -303,6 +341,64 @@ function HeroDecisionCard({
         label="Inspect"
         onOpen={onOpen}
       />
+    </section>
+  )
+}
+
+function ReadinessGate({
+  feed,
+  rows,
+  status,
+}: {
+  feed: DecisionUniverseResponse | null
+  rows: DecisionSignal[]
+  status: FeedStatus
+}) {
+  const qualified = feed?.returned ?? rows.length
+  const universeSize = feed?.universeSize ?? rows.length
+  const excluded = feed?.excludedForInsufficientData ?? Math.max(0, universeSize - qualified)
+  const actionable = actionableRows(rows).length
+  const readinessTone: Tone = status === 'backend' && qualified > 0 ? 'caution' : status === 'loading' ? 'neutral' : 'danger'
+  const readinessLabel =
+    status === 'loading'
+      ? 'Loading evidence'
+      : status === 'backend' && qualified > 0
+        ? 'Price-backed, incomplete'
+        : 'Recommendations paused'
+
+  return (
+    <section className="readiness-panel" data-testid="readiness-gate">
+      <div className="readiness-lead">
+        <p>Decision readiness</p>
+        <h2>{readinessLabel}</h2>
+        <span>{feed?.detail ?? 'Waiting for backend decision evidence.'}</span>
+      </div>
+      <div className="readiness-grid">
+        <Metric
+          label="Usable cases"
+          value={`${actionable}/${qualified}`}
+          detail="Above research-only data threshold"
+          tone={readinessTone}
+        />
+        <Metric
+          label="Excluded"
+          value={`${excluded}`}
+          detail="No fresh OHLCV, no recommendation"
+          tone={excluded > 0 ? 'caution' : 'positive'}
+        />
+        <Metric
+          label="Latest bar"
+          value={formatDate(feed?.priceCoverage.latestPriceDate)}
+          detail={`${feed?.priceCoverage.usableSymbolCount ?? 0} usable price histories`}
+          tone={feed?.priceCoverage.usableSymbolCount ? 'neutral' : 'danger'}
+        />
+        <Metric
+          label="Missing feeds"
+          value="3"
+          detail="Fundamentals, estimates, listed options"
+          tone="caution"
+        />
+      </div>
     </section>
   )
 }
@@ -469,30 +565,38 @@ function DecisionTable({
           <span>Action</span>
           <span>Opportunity</span>
           <span>Risk</span>
-          <span>Forecast</span>
+          <span>20d model</span>
+          <span>Data</span>
           <span></span>
         </div>
-        {displayedRows.map((row) => (
-          <article className={selectedTicker === row.ticker ? 'active table-row' : 'table-row'} key={row.ticker}>
-            <div className="name-cell">
-              <strong>{row.ticker}</strong>
-              <span>{row.name}</span>
-            </div>
-            <ActionPill action={row.action} />
-            <div>
-              <strong>{row.opportunityScore}</strong>
-              <ScoreBar value={row.opportunityScore} tone="positive" />
-            </div>
-            <div>
-              <strong className={row.riskScore >= 68 ? 'danger' : 'neutral'}>{row.riskScore}</strong>
-              <ScoreBar value={row.riskScore} tone={row.riskScore >= 68 ? 'danger' : 'caution'} />
-            </div>
-            <strong className={row.forecast20d < 0 ? 'danger' : 'positive'}>
-              {formatSignedPercent(row.forecast20d)}
-            </strong>
-            <SignalButton context="table" signal={row} onOpen={onOpen} />
-          </article>
-        ))}
+        {displayedRows.map((row) => {
+          const readiness = signalReadiness(row)
+          return (
+            <article className={selectedTicker === row.ticker ? 'active table-row' : 'table-row'} key={row.ticker}>
+              <div className="name-cell">
+                <strong>{row.ticker}</strong>
+                <span>{row.name}</span>
+              </div>
+              <ActionPill action={row.action} />
+              <div>
+                <strong>{row.opportunityScore}</strong>
+                <ScoreBar value={row.opportunityScore} tone="positive" />
+              </div>
+              <div>
+                <strong className={row.riskScore >= 68 ? 'danger' : 'neutral'}>{row.riskScore}</strong>
+                <ScoreBar value={row.riskScore} tone={row.riskScore >= 68 ? 'danger' : 'caution'} />
+              </div>
+              <strong className={row.forecast20d < 0 ? 'danger' : 'positive'}>
+                {formatSignedPercent(row.forecast20d)}
+              </strong>
+              <div className="readiness-cell">
+                <strong className={readiness.tone}>{readiness.label}</strong>
+                <span>{Math.round(row.dataConfidence ?? 0)}%</span>
+              </div>
+              <SignalButton context="table" signal={row} onOpen={onOpen} />
+            </article>
+          )
+        })}
       </div>
     </section>
   )
@@ -526,6 +630,8 @@ function DetailPanel({
     )
   }
 
+  const readiness = signalReadiness(signal)
+
   return (
     <aside className="detail-panel" data-testid="candidate-detail">
       <header>
@@ -545,6 +651,15 @@ function DetailPanel({
         <strong>{signal.positionPlan}</strong>
         <span>{signal.nextCheck}</span>
       </div>
+
+      <section className={`case-status ${readiness.tone}`} data-testid="case-readiness">
+        <div>
+          <p>Case readiness</p>
+          <strong>{readiness.label}</strong>
+          <span>{readiness.detail}</span>
+        </div>
+        <span className={`pill ${readiness.tone}`}>{Math.round(signal.dataConfidence ?? 0)}% data</span>
+      </section>
 
       <section className="portfolio-box">
         <div>
@@ -584,6 +699,7 @@ function DetailPanel({
 
       <InfoList title="Why it ranks here" items={signal.evidence} tone="positive" />
       <InfoList title="What could go wrong" items={signal.riskFlags} tone="caution" />
+      <EvidenceLedger signal={signal} />
       <InfoList title="Invalidation triggers" items={signal.invalidation} tone="danger" />
 
       <button
@@ -614,6 +730,33 @@ function InfoList({ title, items, tone }: { title: string; items: string[]; tone
   )
 }
 
+function EvidenceLedger({ signal }: { signal: DecisionSignal }) {
+  const warnings = signal.dataWarnings ?? []
+  const gaps = warnings.filter((warning) => !warning.includes('backed by cached OHLCV'))
+  return (
+    <section className="evidence-ledger">
+      <p>Evidence ledger</p>
+      <div className="evidence-row positive">
+        <strong>Live</strong>
+        <span>
+          {signal.dataSource ?? 'market data'} - {signal.historyBars ?? 0} OHLCV bars, price as of{' '}
+          {formatDate(signal.priceAsOf)}
+        </span>
+      </div>
+      <div className="evidence-row caution">
+        <strong>Proxy</strong>
+        <span>{signal.optionsProxySource ?? 'Volatility proxy from realized price and volume behavior.'}</span>
+      </div>
+      {gaps.map((gap) => (
+        <div className="evidence-row danger" key={gap}>
+          <strong>Gap</strong>
+          <span>{gap}</span>
+        </div>
+      ))}
+    </section>
+  )
+}
+
 function SignalCard({
   signal,
   onOpen,
@@ -621,6 +764,7 @@ function SignalCard({
   signal: DecisionSignal
   onOpen: (signal: DecisionSignal) => void
 }) {
+  const readiness = signalReadiness(signal)
   return (
     <article className={`signal-card ${actionTone(signal.action)}`}>
       <div className="signal-card-top">
@@ -640,6 +784,10 @@ function SignalCard({
           Risk
           <ScoreBar value={signal.riskScore} tone={signal.riskScore >= 68 ? 'danger' : 'caution'} />
         </label>
+      </div>
+      <div className="card-evidence">
+        <span className={readiness.tone}>{readiness.label}</span>
+        <span>{missingEvidenceCount(signal)} gaps</span>
       </div>
       <footer>
         <span>{formatSignedPercent(signal.forecast20d)} 20d</span>
@@ -1148,6 +1296,8 @@ function App() {
             </button>
           </section>
         ) : null}
+
+        <ReadinessGate feed={decisionFeed} rows={universe} status={feedStatus} />
 
         <section className="hero-grid">
           <HeroDecisionCard label="Best buy candidate" signal={topBuy} tone="positive" onOpen={openSignal} />

@@ -2,7 +2,7 @@ export type Action = 'Buy Now' | 'Accumulate' | 'Hold' | 'Trim' | 'Sell' | 'Avoi
 export type Tone = 'positive' | 'neutral' | 'caution' | 'danger'
 export type AssetType = 'Stock' | 'ETF'
 export type ScenarioId = 'base' | 'volJump' | 'creditStress' | 'growthBreak' | 'ratesFall'
-export type SortKey = 'action' | 'opportunity' | 'confidence' | 'risk' | 'regimeFit'
+export type SortKey = 'action' | 'opportunity' | 'confidence' | 'risk' | 'regimeFit' | 'data'
 
 export type MarketContext = {
   regime: string
@@ -702,6 +702,7 @@ export function sortSignals(rows: DecisionSignal[], sortKey: SortKey) {
     if (sortKey === 'opportunity') return right.opportunityScore - left.opportunityScore
     if (sortKey === 'confidence') return right.confidence - left.confidence
     if (sortKey === 'risk') return right.riskScore - left.riskScore
+    if (sortKey === 'data') return (right.dataConfidence ?? 0) - (left.dataConfidence ?? 0)
     return right.regimeFit - left.regimeFit
   })
   return sorted

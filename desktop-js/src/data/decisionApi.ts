@@ -55,6 +55,7 @@ export type DecisionUniverseResponse = {
   dataMode: 'backend' | 'fallback'
   universeSize: number
   returned: number
+  excludedForInsufficientData?: number
   scenario: string
   marketContext: Partial<MarketContext>
   rawSignals: RawSignal[]
@@ -129,6 +130,7 @@ export async function loadDecisionUniverse({
       dataMode: 'backend',
       universeSize: numberOr(payload.universeSize, payload.rawSignals.length),
       returned: numberOr(payload.returned, payload.rawSignals.length),
+      excludedForInsufficientData: numberOr(payload.excludedForInsufficientData, 0),
       scenario: payload.scenario ?? 'base',
       marketContext: payload.marketContext ?? {},
       rawSignals: payload.rawSignals as RawSignal[],
@@ -161,6 +163,7 @@ function fallbackUniverse(
     dataMode: 'fallback',
     universeSize: 0,
     returned: 0,
+    excludedForInsufficientData: 0,
     scenario: 'base',
     marketContext,
     rawSignals: [],
