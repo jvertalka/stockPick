@@ -163,6 +163,20 @@ function viewForAction(action: Action): ViewId {
   return 'sell'
 }
 
+function actionFilterForView(view: ViewId): ActionFilter {
+  if (view === 'buy') return 'Buy'
+  if (view === 'hold') return 'Hold'
+  if (view === 'sell') return 'Risk'
+  return 'All'
+}
+
+function viewForActionFilter(filter: ActionFilter): ViewId {
+  if (filter === 'Buy') return 'buy'
+  if (filter === 'Hold') return 'hold'
+  if (filter === 'Risk') return 'sell'
+  return 'decision'
+}
+
 function portfolioActionFor(signal: DecisionSignal, owned: boolean, watched: boolean) {
   if (owned) {
     if (signal.action === 'Buy Now' || signal.action === 'Accumulate') return 'Hold / add selectively'
@@ -736,7 +750,7 @@ function MarketRadar({
 }) {
   const sectors = sectorScores(rows)
   return (
-    <section className="radar-layout">
+    <section className="radar-layout" data-testid="view-radar">
       <section className="panel">
         <header className="panel-header">
           <div>
@@ -906,7 +920,8 @@ function App() {
   }, [actionFilter, highConvictionOnly, query, sector, sortKey, universe])
 
   const activeMeta = navItems.find((item) => item.id === activeView) ?? navItems[0]
-  const selectedSignal = visibleRows.find((row) => row.ticker === selectedTicker) ?? null
+  const selectedSignal = visibleRows.find((row) => row.ticker === selectedTicker) ?? visibleRows[0] ?? null
+  const selectedDisplayTicker = selectedSignal?.ticker ?? selectedTicker
   const topBuy = universe.find((row) => row.action === 'Buy Now' || row.action === 'Accumulate')
   const topRisk =
     universe
@@ -1023,9 +1038,20 @@ function App() {
     setActiveView(viewForAction(action))
   }
 
+  function activateView(view: ViewId) {
+    setActiveView(view)
+    setActionFilter(actionFilterForView(view))
+  }
+
+  function activateActionFilter(filter: ActionFilter) {
+    setActionFilter(filter)
+    setActiveView(viewForActionFilter(filter))
+  }
+
   function clearFilters() {
     setQuery('')
     setActionFilter('All')
+    setActiveView('decision')
     setSector('All')
     setSortKey('action')
     setHighConvictionOnly(false)
@@ -1044,9 +1070,10 @@ function App() {
             return (
               <button
                 className={activeView === item.id ? 'active' : ''}
+                aria-current={activeView === item.id ? 'page' : undefined}
                 data-testid={`nav-${item.id}`}
                 key={item.id}
-                onClick={() => setActiveView(item.id)}
+                onClick={() => activateView(item.id)}
                 title={item.label}
                 type="button"
               >
@@ -1062,7 +1089,7 @@ function App() {
         <header className="topbar">
           <div>
             <p>{activeMeta.eyebrow}</p>
-            <h1>{activeMeta.heading}</h1>
+            <h1 data-testid="view-heading">{activeMeta.heading}</h1>
             <span className="sync-line">
               {sourceLabel} - Last feed {formatFeedTime(lastRefresh.toISOString())} - {refreshCount} manual refreshes
             </span>
@@ -1173,7 +1200,7 @@ function App() {
         <Controls
           actionFilter={actionFilter}
           highConvictionOnly={highConvictionOnly}
-          onActionFilterChange={setActionFilter}
+          onActionFilterChange={activateActionFilter}
           onClear={clearFilters}
           onHighConvictionChange={setHighConvictionOnly}
           onQueryChange={setQuery}
@@ -1188,10 +1215,10 @@ function App() {
         {visibleRows.length === 0 ? <EmptyState query={query} /> : null}
 
         {activeView === 'decision' && visibleRows.length > 0 ? (
-          <section className="main-grid">
+          <section className="main-grid" data-testid="view-decision">
             <DecisionTable
               rows={visibleRows}
-              selectedTicker={selectedTicker}
+              selectedTicker={selectedDisplayTicker}
               sourceLabel={sourceLabel}
               onOpen={openSignal}
             />
@@ -1209,7 +1236,7 @@ function App() {
         ) : null}
 
         {activeView === 'buy' && visibleRows.length > 0 ? (
-          <section className="main-grid">
+          <section className="main-grid" data-testid="view-buy">
             <BuyBoard rows={visibleRows} onOpen={openSignal} />
             <DetailPanel
               onClose={() => setSelectedTicker(null)}
@@ -1225,7 +1252,7 @@ function App() {
         ) : null}
 
         {activeView === 'hold' && visibleRows.length > 0 ? (
-          <section className="main-grid">
+          <section className="main-grid" data-testid="view-hold">
             <HoldBoard rows={visibleRows} onOpen={openSignal} />
             <DetailPanel
               onClose={() => setSelectedTicker(null)}
@@ -1241,7 +1268,7 @@ function App() {
         ) : null}
 
         {activeView === 'sell' && visibleRows.length > 0 ? (
-          <section className="main-grid">
+          <section className="main-grid" data-testid="view-sell">
             <SellBoard rows={visibleRows} onOpen={openSignal} />
             <DetailPanel
               onClose={() => setSelectedTicker(null)}
@@ -1265,7 +1292,7 @@ function App() {
         ) : null}
 
         {activeView === 'scenario' && visibleRows.length > 0 ? (
-          <section className="main-grid">
+          <section className="main-grid" data-testid="view-scenario">
             <ScenarioLab
               activeScenario={activeScenario}
               onOpen={openSignal}
