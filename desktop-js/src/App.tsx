@@ -148,7 +148,7 @@ function formatDate(value?: string | null) {
 function feedLabel(status: FeedStatus) {
   if (status === 'loading') return 'Loading'
   if (status === 'backend') return 'Backend cache'
-  return 'Local fallback'
+  return 'No live picks'
 }
 
 function actionFilterFor(action: Action): ActionFilter {
@@ -851,11 +851,11 @@ function ScenarioLab({
   )
 }
 
-function EmptyState({ query }: { query: string }) {
+function EmptyState({ query, reason }: { query: string; reason?: string }) {
   return (
     <section className="panel empty-state">
-      <h2>No matches</h2>
-      <p>No visible securities match "{query}".</p>
+      <h2>{query ? 'No matches' : 'No qualified live signals'}</h2>
+      <p>{reason ?? `No visible securities match "${query}".`}</p>
     </section>
   )
 }
@@ -888,11 +888,11 @@ function App() {
   const [dataError, setDataError] = useState<string | null>(null)
   const [ownedTickers, setOwnedTickers] = useState<Set<string>>(() => readOwnedTickers())
   const [watchTickers, setWatchTickers] = useState<Set<string>>(() => readWatchTickers())
-  const [priceSyncMode, setPriceSyncMode] = useState<'auto' | 'force'>('auto')
+  const [priceSyncMode, setPriceSyncMode] = useState<'off' | 'auto' | 'force'>('off')
 
   const ownedKey = useMemo(() => Array.from(ownedTickers).sort().join(','), [ownedTickers])
   const watchKey = useMemo(() => Array.from(watchTickers).sort().join(','), [watchTickers])
-  const universe = useMemo(() => scoreUniverse(signalInputs ?? undefined, activeScenario), [activeScenario, signalInputs])
+  const universe = useMemo(() => scoreUniverse(signalInputs ?? [], activeScenario), [activeScenario, signalInputs])
   const sectors = useMemo(() => ['All', ...Array.from(new Set(universe.map((row) => row.sector))).sort()], [universe])
   const activeMarketContext = useMemo(
     () => ({ ...marketContext, ...(decisionFeed?.marketContext ?? {}) }),
@@ -936,6 +936,12 @@ function App() {
   const averageConfidence =
     universe.length > 0 ? Math.round(universe.reduce((sum, row) => sum + row.confidence, 0) / universe.length) : 0
   const sourceLabel = feedLabel(feedStatus)
+  const noRowsReason =
+    feedStatus === 'fallback'
+      ? 'Live backend data is unavailable, so Buy/Hold/Sell recommendations are paused instead of using placeholder data.'
+      : decisionFeed?.returned === 0
+        ? decisionFeed.detail
+        : undefined
 
   useEffect(() => {
     let cancelled = false
@@ -955,7 +961,7 @@ function App() {
         setFeedStatus(payload.dataMode)
         setDataError(payload.errorMessage ?? null)
         setLastRefresh(new Date(payload.asOf))
-        setPriceSyncMode('auto')
+        setPriceSyncMode('off')
       })
       .catch((error: unknown) => {
         if (cancelled) return
@@ -998,7 +1004,7 @@ function App() {
 
   function refreshData() {
     setFeedStatus('loading')
-    setPriceSyncMode('auto')
+    setPriceSyncMode('off')
     setRefreshCount((count) => count + 1)
   }
 
@@ -1212,7 +1218,7 @@ function App() {
           sortKey={sortKey}
         />
 
-        {visibleRows.length === 0 ? <EmptyState query={query} /> : null}
+        {visibleRows.length === 0 ? <EmptyState query={query} reason={noRowsReason} /> : null}
 
         {activeView === 'decision' && visibleRows.length > 0 ? (
           <section className="main-grid" data-testid="view-decision">

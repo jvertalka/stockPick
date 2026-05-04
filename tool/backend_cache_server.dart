@@ -610,14 +610,15 @@ class DecisionUniverseService {
       if (profile == null) {
         continue;
       }
-      signals.add(
-        _rawSignalFor(
-          profile,
-          analytics: analytics,
-          scenario: scenario,
-          index: index,
-        ),
+      final rawSignal = _rawSignalFor(
+        profile,
+        analytics: analytics,
+        scenario: scenario,
+        index: index,
       );
+      if (rawSignal != null) {
+        signals.add(rawSignal);
+      }
     }
 
     final summaries = signals.map(_summaryForRawSignal).toList();
@@ -662,11 +663,12 @@ class DecisionUniverseService {
     return {
       'asOf': asOf.toIso8601String(),
       'source': 'finance-oracle-backend-cache',
-      'detail': analytics.coverage.usableSymbolCount > 0
-          ? 'Decision signals use cached Yahoo Finance OHLCV for trend, volatility, liquidity, breadth, drawdown, and relative strength. Fundamentals, revisions, and options are still proxy fields until those feeds are connected.'
-          : 'No usable price history is cached yet. Signals are using deterministic priors while the free Yahoo Finance price spine syncs.',
+      'detail': signals.isNotEmpty
+          ? 'Decision signals use cached OHLCV for trend, volatility, liquidity, breadth, drawdown, and relative strength. Fundamentals, estimate revisions, and listed-options feeds are not connected yet, so those fields are held neutral instead of simulated.'
+          : 'Recommendations paused: no symbols have enough fresh cached OHLCV to support Buy/Hold/Sell decisions. Run Sync prices and wait for usable price coverage.',
       'universeSize': fullUniverse.length,
       'returned': signals.length,
+      'excludedForInsufficientData': fullUniverse.length - signals.length,
       'scenario': scenario,
       'marketContext': _marketContextFor(summaries, analytics),
       'rawSignals': signals,
@@ -790,79 +792,40 @@ class DecisionUniverseService {
     }
   }
 
-  Map<String, Object?> _rawSignalFor(
+  Map<String, Object?>? _rawSignalFor(
     DefaultSymbolProfile profile, {
     required DecisionPriceAnalytics analytics,
     required String scenario,
     required int index,
   }) {
     final symbol = profile.symbol;
-    final seed = _stableSeed('$symbol:$scenario');
     final isEtf = profile.isEtf || isCoreEtfSymbol(symbol);
-    final momentum = _bounded(58 + profile.momentumBias + _noise(seed, 1, 20));
-    final quality = _bounded(62 + profile.qualityBias + _noise(seed, 2, 18));
-    final valuation = _bounded(
-      55 + profile.valuationBias + _noise(seed, 3, 20),
-    );
-    final risk = _bounded(48 + profile.riskBias + _noise(seed, 4, 22));
-    final growth = _bounded(50 + profile.growthBias + _noise(seed, 5, 24));
-    final defensive = _bounded(
-      45 + profile.defensiveBias + _noise(seed, 6, 20),
-    );
-    final credit = _bounded(35 + profile.creditBias + _noise(seed, 7, 22));
-    final rates = _bounded(36 + profile.rateBias + _noise(seed, 8, 24));
-    final fallbackBreadth = _bounded(
-      57 + profile.momentumBias / 2 + _noise(seed, 9, 18),
-    );
-    final fallbackRelativeStrength = _bounded(momentum + _noise(seed, 10, 12));
-    final fallbackResidualStrength = _bounded(
-      fallbackRelativeStrength + _noise(seed, 11, 8),
-    );
-    final revisionTrend = _bounded(
-      58 + profile.growthBias / 2 + _noise(seed, 12, 18),
-    );
-    final fallbackRealizedVol = _bounded(
-      risk + (isEtf ? -10 : 0) + _noise(seed, 13, 10),
-    );
-    final fallbackImpliedVol = _bounded(
-      fallbackRealizedVol + _noise(seed, 14, 12),
-    );
-    final fallbackSkewRisk = _bounded(risk + _noise(seed, 15, 14));
-    final fallbackDrawdownRisk = _bounded(
-      risk + (100 - fallbackBreadth) * 0.2 + _noise(seed, 16, 10),
-    );
-    final fallbackTrend60 = _bounded(momentum + _noise(seed, 17, 8));
     final metrics = analytics.metricsBySymbol[symbol];
+    if (metrics == null ||
+        metrics.barCount < 120 ||
+        DateTime.now().toUtc().difference(metrics.priceAsOf).inDays > 10) {
+      return null;
+    }
     final marketMetrics = analytics.marketMetrics;
     final sectorBenchmark = analytics.benchmarkFor(profile.sector);
     final sectorBreadth = analytics.sectorBreadthBySector[profile.sector];
 
-    final relativeStrength =
-        metrics?.relativeStrengthScore(marketMetrics) ??
-        fallbackRelativeStrength;
-    final residualStrength =
-        metrics?.relativeStrengthScore(sectorBenchmark) ??
-        fallbackResidualStrength;
-    final realizedVol = metrics?.realizedVolScore ?? fallbackRealizedVol;
-    final impliedVol = metrics == null
-        ? fallbackImpliedVol
-        : _bounded(
-            metrics.realizedVolScore * 0.7 +
-                metrics.volatilityExpansionScore * 0.3,
-          );
-    final skewRisk = metrics == null
-        ? fallbackSkewRisk
-        : _bounded(
-            metrics.drawdownRiskScore * 0.45 +
-                metrics.downsideVolumePressure * 0.35 +
-                metrics.volatilityExpansionScore * 0.2,
-          );
-    final drawdownRisk = metrics?.drawdownRiskScore ?? fallbackDrawdownRisk;
-    final dataWarnings =
-        metrics?.warnings ??
-        const <String>[
-          'No synced OHLCV history yet; using priors for price-derived fields.',
-        ];
+    final relativeStrength = metrics.relativeStrengthScore(marketMetrics);
+    final residualStrength = metrics.relativeStrengthScore(sectorBenchmark);
+    final impliedVol = _bounded(
+      metrics.realizedVolScore * 0.7 + metrics.volatilityExpansionScore * 0.3,
+    );
+    final skewRisk = _bounded(
+      metrics.drawdownRiskScore * 0.45 +
+          metrics.downsideVolumePressure * 0.35 +
+          metrics.volatilityExpansionScore * 0.2,
+    );
+    final dataWarnings = <String>{
+      ...metrics.warnings,
+      'Fundamental and estimate-revision fields are neutral because real feeds are not connected yet.',
+      'Listed-options skew and term structure are not connected; options fields use OHLCV-derived proxies only.',
+    }.toList();
+    const neutral = 50.0;
 
     return {
       'ticker': symbol,
@@ -871,61 +834,52 @@ class DecisionUniverseService {
       'sector': profile.sector,
       'industry': profile.industry,
       'style': _styleFor(profile, isEtf: isEtf),
-      'trend20':
-          metrics?.trend20Score ?? _bounded(momentum + _noise(seed, 18, 12)),
-      'trend60': metrics?.trend60Score ?? fallbackTrend60,
-      'trend120':
-          metrics?.trend120Score ??
-          _bounded(fallbackTrend60 + _noise(seed, 19, 10)),
+      'trend20': metrics.trend20Score,
+      'trend60': metrics.trend60Score,
+      'trend120': metrics.trend120Score,
       'relativeStrength': relativeStrength,
       'residualStrength': residualStrength,
-      'revisionTrend': revisionTrend,
-      'surpriseMomentum': _bounded(revisionTrend + _noise(seed, 20, 12)),
-      'marginTrend': _bounded(quality + _noise(seed, 21, 10)),
-      'revenueAcceleration': _bounded(growth + _noise(seed, 22, 10)),
-      'freeCashFlowTrend': _bounded(quality + _noise(seed, 23, 12)),
-      'quality': quality,
-      'valuationSupport': valuation,
-      'liquidity':
-          metrics?.liquidityScore ??
-          _bounded(
-            isEtf ? 90 + _noise(seed, 24, 8) : 76 + _noise(seed, 24, 18),
-          ),
-      'breadth': sectorBreadth ?? fallbackBreadth,
+      'revisionTrend': neutral,
+      'surpriseMomentum': neutral,
+      'marginTrend': neutral,
+      'revenueAcceleration': neutral,
+      'freeCashFlowTrend': neutral,
+      'quality': neutral,
+      'valuationSupport': neutral,
+      'liquidity': metrics.liquidityScore,
+      'breadth': sectorBreadth ?? metrics.breadthScore,
       'impliedVolRank': impliedVol,
-      'realizedVol': realizedVol,
+      'realizedVol': metrics.realizedVolScore,
       'skewRisk': skewRisk,
-      'eventRisk': _bounded((isEtf ? 18 : 42) + _noise(seed, 25, 20)),
-      'crowding': metrics == null
-          ? _bounded(momentum * 0.5 + growth * 0.3 + _noise(seed, 26, 16))
-          : _bounded(
-              metrics.trend60Score * 0.35 +
-                  relativeStrength * 0.35 +
-                  metrics.volumeTrendScore * 0.2 +
-                  metrics.breakoutQualityScore * 0.1,
-            ),
-      'drawdownRisk': drawdownRisk,
-      'creditSensitivity': credit,
-      'rateSensitivity': rates,
-      'growthSensitivity': growth,
-      'defensiveScore': defensive,
+      'eventRisk': isEtf ? 25.0 : neutral,
+      'crowding': _bounded(
+        metrics.trend60Score * 0.35 +
+            relativeStrength * 0.35 +
+            metrics.volumeTrendScore * 0.2 +
+            metrics.breakoutQualityScore * 0.1,
+      ),
+      'drawdownRisk': metrics.drawdownRiskScore,
+      'creditSensitivity': neutral,
+      'rateSensitivity': neutral,
+      'growthSensitivity': neutral,
+      'defensiveScore': neutral,
       'universeRankSeed': index,
-      'dataConfidence': metrics?.dataConfidence ?? 18,
-      'dataSource': metrics == null ? 'priors' : 'yahoo-finance',
+      'dataConfidence': math.min(metrics.dataConfidence, 78),
+      'dataSource': '${metrics.source}-ohlcv',
       'dataWarnings': dataWarnings,
-      'priceAsOf': metrics?.priceAsOf.toIso8601String(),
-      'historyBars': metrics?.barCount ?? 0,
-      'lastPrice': metrics?.lastPrice,
-      'priceChange20d': metrics?.return20d,
-      'priceChange60d': metrics?.return60d,
-      'priceChange120d': metrics?.return120d,
-      'realizedVolatilityPct': metrics?.annualVolatilityPct,
-      'maxDrawdown60d': metrics?.maxDrawdown60d,
-      'volumeTrend': metrics?.volumeTrendRatio,
-      'downsideVolumePressure': metrics?.downsideVolumePressure,
-      'volatilityExpansion': metrics?.volatilityExpansionScore,
+      'priceAsOf': metrics.priceAsOf.toIso8601String(),
+      'historyBars': metrics.barCount,
+      'lastPrice': metrics.lastPrice,
+      'priceChange20d': metrics.return20d,
+      'priceChange60d': metrics.return60d,
+      'priceChange120d': metrics.return120d,
+      'realizedVolatilityPct': metrics.annualVolatilityPct,
+      'maxDrawdown60d': metrics.maxDrawdown60d,
+      'volumeTrend': metrics.volumeTrendRatio,
+      'downsideVolumePressure': metrics.downsideVolumePressure,
+      'volatilityExpansion': metrics.volatilityExpansionScore,
       'optionsProxySource':
-          'Free layer proxy: realized volatility, downside volume pressure, and volatility expansion from Yahoo Finance OHLCV. Listed-options skew/term-structure feed is not connected yet.',
+          'Free layer proxy: realized volatility, downside volume pressure, and volatility expansion from cached OHLCV. Listed-options skew/term-structure feed is not connected yet.',
     };
   }
 
@@ -1052,23 +1006,6 @@ class DecisionUniverseService {
   }
 
   double _bounded(num value) => value.clamp(0, 100).toDouble();
-
-  double _noise(int seed, int salt, double spread) {
-    final mixed = _stableSeed('$seed:$salt');
-    final unit = (mixed % 10000) / 10000.0;
-    return (unit * 2 - 1) * spread;
-  }
-
-  int _stableSeed(String input) {
-    const offset = 0x811c9dc5;
-    const prime = 0x01000193;
-    var hash = offset;
-    for (final unit in input.codeUnits) {
-      hash ^= unit;
-      hash = (hash * prime) & 0x7fffffff;
-    }
-    return hash;
-  }
 }
 
 class DecisionPriceHistoryStore {
@@ -1551,6 +1488,7 @@ class DecisionPriceCoverage {
 class DecisionPriceMetrics {
   const DecisionPriceMetrics({
     required this.symbol,
+    required this.source,
     required this.priceAsOf,
     required this.barCount,
     required this.lastPrice,
@@ -1576,6 +1514,7 @@ class DecisionPriceMetrics {
   });
 
   final String symbol;
+  final String source;
   final DateTime priceAsOf;
   final int barCount;
   final double lastPrice;
@@ -1604,7 +1543,7 @@ class DecisionPriceMetrics {
     if (bars.length < 5) {
       throw const FormatException('Not enough bars for metrics.');
     }
-    return DecisionPriceMetrics._fromBars(series.symbol, bars);
+    return DecisionPriceMetrics._fromBars(series.symbol, series.source, bars);
   }
 
   static DecisionPriceMetrics? fromSeriesOrNull(DecisionPriceSeries series) {
@@ -1617,6 +1556,7 @@ class DecisionPriceMetrics {
 
   factory DecisionPriceMetrics._fromBars(
     String symbol,
+    String source,
     List<DecisionPriceBar> bars,
   ) {
     final latest = bars.last;
@@ -1663,6 +1603,7 @@ class DecisionPriceMetrics {
     }
     return DecisionPriceMetrics(
       symbol: symbol,
+      source: source,
       priceAsOf: latest.date,
       barCount: bars.length,
       lastPrice: latest.close,

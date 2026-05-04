@@ -49,6 +49,46 @@ void main() {
       await webRoot.delete(recursive: true);
     }
   });
+
+  test('decision universe pauses recommendations without live price history', () async {
+    final port = await _freePort();
+    final cacheDir = await Directory.systemTemp.createTemp(
+      'finance-cache-test-empty-cache-',
+    );
+    final webRoot = await Directory.systemTemp.createTemp(
+      'finance-cache-test-empty-web-',
+    );
+    await File(
+      '${webRoot.path}${Platform.pathSeparator}index.html',
+    ).writeAsString('<html><body>Finance Oracle</body></html>');
+
+    final server = BackendCacheServer(
+      BackendCacheConfig(
+        host: '127.0.0.1',
+        port: port,
+        cacheDirectory: cacheDir,
+        webRoot: webRoot,
+      ),
+    );
+    final serverFuture = server.start();
+
+    try {
+      await _waitForServer(port);
+      final universe = await _getJson(
+        'http://127.0.0.1:$port/decision/universe?sync=off',
+      );
+
+      expect(universe['returned'], 0);
+      expect(universe['rawSignals'], isEmpty);
+      expect(universe['detail'], contains('Recommendations paused'));
+      expect(universe['excludedForInsufficientData'], universe['universeSize']);
+    } finally {
+      await server.stop();
+      await serverFuture.timeout(const Duration(seconds: 2));
+      await cacheDir.delete(recursive: true);
+      await webRoot.delete(recursive: true);
+    }
+  });
 }
 
 Future<int> _freePort() async {

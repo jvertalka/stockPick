@@ -1,6 +1,5 @@
 import {
   marketContext,
-  rawSignals,
   type Action,
   type MarketContext,
   type RawSignal,
@@ -85,7 +84,7 @@ const defaultBackendUrl = 'http://127.0.0.1:8787'
 export async function loadDecisionUniverse({
   ownedTickers = [],
   watchTickers = [],
-  syncMode = 'auto',
+  syncMode = 'off',
   syncLimit = syncMode === 'force' ? 96 : 24,
   timeoutMs = syncMode === 'force' ? 20000 : 9000,
 }: LoadUniverseOptions = {}): Promise<DecisionUniverseResponse> {
@@ -119,8 +118,8 @@ export async function loadDecisionUniverse({
     }
 
     const payload = (await response.json()) as Partial<DecisionUniverseResponse>
-    if (!Array.isArray(payload.rawSignals) || payload.rawSignals.length === 0) {
-      throw new Error('Decision endpoint returned no raw signals')
+    if (!Array.isArray(payload.rawSignals)) {
+      throw new Error('Decision endpoint returned no raw signal array')
     }
 
     return {
@@ -158,13 +157,13 @@ function fallbackUniverse(
   return {
     asOf: now,
     source: 'local-fallback',
-    detail: 'Using the bundled local signal universe until the backend cache is reachable.',
+    detail: 'Recommendations are paused because the backend live-data cache is unreachable.',
     dataMode: 'fallback',
-    universeSize: rawSignals.length,
-    returned: rawSignals.length,
+    universeSize: 0,
+    returned: 0,
     scenario: 'base',
     marketContext,
-    rawSignals,
+    rawSignals: [],
     history: [],
     actionCounts: {},
     priceCoverage: emptyCoverage(),
