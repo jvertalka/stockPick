@@ -107,13 +107,22 @@ const sortOptions: Array<{ value: SortKey; label: string }> = [
 ]
 const actionOrder: Action[] = ['Buy Now', 'Accumulate', 'Hold', 'Trim', 'Sell', 'Avoid']
 const ownedStorageKey = 'finance-oracle-owned-tickers'
+const watchStorageKey = 'finance-oracle-watch-tickers'
 const maxTableRows = 260
 const maxBoardCards = 96
 const maxRiskRows = 140
 
 function readOwnedTickers() {
+  return readStoredTickers(ownedStorageKey)
+}
+
+function readWatchTickers() {
+  return readStoredTickers(watchStorageKey)
+}
+
+function readStoredTickers(storageKey: string) {
   try {
-    const stored = window.localStorage.getItem(ownedStorageKey)
+    const stored = window.localStorage.getItem(storageKey)
     const decoded = stored ? (JSON.parse(stored) as unknown) : []
     if (!Array.isArray(decoded)) return new Set<string>()
     return new Set(decoded.map((ticker) => String(ticker).trim().toUpperCase()).filter(Boolean))
@@ -127,6 +136,13 @@ function formatFeedTime(value: string | null) {
   const parsed = new Date(value)
   if (Number.isNaN(parsed.getTime())) return 'pending'
   return parsed.toLocaleTimeString()
+}
+
+function formatDate(value?: string | null) {
+  if (!value) return 'not synced'
+  const parsed = new Date(value)
+  if (Number.isNaN(parsed.getTime())) return 'not synced'
+  return parsed.toLocaleDateString()
 }
 
 function feedLabel(status: FeedStatus) {
@@ -147,7 +163,7 @@ function viewForAction(action: Action): ViewId {
   return 'sell'
 }
 
-function portfolioActionFor(signal: DecisionSignal, owned: boolean) {
+function portfolioActionFor(signal: DecisionSignal, owned: boolean, watched: boolean) {
   if (owned) {
     if (signal.action === 'Buy Now' || signal.action === 'Accumulate') return 'Hold / add selectively'
     if (signal.action === 'Hold') return 'Hold'
@@ -155,6 +171,8 @@ function portfolioActionFor(signal: DecisionSignal, owned: boolean) {
     if (signal.action === 'Sell') return 'Exit candidate'
     return 'Reduce or avoid fresh exposure'
   }
+  if (watched && (signal.action === 'Buy Now' || signal.action === 'Accumulate')) return 'Watchlist buy setup'
+  if (watched && (signal.action === 'Trim' || signal.action === 'Sell' || signal.action === 'Avoid')) return 'Watchlist risk flag'
   if (signal.action === 'Buy Now') return 'Buy candidate'
   if (signal.action === 'Accumulate') return 'Accumulate on pullbacks'
   if (signal.action === 'Hold') return 'Watch only'
@@ -470,16 +488,20 @@ function DetailPanel({
   signal,
   reviewed,
   owned,
+  watched,
   onClose,
   onReview,
   onToggleOwned,
+  onToggleWatch,
 }: {
   signal: DecisionSignal | null
   reviewed: boolean
   owned: boolean
+  watched: boolean
   onClose: () => void
   onReview: (ticker: string) => void
   onToggleOwned: (ticker: string) => void
+  onToggleWatch: (ticker: string) => void
 }) {
   if (!signal) {
     return (
@@ -512,21 +534,38 @@ function DetailPanel({
 
       <section className="portfolio-box">
         <div>
-          <p>{owned ? 'Portfolio action' : 'Entry action'}</p>
-          <strong>{portfolioActionFor(signal, owned)}</strong>
-          <span>{owned ? 'Tracked position' : 'Not tracked as owned'}</span>
+          <p>{owned ? 'Portfolio action' : watched ? 'Watchlist action' : 'Entry action'}</p>
+          <strong>{portfolioActionFor(signal, owned, watched)}</strong>
+          <span>{owned ? 'Tracked position' : watched ? 'Watchlist name' : 'Not tracked'}</span>
         </div>
-        <button onClick={() => onToggleOwned(signal.ticker)} type="button">
-          <CheckCircle2 size={16} />
-          {owned ? 'Untrack' : 'Track'}
-        </button>
+        <div className="portfolio-actions">
+          <button onClick={() => onToggleOwned(signal.ticker)} type="button">
+            <CheckCircle2 size={16} />
+            {owned ? 'Untrack' : 'Owned'}
+          </button>
+          <button onClick={() => onToggleWatch(signal.ticker)} type="button">
+            <Bell size={16} />
+            {watched ? 'Unwatch' : 'Watch'}
+          </button>
+        </div>
       </section>
 
       <div className="detail-metrics">
         <Metric label="Opportunity" value={`${signal.opportunityScore}`} tone="positive" />
         <Metric label="Confidence" value={`${signal.confidence}`} />
         <Metric label="Risk" value={`${signal.riskScore}`} tone={signal.riskScore >= 68 ? 'danger' : 'caution'} />
+        <Metric
+          label="Data confidence"
+          value={`${Math.round(signal.dataConfidence ?? 65)}%`}
+          detail={signal.dataSource ?? 'local'}
+          tone={(signal.dataConfidence ?? 65) < 45 ? 'danger' : 'neutral'}
+        />
         <Metric label="Drawdown odds" value={`${signal.probabilityDrawdown}%`} tone="caution" />
+        <Metric
+          label="Price as of"
+          value={formatDate(signal.priceAsOf)}
+          detail={signal.historyBars ? `${signal.historyBars} bars` : 'no OHLCV yet'}
+        />
       </div>
 
       <InfoList title="Why it ranks here" items={signal.evidence} tone="positive" />
@@ -834,8 +873,11 @@ function App() {
   const [feedStatus, setFeedStatus] = useState<FeedStatus>('loading')
   const [dataError, setDataError] = useState<string | null>(null)
   const [ownedTickers, setOwnedTickers] = useState<Set<string>>(() => readOwnedTickers())
+  const [watchTickers, setWatchTickers] = useState<Set<string>>(() => readWatchTickers())
+  const [priceSyncMode, setPriceSyncMode] = useState<'auto' | 'force'>('auto')
 
   const ownedKey = useMemo(() => Array.from(ownedTickers).sort().join(','), [ownedTickers])
+  const watchKey = useMemo(() => Array.from(watchTickers).sort().join(','), [watchTickers])
   const universe = useMemo(() => scoreUniverse(signalInputs ?? undefined, activeScenario), [activeScenario, signalInputs])
   const sectors = useMemo(() => ['All', ...Array.from(new Set(universe.map((row) => row.sector))).sort()], [universe])
   const activeMarketContext = useMemo(
@@ -872,6 +914,7 @@ function App() {
       .sort(byRiskPriority)[0] ?? undefined
   const reviewed = selectedSignal ? reviewedTickers.has(selectedSignal.ticker) : false
   const selectedOwned = selectedSignal ? ownedTickers.has(selectedSignal.ticker) : false
+  const selectedWatched = selectedSignal ? watchTickers.has(selectedSignal.ticker) : false
   const buyCount = universe.filter((row) => row.action === 'Buy Now' || row.action === 'Accumulate').length
   const holdCount = universe.filter((row) => row.action === 'Hold').length
   const riskCount = universe.filter((row) => row.action === 'Sell' || row.action === 'Trim' || row.action === 'Avoid').length
@@ -882,8 +925,14 @@ function App() {
   useEffect(() => {
     let cancelled = false
     const owned = ownedKey.length > 0 ? ownedKey.split(',') : []
+    const watched = watchKey.length > 0 ? watchKey.split(',') : []
 
-    loadDecisionUniverse({ ownedTickers: owned })
+    loadDecisionUniverse({
+      ownedTickers: owned,
+      watchTickers: watched,
+      syncMode: priceSyncMode,
+      syncLimit: priceSyncMode === 'force' ? 96 : 24,
+    })
       .then((payload) => {
         if (cancelled) return
         setDecisionFeed(payload)
@@ -891,6 +940,7 @@ function App() {
         setFeedStatus(payload.dataMode)
         setDataError(payload.errorMessage ?? null)
         setLastRefresh(new Date(payload.asOf))
+        setPriceSyncMode('auto')
       })
       .catch((error: unknown) => {
         if (cancelled) return
@@ -901,7 +951,7 @@ function App() {
     return () => {
       cancelled = true
     }
-  }, [ownedKey, refreshCount])
+  }, [ownedKey, priceSyncMode, refreshCount, watchKey])
 
   useEffect(() => {
     try {
@@ -910,6 +960,14 @@ function App() {
       // Local storage can be unavailable in hardened webviews.
     }
   }, [ownedTickers])
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(watchStorageKey, JSON.stringify(Array.from(watchTickers).sort()))
+    } catch {
+      // Local storage can be unavailable in hardened webviews.
+    }
+  }, [watchTickers])
 
   function openSignal(signal: DecisionSignal) {
     setSelectedTicker(signal.ticker)
@@ -925,12 +983,31 @@ function App() {
 
   function refreshData() {
     setFeedStatus('loading')
+    setPriceSyncMode('auto')
+    setRefreshCount((count) => count + 1)
+  }
+
+  function syncPrices() {
+    setFeedStatus('loading')
+    setPriceSyncMode('force')
     setRefreshCount((count) => count + 1)
   }
 
   function toggleOwned(ticker: string) {
     setFeedStatus('loading')
     setOwnedTickers((current) => {
+      const next = new Set(current)
+      if (next.has(ticker)) {
+        next.delete(ticker)
+      } else {
+        next.add(ticker)
+      }
+      return next
+    })
+  }
+
+  function toggleWatch(ticker: string) {
+    setWatchTickers((current) => {
       const next = new Set(current)
       if (next.has(ticker)) {
         next.delete(ticker)
@@ -1002,6 +1079,16 @@ function App() {
               Refresh
             </button>
             <button
+              aria-label="Sync prices"
+              disabled={feedStatus === 'loading'}
+              onClick={syncPrices}
+              title="Sync prices"
+              type="button"
+            >
+              <RefreshCcw size={17} />
+              Sync prices
+            </button>
+            <button
               aria-expanded={alertsOpen}
               aria-label="Toggle alerts"
               className={alertsOpen ? 'active' : ''}
@@ -1051,9 +1138,34 @@ function App() {
               <span>{riskCount} risk</span>
               <span>{averageConfidence}% confidence</span>
               <span>{ownedTickers.size} owned</span>
+              <span>{watchTickers.size} watched</span>
             </div>
             <p className="hero-reason">{dataError ?? decisionFeed?.detail ?? 'Loading backend decision universe.'}</p>
           </section>
+        </section>
+
+        <section className="data-strip">
+          <Metric
+            label="Price coverage"
+            value={`${decisionFeed?.priceCoverage.usableSymbolCount ?? 0}/${decisionFeed?.returned ?? universe.length}`}
+            detail={`${decisionFeed?.priceCoverage.cachedSymbolCount ?? 0} cached, ${decisionFeed?.priceCoverage.staleSymbolCount ?? 0} stale`}
+          />
+          <Metric
+            label="Latest bar"
+            value={formatDate(decisionFeed?.priceCoverage.latestPriceDate)}
+            detail={`${decisionFeed?.priceCoverage.totalBarCount ?? 0} cached bars`}
+          />
+          <Metric
+            label="Last sync"
+            value={formatFeedTime(decisionFeed?.sync.lastSyncAt ?? null)}
+            detail={`${decisionFeed?.sync.updated ?? 0} updated, ${decisionFeed?.sync.failed ?? 0} failed`}
+          />
+          <Metric
+            label="Options layer"
+            value="Proxy"
+            detail="Realized vol and downside-volume proxy until options feed is connected"
+            tone="caution"
+          />
         </section>
 
         <ActionSummaryStrip rows={universe} activeFilter={actionFilter} onActionFocus={focusAction} />
@@ -1087,9 +1199,11 @@ function App() {
               onClose={() => setSelectedTicker(null)}
               onReview={markReviewed}
               onToggleOwned={toggleOwned}
+              onToggleWatch={toggleWatch}
               owned={selectedOwned}
               reviewed={reviewed}
               signal={selectedSignal}
+              watched={selectedWatched}
             />
           </section>
         ) : null}
@@ -1101,9 +1215,11 @@ function App() {
               onClose={() => setSelectedTicker(null)}
               onReview={markReviewed}
               onToggleOwned={toggleOwned}
+              onToggleWatch={toggleWatch}
               owned={selectedOwned}
               reviewed={reviewed}
               signal={selectedSignal}
+              watched={selectedWatched}
             />
           </section>
         ) : null}
@@ -1115,9 +1231,11 @@ function App() {
               onClose={() => setSelectedTicker(null)}
               onReview={markReviewed}
               onToggleOwned={toggleOwned}
+              onToggleWatch={toggleWatch}
               owned={selectedOwned}
               reviewed={reviewed}
               signal={selectedSignal}
+              watched={selectedWatched}
             />
           </section>
         ) : null}
@@ -1129,9 +1247,11 @@ function App() {
               onClose={() => setSelectedTicker(null)}
               onReview={markReviewed}
               onToggleOwned={toggleOwned}
+              onToggleWatch={toggleWatch}
               owned={selectedOwned}
               reviewed={reviewed}
               signal={selectedSignal}
+              watched={selectedWatched}
             />
           </section>
         ) : null}
@@ -1157,9 +1277,11 @@ function App() {
               onClose={() => setSelectedTicker(null)}
               onReview={markReviewed}
               onToggleOwned={toggleOwned}
+              onToggleWatch={toggleWatch}
               owned={selectedOwned}
               reviewed={reviewed}
               signal={selectedSignal}
+              watched={selectedWatched}
             />
           </section>
         ) : null}

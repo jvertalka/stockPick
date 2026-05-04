@@ -48,6 +48,21 @@ export type RawSignal = {
   rateSensitivity: number
   growthSensitivity: number
   defensiveScore: number
+  dataConfidence?: number
+  dataSource?: string
+  dataWarnings?: string[]
+  priceAsOf?: string | null
+  historyBars?: number
+  lastPrice?: number
+  priceChange20d?: number
+  priceChange60d?: number
+  priceChange120d?: number
+  realizedVolatilityPct?: number
+  maxDrawdown60d?: number
+  volumeTrend?: number
+  downsideVolumePressure?: number
+  volatilityExpansion?: number
+  optionsProxySource?: string
 }
 
 export type DecisionSignal = RawSignal & {
@@ -761,7 +776,7 @@ function scoreSignal(signal: RawSignal): DecisionSignal {
       signal.eventRisk * 0.12 +
       (100 - signal.breadth) * 0.12,
   )
-  const riskScore = clamp(
+  const baseRiskScore = clamp(
     fragilityScore * 0.45 +
       signal.realizedVol * 0.15 +
       signal.creditSensitivity * 0.12 +
@@ -769,7 +784,7 @@ function scoreSignal(signal: RawSignal): DecisionSignal {
       signal.eventRisk * 0.1 +
       (100 - signal.liquidity) * 0.1,
   )
-  const opportunityScore = clamp(
+  const baseOpportunityScore = clamp(
     trendQuality * 0.19 +
       signal.relativeStrength * 0.14 +
       signal.residualStrength * 0.14 +
@@ -778,16 +793,8 @@ function scoreSignal(signal: RawSignal): DecisionSignal {
       signal.valuationSupport * 0.08 +
       regimeFit * 0.12 +
       signal.breadth * 0.08 -
-      riskScore * 0.05 -
+      baseRiskScore * 0.05 -
       fragilityScore * 0.04,
-  )
-  const asymmetryScore = clamp(opportunityScore * 0.72 + signal.valuationSupport * 0.16 - riskScore * 0.2 + 20)
-  const thesisDamage = clamp(
-    (100 - signal.relativeStrength) * 0.24 +
-      (100 - signal.residualStrength) * 0.18 +
-      (100 - signal.revisionTrend) * 0.16 +
-      riskScore * 0.22 +
-      fragilityScore * 0.2,
   )
   const agreement = [
     trendQuality,
@@ -796,13 +803,26 @@ function scoreSignal(signal: RawSignal): DecisionSignal {
     fundamentalDirection,
     signal.quality,
     signal.breadth,
-    100 - riskScore,
+    100 - baseRiskScore,
   ]
   const average = agreement.reduce((sum, value) => sum + value, 0) / agreement.length
   const dispersion =
     agreement.reduce((sum, value) => sum + Math.abs(value - average), 0) / agreement.length
-  const confidence = clamp(average * 0.72 + signal.liquidity * 0.12 + (100 - dispersion) * 0.16)
-  const signalStability = clamp(100 - dispersion * 1.15 - signal.eventRisk * 0.14)
+  const baseConfidence = clamp(average * 0.72 + signal.liquidity * 0.12 + (100 - dispersion) * 0.16)
+  const dataConfidence = signal.dataConfidence ?? 65
+  const lowDataPenalty = Math.max(0, 55 - dataConfidence)
+  const riskScore = clamp(baseRiskScore + lowDataPenalty * 0.12)
+  const opportunityScore = clamp(baseOpportunityScore - lowDataPenalty * 0.18)
+  const confidence = clamp(baseConfidence * 0.78 + dataConfidence * 0.22)
+  const asymmetryScore = clamp(opportunityScore * 0.72 + signal.valuationSupport * 0.16 - riskScore * 0.2 + 20)
+  const thesisDamage = clamp(
+    (100 - signal.relativeStrength) * 0.24 +
+      (100 - signal.residualStrength) * 0.18 +
+      (100 - signal.revisionTrend) * 0.16 +
+      riskScore * 0.22 +
+      fragilityScore * 0.2,
+  )
+  const signalStability = clamp(100 - dispersion * 1.15 - signal.eventRisk * 0.14 - lowDataPenalty * 0.16)
   const forecast20d = clamp((opportunityScore - riskScore) / 8 + (regimeFit - 50) / 18, -12, 12)
   const probabilityOutperform = clamp(50 + (opportunityScore - 60) * 0.55 + (regimeFit - 60) * 0.22 - riskScore * 0.08)
   const probabilityDrawdown = clamp(18 + riskScore * 0.52 + fragilityScore * 0.24 - opportunityScore * 0.18)
@@ -886,7 +906,10 @@ function positionPlan(action: Action, opportunity: number, risk: number, crowdin
 }
 
 function evidenceFor(signal: RawSignal, opportunity: number, regimeFit: number, confidence: number) {
-  const reasons = []
+  const reasons: string[] = []
+  if ((signal.dataConfidence ?? 0) >= 75 && signal.dataSource && signal.dataSource !== 'priors') {
+    reasons.push('Price-derived signals are backed by synced daily OHLCV.')
+  }
   if (opportunity >= 78) reasons.push('Opportunity score clears the buy threshold.')
   if (signal.relativeStrength >= 75) reasons.push('Relative strength is leading peers and the market.')
   if (signal.residualStrength >= 72) reasons.push('Residual strength remains positive after sector and market effects.')
@@ -899,7 +922,8 @@ function evidenceFor(signal: RawSignal, opportunity: number, regimeFit: number, 
 }
 
 function riskFlagsFor(signal: RawSignal, risk: number, fragility: number, thesisDamage: number) {
-  const flags = []
+  const flags: string[] = []
+  if ((signal.dataConfidence ?? 65) < 45) flags.push('Price-history confidence is low.')
   if (risk >= 65) flags.push('Composite risk is elevated.')
   if (fragility >= 65) flags.push('Fragility cluster is rising.')
   if (signal.impliedVolRank >= 65) flags.push('Options-implied volatility is elevated.')
@@ -907,11 +931,14 @@ function riskFlagsFor(signal: RawSignal, risk: number, fragility: number, thesis
   if (signal.crowding >= 68) flags.push('Crowding raises failed-breakout risk.')
   if (signal.breadth <= 45) flags.push('Peer breadth is weak.')
   if (thesisDamage >= 65) flags.push('Thesis damage is high enough for sell discipline.')
+  signal.dataWarnings?.forEach((warning) => {
+    if (!flags.includes(warning)) flags.push(warning)
+  })
   return flags.length > 0 ? flags.slice(0, 4) : ['No major deterioration cluster yet.']
 }
 
 function invalidationFor(signal: RawSignal) {
-  const invalidation = []
+  const invalidation: string[] = []
   if (signal.relativeStrength >= 70) {
     invalidation.push('Relative strength falls below peer group for 10 trading days.')
   } else {

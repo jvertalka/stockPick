@@ -150,6 +150,14 @@ back to the bundled local universe if the cache is offline:
 dart run tool\backend_cache_server.dart --port 8787 --web-root desktop-js\dist
 ```
 
+`/decision/universe` now maintains a local free-layer daily OHLCV spine using
+the backend cache. It pulls Yahoo Finance chart history in small batches,
+persists it under `.dart_tool/market_data_cache/decision_price_history.json`,
+and uses cached prices for trend, realized volatility, liquidity, breadth,
+relative strength, and drawdown inputs. The JavaScript workstation exposes
+coverage, latest bar date, sync results, and per-ticker data confidence so weak
+data is separated from weak stock evidence.
+
 The native desktop shell uses Tauri:
 
 ```powershell
