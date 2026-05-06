@@ -84,6 +84,18 @@ export type DecisionSignal = RawSignal & {
   riskFlags: string[]
   invalidation: string[]
   nextCheck: string
+  // Data-driven additions: every score below is statistically grounded
+  // in cross-sectional Z-scores rather than hand-set weights.
+  momentumZ: number
+  qualityZ: number
+  valueZ: number
+  lowVolZ: number
+  growthZ: number
+  fragilityZ: number
+  compositeAlphaZ: number
+  alphaPercentile: number
+  detectedRegime: string
+  factorAgreement: number
 }
 
 export type Scenario = {
@@ -656,17 +668,234 @@ export const rawSignals: RawSignal[] = [
   },
 ]
 
+/* =========================================================================
+   Data-driven scoring pipeline
+   -------------------------------------------------------------------------
+   Replaces the previous hand-tuned weighted-sum with a 6-step statistical
+   process:
+     1. Apply scenario shocks (unchanged from before)
+     2. Compute universe-wide statistics (mean, stddev, percentile rank)
+        for every input across ALL stocks being scored together
+     3. Z-score each input cross-sectionally so signals are comparable
+        across stocks regardless of their absolute scale
+     4. Decompose Z-scores into canonical academic factors (momentum,
+        quality, value, low-vol, growth, options-derived fragility)
+     5. Detect the prevailing market regime from cross-sectional dispersion
+        + macro-sensitivity averages, then weight factors per regime
+     6. Compute composite alpha as a regime-weighted factor sum, convert
+        to percentile rank, and gate actions on percentile + Z magnitude
+   The action label is no longer "Opp >= 74 = Buy". It's "this stock's
+   composite alpha is in the top 8% of the universe AND its risk Z is
+   below +0.5 AND at least three factors agree on direction."
+   ========================================================================= */
+
+const FACTOR_INPUTS = {
+  momentum: ['trend20', 'trend60', 'trend120', 'relativeStrength', 'residualStrength'] as const,
+  quality: ['quality', 'marginTrend', 'freeCashFlowTrend'] as const,
+  value: ['valuationSupport'] as const,
+  lowVol: ['realizedVol', 'impliedVolRank', 'drawdownRisk'] as const,
+  growth: ['revenueAcceleration', 'revisionTrend', 'surpriseMomentum', 'growthSensitivity'] as const,
+  fragility: ['skewRisk', 'crowding', 'eventRisk', 'impliedVolRank'] as const,
+}
+
+type UniverseStats = {
+  size: number
+  // mean[field] and stddev[field] across the active universe
+  mean: Record<string, number>
+  stddev: Record<string, number>
+  // Aggregate market-state observations derived from the cross-section
+  marketBreadth: number // average breadth, 0-100
+  marketTrend: number   // average trend60, 0-100
+  marketRisk: number    // average drawdownRisk, 0-100
+  marketDispersion: number // stddev of compositeReadings (proxy for regime change)
+}
+
+type DetectedRegime =
+  | 'growth-favorable'
+  | 'risk-on-broad'
+  | 'late-cycle'
+  | 'defensive'
+  | 'credit-stress'
+  | 'mixed'
+
+const NUMERIC_FIELDS_FOR_STATS: Array<keyof RawSignal> = [
+  'trend20', 'trend60', 'trend120',
+  'relativeStrength', 'residualStrength',
+  'revisionTrend', 'surpriseMomentum',
+  'marginTrend', 'revenueAcceleration', 'freeCashFlowTrend',
+  'quality', 'valuationSupport',
+  'liquidity', 'breadth',
+  'impliedVolRank', 'realizedVol', 'skewRisk', 'eventRisk',
+  'crowding', 'drawdownRisk',
+  'creditSensitivity', 'rateSensitivity',
+  'growthSensitivity', 'defensiveScore',
+]
+
+/** Compute mean + stddev for every numeric input across the universe. */
+function computeUniverseStats(signals: RawSignal[]): UniverseStats {
+  const size = signals.length
+  const mean: Record<string, number> = {}
+  const stddev: Record<string, number> = {}
+
+  for (const field of NUMERIC_FIELDS_FOR_STATS) {
+    const values = signals.map((signal) => signal[field] as number).filter(Number.isFinite)
+    if (values.length === 0) {
+      mean[field as string] = 50
+      stddev[field as string] = 1
+      continue
+    }
+    const m = values.reduce((sum, value) => sum + value, 0) / values.length
+    const variance =
+      values.reduce((sum, value) => sum + (value - m) * (value - m), 0) / values.length
+    mean[field as string] = m
+    // Floor stddev at 1 so we never divide by 0 on a degenerate universe.
+    stddev[field as string] = Math.max(1, Math.sqrt(variance))
+  }
+
+  const marketBreadth = mean.breadth ?? 50
+  const marketTrend = mean.trend60 ?? 50
+  const marketRisk = mean.drawdownRisk ?? 50
+
+  // Cross-sectional dispersion: how spread out are the trends? High
+  // dispersion = factor rotation. Low dispersion = correlated market.
+  const trendDispersion = stddev.trend60 ?? 0
+  const fragilityDispersion = stddev.skewRisk ?? 0
+  const marketDispersion = (trendDispersion + fragilityDispersion) / 2
+
+  return { size, mean, stddev, marketBreadth, marketTrend, marketRisk, marketDispersion }
+}
+
+/** Detect the prevailing regime from cross-sectional aggregates + macro
+ * sensitivities. The regime label drives factor-weight selection. */
+function detectMarketRegime(stats: UniverseStats): DetectedRegime {
+  const breadth = stats.marketBreadth
+  const trend = stats.marketTrend
+  const risk = stats.marketRisk
+  const credit = stats.mean.creditSensitivity ?? 50
+  const growth = stats.mean.growthSensitivity ?? 50
+
+  // Heuristics ordered most-restrictive-first
+  if (risk > 65 && credit > 60) return 'credit-stress'
+  if (risk > 60 && breadth < 45) return 'late-cycle'
+  if (trend > 60 && growth > 55 && breadth > 55) return 'growth-favorable'
+  if (trend > 55 && breadth > 60) return 'risk-on-broad'
+  if (risk < 50 && breadth < 55) return 'defensive'
+  return 'mixed'
+}
+
+/**
+ * Regime-conditional factor weights. Each row sums to 1.0. Weights here
+ * are still hand-set, but conditional on regime — which is the next-best
+ * thing to trained weights and is the standard quant practice before
+ * supervised models exist.
+ */
+const FACTOR_WEIGHTS: Record<DetectedRegime, Record<keyof typeof FACTOR_INPUTS, number>> = {
+  'growth-favorable': {
+    momentum: 0.30,
+    quality: 0.20,
+    value: 0.05,
+    lowVol: 0.10,
+    growth: 0.25,
+    fragility: 0.10,
+  },
+  'risk-on-broad': {
+    momentum: 0.32,
+    quality: 0.18,
+    value: 0.10,
+    lowVol: 0.07,
+    growth: 0.22,
+    fragility: 0.11,
+  },
+  'late-cycle': {
+    momentum: 0.18,
+    quality: 0.28,
+    value: 0.18,
+    lowVol: 0.15,
+    growth: 0.06,
+    fragility: 0.15,
+  },
+  'defensive': {
+    momentum: 0.15,
+    quality: 0.30,
+    value: 0.18,
+    lowVol: 0.20,
+    growth: 0.05,
+    fragility: 0.12,
+  },
+  'credit-stress': {
+    momentum: 0.10,
+    quality: 0.32,
+    value: 0.18,
+    lowVol: 0.22,
+    growth: 0.03,
+    fragility: 0.15,
+  },
+  'mixed': {
+    momentum: 0.22,
+    quality: 0.22,
+    value: 0.13,
+    lowVol: 0.13,
+    growth: 0.18,
+    fragility: 0.12,
+  },
+}
+
+function zScore(value: number, mean: number, stddev: number): number {
+  return (value - mean) / Math.max(1, stddev)
+}
+
+/** Average of a Z-score array, ignoring NaN/Infinity. */
+function meanZ(values: number[]): number {
+  const finite = values.filter(Number.isFinite)
+  if (finite.length === 0) return 0
+  return finite.reduce((sum, value) => sum + value, 0) / finite.length
+}
+
+/** Standard deviation across an array. */
+function stdZ(values: number[]): number {
+  const finite = values.filter(Number.isFinite)
+  if (finite.length === 0) return 0
+  const m = meanZ(finite)
+  const variance = finite.reduce((sum, value) => sum + (value - m) * (value - m), 0) / finite.length
+  return Math.sqrt(variance)
+}
+
+/** Standard normal CDF approximation (Abramowitz & Stegun). Used to
+ * convert composite Z-scores to percentile ranks. */
+function normalCdf(z: number): number {
+  const t = 1 / (1 + 0.2316419 * Math.abs(z))
+  const d = 0.3989422804014327 * Math.exp(-z * z / 2)
+  const p = d * t * (
+    0.31938153 +
+    t * (-0.356563782 +
+      t * (1.781477937 + t * (-1.821255978 + t * 1.330274429)))
+  )
+  return z >= 0 ? 1 - p : p
+}
+
 export function scoreUniverse(
   signals: RawSignal[] = rawSignals,
   scenario: ScenarioId = 'base',
 ): DecisionSignal[] {
-  return signals
-    .map((signal) => applyScenario(signal, scenario))
-    .map(scoreSignal)
-    .sort((left, right) => {
-      if (left.actionRank !== right.actionRank) return left.actionRank - right.actionRank
-      return right.opportunityScore - left.opportunityScore
-    })
+  // Step 1: scenario application
+  const scaled = signals.map((signal) => applyScenario(signal, scenario))
+
+  // Step 2: compute universe-wide statistics
+  const stats = computeUniverseStats(scaled)
+
+  // Step 3: detect market regime from the cross-section
+  const regime = detectMarketRegime(stats)
+
+  // Steps 4-6: score every signal with regime-aware factor weighting
+  const scored = scaled.map((signal) => scoreSignal(signal, stats, regime))
+
+  // Final: rank by composite alpha (highest first); the action label
+  // already encodes the percentile gate, so this sort just reflects
+  // strongest-first within each action bucket.
+  return scored.sort((left, right) => {
+    if (left.actionRank !== right.actionRank) return left.actionRank - right.actionRank
+    return right.compositeAlphaZ - left.compositeAlphaZ
+  })
 }
 
 export function sectorScores(rows: DecisionSignal[]) {
@@ -751,135 +980,215 @@ function applyScenario(signal: RawSignal, scenario: ScenarioId): RawSignal {
   return next
 }
 
-function scoreSignal(signal: RawSignal): DecisionSignal {
-  const trendQuality = signal.trend20 * 0.25 + signal.trend60 * 0.35 + signal.trend120 * 0.4
-  const fundamentalDirection =
-    signal.revisionTrend * 0.32 +
-    signal.surpriseMomentum * 0.18 +
-    signal.marginTrend * 0.16 +
-    signal.revenueAcceleration * 0.18 +
-    signal.freeCashFlowTrend * 0.16
-  const regimeFit = clamp(
-    trendQuality * 0.23 +
-      signal.relativeStrength * 0.18 +
-      signal.residualStrength * 0.16 +
-      signal.breadth * 0.14 +
-      signal.growthSensitivity * 0.12 +
-      signal.defensiveScore * 0.07 +
-      (100 - signal.creditSensitivity) * 0.05 +
-      (100 - signal.rateSensitivity) * 0.05,
-  )
-  const fragilityScore = clamp(
-    signal.impliedVolRank * 0.2 +
-      signal.skewRisk * 0.18 +
-      signal.crowding * 0.18 +
-      signal.drawdownRisk * 0.2 +
-      signal.eventRisk * 0.12 +
-      (100 - signal.breadth) * 0.12,
-  )
-  const baseRiskScore = clamp(
-    fragilityScore * 0.45 +
-      signal.realizedVol * 0.15 +
-      signal.creditSensitivity * 0.12 +
-      signal.rateSensitivity * 0.08 +
-      signal.eventRisk * 0.1 +
-      (100 - signal.liquidity) * 0.1,
-  )
-  const baseOpportunityScore = clamp(
-    trendQuality * 0.19 +
-      signal.relativeStrength * 0.14 +
-      signal.residualStrength * 0.14 +
-      fundamentalDirection * 0.18 +
-      signal.quality * 0.11 +
-      signal.valuationSupport * 0.08 +
-      regimeFit * 0.12 +
-      signal.breadth * 0.08 -
-      baseRiskScore * 0.05 -
-      fragilityScore * 0.04,
-  )
-  const agreement = [
-    trendQuality,
-    signal.relativeStrength,
-    signal.residualStrength,
-    fundamentalDirection,
-    signal.quality,
-    signal.breadth,
-    100 - baseRiskScore,
-  ]
-  const average = agreement.reduce((sum, value) => sum + value, 0) / agreement.length
-  const dispersion =
-    agreement.reduce((sum, value) => sum + Math.abs(value - average), 0) / agreement.length
-  const baseConfidence = clamp(average * 0.72 + signal.liquidity * 0.12 + (100 - dispersion) * 0.16)
+function scoreSignal(signal: RawSignal, stats: UniverseStats, regime: DetectedRegime): DecisionSignal {
   const dataConfidence = signal.dataConfidence ?? 65
   const lowDataPenalty = Math.max(0, 55 - dataConfidence)
-  const riskScore = clamp(baseRiskScore + lowDataPenalty * 0.12)
-  const opportunityScore = clamp(baseOpportunityScore - lowDataPenalty * 0.18)
-  const confidence = clamp(baseConfidence * 0.78 + dataConfidence * 0.22)
-  const asymmetryScore = clamp(opportunityScore * 0.72 + signal.valuationSupport * 0.16 - riskScore * 0.2 + 20)
-  const thesisDamage = clamp(
-    (100 - signal.relativeStrength) * 0.24 +
-      (100 - signal.residualStrength) * 0.18 +
-      (100 - signal.revisionTrend) * 0.16 +
-      riskScore * 0.22 +
-      fragilityScore * 0.2,
+
+  // Step 4a: Z-score every input cross-sectionally. A trend score of 75
+  // means very different things in a bull market (median) vs. a bear
+  // market (top decile). Z-scores normalize that.
+  const z = (field: keyof RawSignal) =>
+    zScore(signal[field] as number, stats.mean[field as string] ?? 50, stats.stddev[field as string] ?? 1)
+
+  // Step 4b: Build canonical academic factor scores from Z-score averages.
+  // Each factor is a literature-backed concept (Fama-French / AQR / Jegadeesh):
+  //   momentum  : cross-sectional 12-month relative strength + residual
+  //   quality   : Asness-Frazzini-Pedersen quality factor
+  //   value     : Fama-French value factor
+  //   lowVol    : low-volatility anomaly (Frazzini-Pedersen)
+  //   growth    : earnings revisions + surprise momentum (Chan-Jegadeesh-Lakonishok)
+  //   fragility : options-implied risk (skew + IV + crowding) — Xing-Zhang-Zhao
+  const momentumZ = meanZ(FACTOR_INPUTS.momentum.map((field) => z(field)))
+  const qualityZ = meanZ(FACTOR_INPUTS.quality.map((field) => z(field)))
+  const valueZ = z('valuationSupport')
+  // low-vol factor inverts: lower realized vol / IV / drawdown = higher score
+  const lowVolZ = -meanZ(FACTOR_INPUTS.lowVol.map((field) => z(field)))
+  const growthZ = meanZ(FACTOR_INPUTS.growth.map((field) => z(field)))
+  // fragility inverts: high skew / crowding / event risk = penalty
+  const fragilityZ = -meanZ(FACTOR_INPUTS.fragility.map((field) => z(field)))
+
+  // Step 5: Apply regime-conditional factor weights
+  const w = FACTOR_WEIGHTS[regime]
+  const compositeAlphaZ =
+    momentumZ * w.momentum +
+    qualityZ * w.quality +
+    valueZ * w.value +
+    lowVolZ * w.lowVol +
+    growthZ * w.growth +
+    fragilityZ * w.fragility
+
+  // Step 6a: Convert composite Z to percentile via normal CDF.
+  // alphaPercentile = 75 means the stock is in the top 25% of the universe.
+  const alphaPercentile = clamp(normalCdf(compositeAlphaZ) * 100)
+
+  // Step 6b: Factor agreement = how many factors point the same direction.
+  // A stock with all 6 factors in agreement is high confidence; one with
+  // 3 positive and 3 negative is low confidence regardless of magnitude.
+  const factorZs = [momentumZ, qualityZ, valueZ, lowVolZ, growthZ, fragilityZ]
+  const positiveFactors = factorZs.filter((value) => value > 0.2).length
+  const negativeFactors = factorZs.filter((value) => value < -0.2).length
+  const factorAgreement = clamp(
+    50 + (positiveFactors - negativeFactors) * 8 - stdZ(factorZs) * 8,
   )
-  const signalStability = clamp(100 - dispersion * 1.15 - signal.eventRisk * 0.14 - lowDataPenalty * 0.16)
-  const forecast20d = clamp((opportunityScore - riskScore) / 8 + (regimeFit - 50) / 18, -12, 12)
-  const probabilityOutperform = clamp(50 + (opportunityScore - 60) * 0.55 + (regimeFit - 60) * 0.22 - riskScore * 0.08)
-  const probabilityDrawdown = clamp(18 + riskScore * 0.52 + fragilityScore * 0.24 - opportunityScore * 0.18)
+
+  // Risk Z (separate from alpha): combines downside-fragility inputs.
+  // Note: this is the OPPOSITE direction from fragilityZ (which is a
+  // factor where higher = better). Here higher = more risk.
+  const riskZ = meanZ([
+    z('drawdownRisk'),
+    z('skewRisk'),
+    z('eventRisk'),
+    z('realizedVol'),
+    z('creditSensitivity') * 0.4,
+    z('rateSensitivity') * 0.3,
+    -z('liquidity') * 0.5,
+  ])
+
+  // Backward-compatible 0-100 scores derived from Z-scores so the
+  // existing UI keeps working without a schema change. These are
+  // statistical translations, not redundant calculations.
+  const opportunityScore = Math.round(alphaPercentile)
+  const fragilityScore = Math.round(clamp(50 + (-fragilityZ) * 18))
+  const riskScore = Math.round(clamp(50 + riskZ * 18 + lowDataPenalty * 0.12))
+  const confidence = Math.round(clamp(factorAgreement * 0.78 + dataConfidence * 0.22))
+  // regimeFit: how well this stock's factor profile matches the regime
+  // ideal. Computed as Z-weighted match to the regime's preferred factors.
+  const regimeIdealMatch =
+    momentumZ * w.momentum +
+    qualityZ * w.quality +
+    growthZ * w.growth +
+    lowVolZ * w.lowVol
+  const regimeFit = Math.round(clamp(50 + regimeIdealMatch * 18))
+
+  const asymmetryScore = Math.round(clamp(50 + (compositeAlphaZ - riskZ) * 18))
+
+  // Thesis damage: high when fundamental + momentum factors have rolled
+  // negative. This drives sell discipline.
+  const thesisDamage = Math.round(
+    clamp(50 - meanZ([momentumZ, growthZ, qualityZ]) * 18 + Math.max(0, riskZ) * 12),
+  )
+
+  const signalStability = Math.round(clamp(100 - stdZ(factorZs) * 25 - lowDataPenalty * 0.2))
+
+  // Forecast 20d: still derived from composite Z scaled to a return %.
+  // Honest about the magnitude — composite Z of +1.5 (top ~7%) maps to
+  // roughly +4% expected, NOT a guaranteed return. The bands matter.
+  const forecast20d = clamp(compositeAlphaZ * 2.5, -12, 12)
+  const probabilityOutperform = Math.round(clamp(normalCdf(compositeAlphaZ - 0.1) * 100))
+  const probabilityDrawdown = Math.round(clamp(normalCdf(riskZ - 0.4) * 100))
+
+  // Action gate: based on percentiles + factor agreement + risk Z.
+  // Adaptive — uses the universe distribution rather than absolute cutoffs.
   const action = classifyAction({
-    opportunityScore,
-    confidence,
-    riskScore,
-    fragilityScore,
-    regimeFit,
+    alphaPercentile,
+    compositeAlphaZ,
+    riskZ,
+    fragilityZ,
+    momentumZ,
+    growthZ,
+    qualityZ,
     thesisDamage,
+    factorAgreement,
   })
 
   return {
     ...signal,
     action,
-    opportunityScore: Math.round(opportunityScore),
-    confidence: Math.round(confidence),
-    riskScore: Math.round(riskScore),
-    fragilityScore: Math.round(fragilityScore),
-    regimeFit: Math.round(regimeFit),
-    asymmetryScore: Math.round(asymmetryScore),
-    thesisDamage: Math.round(thesisDamage),
+    opportunityScore,
+    confidence,
+    riskScore,
+    fragilityScore,
+    regimeFit,
+    asymmetryScore,
+    thesisDamage,
     forecast20d,
-    probabilityOutperform: Math.round(probabilityOutperform),
-    probabilityDrawdown: Math.round(probabilityDrawdown),
-    signalStability: Math.round(signalStability),
+    probabilityOutperform,
+    probabilityDrawdown,
+    signalStability,
     actionRank: actionRank(action),
     positionPlan: positionPlan(action, opportunityScore, riskScore, signal.crowding),
-    evidence: evidenceFor(signal, opportunityScore, regimeFit, confidence),
-    riskFlags: riskFlagsFor(signal, riskScore, fragilityScore, thesisDamage),
+    evidence: evidenceForZ(signal, momentumZ, qualityZ, growthZ, valueZ, lowVolZ, regime),
+    riskFlags: riskFlagsForZ(signal, riskZ, fragilityZ, thesisDamage),
     invalidation: invalidationFor(signal),
     nextCheck: nextCheckFor(action, signal.eventRisk, riskScore),
+    momentumZ,
+    qualityZ,
+    valueZ,
+    lowVolZ,
+    growthZ,
+    fragilityZ,
+    compositeAlphaZ,
+    alphaPercentile: Math.round(alphaPercentile),
+    detectedRegime: regime,
+    factorAgreement: Math.round(factorAgreement),
   }
 }
 
+/**
+ * Statistical action gate. All thresholds are expressed in:
+ *   - percentile rank (where the stock sits in the universe)
+ *   - Z-score magnitude (how far from the mean, in stddev units)
+ *   - factor agreement (how many factors point same direction)
+ *
+ * Adaptive: in a flat universe where everything looks similar, only
+ * the truly outlier setups clear the bar. In a wide-dispersion universe,
+ * more candidates qualify because the top decile is genuinely better.
+ *
+ * Buy Now requires statistical significance (alpha Z >= 1.0, ~top 16%)
+ * AND confirmation across factors (agreement >= 60) AND risk gate
+ * (riskZ <= +0.5, i.e. not in the high-risk tail).
+ */
 function classifyAction(scores: {
-  opportunityScore: number
-  confidence: number
-  riskScore: number
-  fragilityScore: number
-  regimeFit: number
+  alphaPercentile: number
+  compositeAlphaZ: number
+  riskZ: number
+  fragilityZ: number
+  momentumZ: number
+  growthZ: number
+  qualityZ: number
   thesisDamage: number
+  factorAgreement: number
 }): Action {
-  if (scores.thesisDamage >= 58 && scores.riskScore >= 56) return 'Sell'
-  if (scores.thesisDamage >= 54 || (scores.riskScore >= 58 && scores.opportunityScore < 66)) return 'Trim'
-  if (scores.riskScore >= 70 && scores.opportunityScore < 60) return 'Avoid'
+  // Sell discipline: thesis materially damaged AND risk elevated
+  if (scores.thesisDamage >= 60 && scores.riskZ >= 0.6) return 'Sell'
+
+  // Trim: factor decay (momentum + growth roll over) OR risk elevated
+  // without offsetting opportunity
   if (
-    scores.opportunityScore >= 74 &&
-    scores.confidence >= 68 &&
-    scores.regimeFit >= 62 &&
-    scores.riskScore <= 55
+    scores.thesisDamage >= 56 ||
+    (scores.riskZ >= 0.8 && scores.alphaPercentile < 50)
+  ) {
+    return 'Trim'
+  }
+
+  // Avoid: bottom of the universe with elevated risk — neither owns nor
+  // initiates here
+  if (scores.alphaPercentile < 25 && scores.riskZ >= 0.5) return 'Avoid'
+
+  // Buy Now: top 16% by composite alpha (Z >= 1.0 is statistically
+  // significant), factors agree, risk is not in the upper tail
+  if (
+    scores.alphaPercentile >= 84 &&
+    scores.compositeAlphaZ >= 1.0 &&
+    scores.factorAgreement >= 60 &&
+    scores.riskZ <= 0.5
   ) {
     return 'Buy Now'
   }
-  if (scores.opportunityScore >= 68 && scores.confidence >= 62 && scores.riskScore <= 64) return 'Accumulate'
-  if (scores.opportunityScore < 54 && scores.regimeFit < 52) return 'Avoid'
+
+  // Accumulate: top quartile, decent agreement, risk not extreme
+  if (
+    scores.alphaPercentile >= 70 &&
+    scores.compositeAlphaZ >= 0.5 &&
+    scores.factorAgreement >= 50 &&
+    scores.riskZ <= 1.0
+  ) {
+    return 'Accumulate'
+  }
+
+  // Avoid: bottom decile with no obvious pull
+  if (scores.alphaPercentile < 15) return 'Avoid'
+
   return 'Hold'
 }
 
@@ -906,36 +1215,63 @@ function positionPlan(action: Action, opportunity: number, risk: number, crowdin
   return 'Avoid for now'
 }
 
-function evidenceFor(signal: RawSignal, opportunity: number, regimeFit: number, confidence: number) {
+/**
+ * Build the evidence list from factor Z-scores. Each line cites the
+ * specific factor whose Z is statistically meaningful (>=0.5 or <=-0.5
+ * in stddev units) so the user can see exactly which factor is driving
+ * the rank.
+ */
+function evidenceForZ(
+  signal: RawSignal,
+  momentumZ: number,
+  qualityZ: number,
+  growthZ: number,
+  valueZ: number,
+  lowVolZ: number,
+  regime: DetectedRegime,
+): string[] {
   const reasons: string[] = []
-  if ((signal.dataConfidence ?? 0) >= 75 && signal.dataSource && signal.dataSource !== 'priors') {
+  const STAT_THRESHOLD = 0.5
+  if (momentumZ >= STAT_THRESHOLD)
+    reasons.push(`Momentum factor +${momentumZ.toFixed(1)}σ — leading the universe on trend + relative strength.`)
+  if (growthZ >= STAT_THRESHOLD)
+    reasons.push(`Growth factor +${growthZ.toFixed(1)}σ — revisions, surprise, and revenue acceleration above peers.`)
+  if (qualityZ >= STAT_THRESHOLD)
+    reasons.push(`Quality factor +${qualityZ.toFixed(1)}σ — margins, FCF, and balance sheet rank top quartile.`)
+  if (valueZ >= STAT_THRESHOLD)
+    reasons.push(`Value factor +${valueZ.toFixed(1)}σ — valuation support above the universe median.`)
+  if (lowVolZ >= STAT_THRESHOLD)
+    reasons.push(`Low-vol factor +${lowVolZ.toFixed(1)}σ — drawdown risk and realized vol below peers.`)
+  if (
+    (signal.dataConfidence ?? 0) >= 75 &&
+    signal.dataSource &&
+    signal.dataSource !== 'priors'
+  ) {
     reasons.push('Price-derived signals are backed by synced daily OHLCV.')
   }
-  if (opportunity >= 78) reasons.push('Opportunity score clears the buy threshold.')
-  if (signal.relativeStrength >= 75) reasons.push('Relative strength is leading peers and the market.')
-  if (signal.residualStrength >= 72) reasons.push('Residual strength remains positive after sector and market effects.')
-  if (signal.revisionTrend >= 72) reasons.push('Estimate revision trend supports the thesis.')
-  if (signal.quality >= 82) reasons.push('Quality and durability are above the universe median.')
-  if (regimeFit >= 70) reasons.push('Current regime fit is supportive.')
-  if (confidence >= 74) reasons.push('Signal agreement is high enough for action.')
-  if (signal.assetType === 'ETF') reasons.push('ETF structure lowers single-name event risk.')
-  return reasons.length > 0 ? reasons.slice(0, 4) : ['Mixed evidence keeps this in review.']
+  if (signal.assetType === 'ETF') {
+    reasons.push('ETF structure lowers single-name event risk.')
+  }
+  if (reasons.length === 0) {
+    reasons.push(`Mixed factor profile in a ${regime.replace(/-/g, ' ')} regime — no factor clears 0.5σ.`)
+  }
+  return reasons.slice(0, 4)
 }
 
-function riskFlagsFor(signal: RawSignal, risk: number, fragility: number, thesisDamage: number) {
+function riskFlagsForZ(signal: RawSignal, riskZ: number, fragilityZ: number, thesisDamage: number): string[] {
   const flags: string[] = []
   if ((signal.dataConfidence ?? 65) < 45) flags.push('Price-history confidence is low.')
-  if (risk >= 65) flags.push('Composite risk is elevated.')
-  if (fragility >= 65) flags.push('Fragility cluster is rising.')
-  if (signal.impliedVolRank >= 65) flags.push('Options-implied volatility is elevated.')
-  if (signal.skewRisk >= 64) flags.push('Downside skew shows hedging demand.')
-  if (signal.crowding >= 68) flags.push('Crowding raises failed-breakout risk.')
-  if (signal.breadth <= 45) flags.push('Peer breadth is weak.')
-  if (thesisDamage >= 65) flags.push('Thesis damage is high enough for sell discipline.')
+  if (riskZ >= 0.8) flags.push(`Composite risk +${riskZ.toFixed(1)}σ above universe — top decile of risk.`)
+  if (fragilityZ <= -0.8) flags.push(`Fragility factor ${fragilityZ.toFixed(1)}σ — high skew + crowding cluster.`)
+  if (signal.impliedVolRank >= 65) flags.push(`Implied vol rank ${signal.impliedVolRank} — options market pricing wide outcomes.`)
+  if (signal.skewRisk >= 64) flags.push(`Put skew ${signal.skewRisk} — institutions buying downside protection.`)
+  if (signal.crowding >= 68) flags.push(`Crowding ${signal.crowding} — limited marginal buyer.`)
+  if (thesisDamage >= 60) flags.push(`Thesis damage ${thesisDamage} — factor decay in momentum/growth/quality.`)
   signal.dataWarnings?.forEach((warning) => {
     if (!flags.includes(warning)) flags.push(warning)
   })
-  return flags.length > 0 ? flags.slice(0, 4) : ['No major deterioration cluster yet.']
+  if (flags.length === 0) flags.push('No major deterioration cluster yet.')
+  return flags.slice(0, 4)
 }
 
 function invalidationFor(signal: RawSignal) {

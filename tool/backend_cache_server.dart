@@ -186,7 +186,16 @@ class BackendCacheServer {
       return;
     }
 
-    final entry = await _cache.fetch(target);
+    // Forward the inbound Authorization + Accept headers so hosts that
+    // care (Tradier auths via Bearer; Tradier returns XML by default
+    // unless you ask for JSON via Accept) get what the caller intended.
+    final authHeader = request.headers.value(HttpHeaders.authorizationHeader);
+    final acceptHeader = request.headers.value(HttpHeaders.acceptHeader);
+    final entry = await _cache.fetch(
+      target,
+      authHeader: authHeader,
+      acceptHeader: acceptHeader,
+    );
     request.response.statusCode = entry.statusCode;
     request.response.headers.set(
       HttpHeaders.contentTypeHeader,
@@ -282,7 +291,7 @@ class BackendCacheServer {
     );
     response.headers.set(
       HttpHeaders.accessControlAllowHeadersHeader,
-      'Accept, Content-Type',
+      'Accept, Authorization, Content-Type',
     );
   }
 
@@ -313,6 +322,8 @@ class MarketDataCache {
     'query1.finance.yahoo.com',
     'query2.finance.yahoo.com',
     'stooq.com',
+    'sandbox.tradier.com',
+    'api.tradier.com',
   };
 
   bool isAllowed(Uri uri) {
@@ -321,7 +332,11 @@ class MarketDataCache {
         _allowedHosts.contains(host);
   }
 
-  Future<CachedProxyResponse> fetch(Uri uri) async {
+  Future<CachedProxyResponse> fetch(
+    Uri uri, {
+    String? authHeader,
+    String? acceptHeader,
+  }) async {
     final key = _stableHash(uri.toString());
     final paths = _CachePaths(
       metadata: File('${directory.path}${Platform.pathSeparator}$key.json'),
@@ -334,7 +349,12 @@ class MarketDataCache {
     }
 
     try {
-      final fresh = await _fetchNetwork(uri, policy);
+      final fresh = await _fetchNetwork(
+        uri,
+        policy,
+        authHeader: authHeader,
+        acceptHeader: acceptHeader,
+      );
       if (fresh.statusCode >= 200 && fresh.statusCode < 300) {
         await _write(paths, fresh);
         return fresh.toResponse(cacheState: 'MISS');
@@ -395,13 +415,24 @@ class MarketDataCache {
     }
   }
 
-  Future<_StoredCacheEntry> _fetchNetwork(Uri uri, _CachePolicy policy) async {
+  Future<_StoredCacheEntry> _fetchNetwork(
+    Uri uri,
+    _CachePolicy policy, {
+    String? authHeader,
+    String? acceptHeader,
+  }) async {
     final request = await _client.getUrl(uri).timeout(policy.timeout);
-    request.headers.set(HttpHeaders.acceptHeader, '*/*');
+    request.headers.set(
+      HttpHeaders.acceptHeader,
+      acceptHeader != null && acceptHeader.isNotEmpty ? acceptHeader : '*/*',
+    );
     request.headers.set(
       HttpHeaders.userAgentHeader,
       'FinanceOracleLocalCache/1.0 (${Platform.operatingSystem})',
     );
+    if (authHeader != null && authHeader.isNotEmpty) {
+      request.headers.set(HttpHeaders.authorizationHeader, authHeader);
+    }
     final response = await request.close().timeout(policy.timeout);
     final body = await _readAll(response).timeout(policy.timeout);
     return _StoredCacheEntry(
