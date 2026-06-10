@@ -30,6 +30,9 @@ import {
 import { DecisionHistory, PositionSizer, TickerNotes } from './components/DetailExtras'
 import { FactorBreakdown } from './components/FactorBreakdown'
 import { QuantAnalysisCard } from './components/QuantAnalysisCard'
+import { OptionsStrategiesCard } from './components/OptionsStrategiesCard'
+import { ExecutiveBrief } from './components/ExecutiveBrief'
+import { findHoldingForSignal } from './components/optionsStrategiesHelpers'
 import { ShortcutsOverlay } from './components/ShortcutsOverlay'
 import { copyToClipboard, rowsToCsv, type ExportRow } from './components/exportCsv'
 import { useToast } from './components/useToast'
@@ -39,6 +42,8 @@ import { OptionsCard } from './components/OptionsCard'
 import { EarningsChip } from './components/EarningsChip'
 import { ComparisonView } from './components/ComparisonView'
 import { ModelReadinessPanel } from './components/ModelReadiness'
+import { BacktestPanel } from './components/BacktestPanel'
+import { ModelDecayMonitor } from './components/ModelDecayMonitor'
 import { FilterBuilder } from './components/FilterBuilder'
 import { buildPredicate, type FilterRule } from './components/filterTypes'
 import {
@@ -70,11 +75,21 @@ import {
   fetchSnapshotsBatched,
   pickTickersToEnhance,
 } from './data/optionsEnhancer'
+import { cachedComputeQuantAnalysis, type QuantAnalysis } from './data/quantAnalysis'
+import {
+  loadModel,
+  logLivePrediction,
+  predictForUniverse,
+  reconcilePredictions,
+  type LivePrediction,
+  type StoredMlModel,
+} from './data/mlModelService'
 import {
   actionTone,
   formatSignedPercent,
   marketContext,
   scenarios,
+  applyQuantOverlay,
   scoreUniverse,
   sectorScores,
   sortSignals,
@@ -93,7 +108,7 @@ import {
 } from './data/decisionApi'
 import './App.css'
 
-type ViewId = 'decision' | 'buy' | 'hold' | 'sell' | 'radar' | 'scenario' | 'compare' | 'workflow' | 'readiness'
+type ViewId = 'brief' | 'decision' | 'buy' | 'hold' | 'sell' | 'radar' | 'scenario' | 'compare' | 'workflow' | 'readiness'
 type ActionFilter = 'All' | 'Buy' | 'Hold' | 'Risk'
 type FeedStatus = 'loading' | 'backend' | 'fallback'
 
@@ -106,6 +121,13 @@ type NavItem = {
 }
 
 const navItems: NavItem[] = [
+  {
+    id: 'brief',
+    label: 'Brief',
+    eyebrow: 'Executive brief',
+    heading: 'Top decisions + options plan + portfolio at a glance',
+    icon: Sparkles,
+  },
   {
     id: 'decision',
     label: 'Decision Desk',
@@ -763,6 +785,7 @@ function DecisionTable({
   ownedTickers,
   watchTickers,
   enrichedTickers,
+  mlPredictions: mlPredictionsProp,
   isLoading,
   onOpen,
 }: {
@@ -772,9 +795,13 @@ function DecisionTable({
   ownedTickers: Set<string>
   watchTickers: Set<string>
   enrichedTickers: Set<string>
+  mlPredictions?: Map<string, LivePrediction>
   isLoading?: boolean
   onOpen: (signal: DecisionSignal) => void
 }) {
+  // Defensive default: HMR sometimes passes undefined during a refresh
+  // window. An empty map keeps the table rendering cleanly.
+  const mlPredictions = mlPredictionsProp ?? new Map<string, LivePrediction>()
   const [expandedTicker, setExpandedTicker] = useState<string | null>(null)
   const displayedRows = rows.slice(0, maxTableRows)
   const visibleLabel =
@@ -813,6 +840,7 @@ function DecisionTable({
                 <th scope="col">Opp</th>
                 <th scope="col">Risk</th>
                 <th scope="col">20d</th>
+                <th scope="col" title="ML model prediction (when available)">ML</th>
                 <th scope="col">Data</th>
                 <th scope="col" aria-label="Row actions"></th>
               </tr>
@@ -856,6 +884,14 @@ function DecisionTable({
                               Live IV
                             </span>
                           ) : null}
+                          {row.quantConfirmed ? (
+                            <span
+                              className="ticker-badge quant-confirmed"
+                              title={`Action validated by Monte Carlo + BSM + Kelly. MC mean ${row.monteCarloMean?.toFixed(1)}% / Half Kelly ${row.recommendedKellyHalfPct}%.`}
+                            >
+                              Quant ✓
+                            </span>
+                          ) : null}
                         </strong>
                         <span>{row.name}</span>
                       </td>
@@ -881,6 +917,36 @@ function DecisionTable({
                       <td className={`delta ${row.forecast20d < 0 ? 'danger' : 'positive'}`}>
                         {formatSignedPercent(row.forecast20d)}
                       </td>
+                      <td className={(() => {
+                        const prediction = mlPredictions.get(row.ticker)
+                        if (!prediction) return 'delta'
+                        return `delta ${prediction.predictedReturn20d < 0 ? 'danger' : 'positive'}`
+                      })()} title={(() => {
+                        const prediction = mlPredictions.get(row.ticker)
+                        if (!prediction) return 'No ML prediction'
+                        if (prediction.p10Return20d != null && prediction.p90Return20d != null) {
+                          return `GBT 20d: ${formatSignedPercent(prediction.predictedReturn20d)} | 80% interval [${formatSignedPercent(prediction.p10Return20d)}, ${formatSignedPercent(prediction.p90Return20d)}]`
+                        }
+                        return `GBT 20d: ${formatSignedPercent(prediction.predictedReturn20d)}`
+                      })()}>
+                        {(() => {
+                          const prediction = mlPredictions.get(row.ticker)
+                          if (!prediction) return '–'
+                          const point = formatSignedPercent(prediction.predictedReturn20d)
+                          if (prediction.p10Return20d != null && prediction.p90Return20d != null) {
+                            // Show point estimate with tiny interval beneath
+                            return (
+                              <>
+                                <strong>{point}</strong>
+                                <span style={{ display: 'block', fontSize: 9, color: 'var(--muted)' }}>
+                                  [{prediction.p10Return20d.toFixed(1)}, {prediction.p90Return20d.toFixed(1)}]
+                                </span>
+                              </>
+                            )
+                          }
+                          return point
+                        })()}
+                      </td>
                       <td title={readiness.detail}>
                         <strong className={readiness.tone}>{readiness.label}</strong>
                         <span style={{ display: 'block', color: 'var(--muted)', fontSize: 11 }}>
@@ -903,7 +969,7 @@ function DecisionTable({
                     </tr>
                     {isExpanded ? (
                       <tr className="expanded-row">
-                        <td colSpan={8}>
+                        <td colSpan={9}>
                           <dl>
                             <div>
                               <dt>Why it ranks here</dt>
@@ -1095,6 +1161,7 @@ function DetailPanel({
   owned,
   watched,
   isDrawerOpen,
+  holdings,
   onClose,
   onReview,
   onToggleOwned,
@@ -1105,6 +1172,7 @@ function DetailPanel({
   owned: boolean
   watched: boolean
   isDrawerOpen: boolean
+  holdings: StoredHolding[]
   onClose: () => void
   onReview: (ticker: string) => void
   onToggleOwned: (ticker: string) => void
@@ -1200,9 +1268,14 @@ function DetailPanel({
       <PriceChart ticker={signal.ticker} />
       <FactorBreakdown signal={signal} />
       <QuantAnalysisCard signal={signal} />
+      <OptionsStrategiesCard
+        holding={findHoldingForSignal(signal, holdings)}
+        signal={signal}
+      />
       <OptionsCard ticker={signal.ticker} />
       <PositionSizer
         action={signal.action}
+        kellyHalfPct={signal.recommendedKellyHalfPct}
         lastPrice={signal.lastPrice}
         riskScore={signal.riskScore}
         ticker={signal.ticker}
@@ -1550,6 +1623,7 @@ function ScenarioLab({
   ownedTickers,
   watchTickers,
   enrichedTickers,
+  mlPredictions,
   onScenarioChange,
   onOpen,
 }: {
@@ -1559,6 +1633,7 @@ function ScenarioLab({
   ownedTickers: Set<string>
   watchTickers: Set<string>
   enrichedTickers: Set<string>
+  mlPredictions?: Map<string, LivePrediction>
   onScenarioChange: (scenario: ScenarioId) => void
   onOpen: (signal: DecisionSignal) => void
 }) {
@@ -1588,6 +1663,7 @@ function ScenarioLab({
       </div>
       <DecisionTable
         enrichedTickers={enrichedTickers}
+        mlPredictions={mlPredictions}
         onOpen={onOpen}
         ownedTickers={ownedTickers}
         rows={rows}
@@ -1619,7 +1695,7 @@ function InlineEmptyState({ message }: { message: string }) {
 
 function App() {
   const persisted = useMemo(() => readPersistedViewState(), [])
-  const [activeView, setActiveView] = useState<ViewId>(persisted.activeView ?? 'decision')
+  const [activeView, setActiveView] = useState<ViewId>(persisted.activeView ?? 'brief')
   const [query, setQuery] = useState('')
   const [actionFilter, setActionFilter] = useState<ActionFilter>(persisted.actionFilter ?? 'All')
   const [sector, setSector] = useState(persisted.sector ?? 'All')
@@ -1649,6 +1725,18 @@ function App() {
   const [optionsSnapshots, setOptionsSnapshots] = useState<Map<string, OptionsSnapshot>>(
     () => new Map(),
   )
+  const [quantAnalyses, setQuantAnalyses] = useState<Map<string, QuantAnalysis>>(
+    () => new Map(),
+  )
+  // ML model state: persisted GBT loaded from IndexedDB + live predictions
+  // for the visible universe + A/B decision mode toggle.
+  const [mlModel, setMlModel] = useState<StoredMlModel | null>(null)
+  const [mlPredictions, setMlPredictions] = useState<Map<string, LivePrediction>>(
+    () => new Map(),
+  )
+  const [decisionMode, setDecisionMode] = useState<'rules' | 'ml' | 'ensemble'>(
+    () => (typeof window !== 'undefined' && (window.localStorage.getItem('decisionMode') as 'rules' | 'ml' | 'ensemble' | null)) || 'rules',
+  )
   const [reconnectIn, setReconnectIn] = useState<number | null>(null)
   const reconnectAttemptsRef = useRef(0)
   const reconnectTimerRef = useRef<number | null>(null)
@@ -1657,10 +1745,7 @@ function App() {
   const ownedKey = useMemo(() => Array.from(ownedTickers).sort().join(','), [ownedTickers])
   const watchKey = useMemo(() => Array.from(watchTickers).sort().join(','), [watchTickers])
   const universe = useMemo(() => {
-    // Overlay live options snapshots onto the raw signals BEFORE scoring,
-    // so the engine's Buy/Hold/Sell labels reflect real implied vol and
-    // skew for any enriched ticker. Rows without a snapshot keep their
-    // original price-derived proxies.
+    // 1. Overlay live options data onto rawSignals BEFORE scoring.
     const baseSignals = signalInputs ?? []
     const enriched = optionsSnapshots.size === 0
       ? baseSignals
@@ -1668,8 +1753,53 @@ function App() {
           const snapshot = optionsSnapshots.get(signal.ticker)
           return snapshot ? applyOptionsOverlay(signal, snapshot) : signal
         })
-    return scoreUniverse(enriched, activeScenario)
-  }, [activeScenario, signalInputs, optionsSnapshots])
+    // 2. Run the statistical scoring pipeline (Z-scores + factors + regime).
+    const scored = scoreUniverse(enriched, activeScenario)
+    // 3. Overlay Monte Carlo + BSM + Kelly outputs onto the scored signals.
+    //    For tickers we've completed quant analysis on, this REPLACES the
+    //    rule-based forecast/probabilities with simulation-based ones AND
+    //    re-evaluates the action through quant-confirmation gates.
+    let withQuant = scored
+    if (quantAnalyses.size > 0) {
+      withQuant = scored.map((signal) => {
+        const quant = quantAnalyses.get(signal.ticker)
+        if (!quant) return signal
+        return applyQuantOverlay(signal, {
+          monteCarloMean: quant.monteCarlo.meanReturnPct,
+          monteCarloProbUp: quant.monteCarlo.probUp,
+          monteCarloProbUp5: quant.monteCarlo.probUp5pct,
+          monteCarloProbDown8: quant.monteCarlo.probDown8pct,
+          kellyHalfFraction: quant.kellyHalf,
+          riskNeutralProbUp: quant.riskNeutral?.probUp,
+        })
+      })
+    }
+    // A/B decision mode: override action with ML prediction (or blend) when configured.
+    if (decisionMode !== 'rules' && mlPredictions.size > 0) {
+      withQuant = withQuant.map((signal) => {
+        const prediction = mlPredictions.get(signal.ticker)
+        if (!prediction) return signal
+        const mlReturn = prediction.predictedReturn20d
+        if (decisionMode === 'ml') {
+          // Pure-ML action gating, anchored to the same equity-premium pace
+          // thresholds the engine uses elsewhere.
+          let mlAction: typeof signal.action = 'Hold'
+          if (mlReturn > 1.5) mlAction = 'Buy Now'
+          else if (mlReturn > 0.5) mlAction = 'Accumulate'
+          else if (mlReturn < -3) mlAction = 'Sell'
+          else if (mlReturn < -1) mlAction = 'Trim'
+          return { ...signal, action: mlAction }
+        }
+        // Ensemble: average rules forecast and ML prediction
+        const blended = (signal.forecast20d + mlReturn) / 2
+        let blendedAction = signal.action
+        if (blended > 2 && signal.action === 'Hold') blendedAction = 'Accumulate'
+        if (blended < -2 && signal.action === 'Hold') blendedAction = 'Trim'
+        return { ...signal, action: blendedAction, forecast20d: blended }
+      })
+    }
+    return withQuant
+  }, [activeScenario, signalInputs, optionsSnapshots, quantAnalyses, decisionMode, mlPredictions])
   const sectors = useMemo(() => ['All', ...Array.from(new Set(universe.map((row) => row.sector))).sort()], [universe])
   const activeMarketContext = useMemo(
     () => ({ ...marketContext, ...(decisionFeed?.marketContext ?? {}) }),
@@ -2006,6 +2136,52 @@ function App() {
     setDockBadge(ownedRiskCount)
   }, [ownedRiskCount])
 
+  // Persist decision-mode choice
+  useEffect(() => {
+    try {
+      window.localStorage.setItem('decisionMode', decisionMode)
+    } catch {
+      // ignore
+    }
+  }, [decisionMode])
+
+  // Hydrate trained ML model from IDB on mount + reconcile any pending
+  // predictions whose forward windows have closed.
+  useEffect(() => {
+    let cancelled = false
+    void loadModel().then((stored) => {
+      if (cancelled) return
+      setMlModel(stored)
+    })
+    void reconcilePredictions()
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  // When the model is loaded, predict for the top tickers in the
+  // universe (cap at 30 since each prediction needs a separate Yahoo
+  // bars fetch). Predictions persist for decay tracking.
+  useEffect(() => {
+    if (!mlModel) return
+    if (universe.length === 0) return
+    let cancelled = false
+    const tickers = pickTickersToEnhance(universe, ownedTickers, watchTickers, 30)
+    if (tickers.length === 0) return
+    void predictForUniverse(tickers, mlModel).then((predictions) => {
+      if (cancelled) return
+      setMlPredictions(predictions)
+      // Log each prediction so the decay monitor has data later
+      predictions.forEach((prediction) => {
+        void logLivePrediction(prediction)
+      })
+    })
+    return () => {
+      cancelled = true
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mlModel, refreshCount, ownedKey, watchKey])
+
   // Background enhancement: pull real Tradier (or other provider) snapshots
   // for the top ~20 tickers we're most likely to look at. As each snapshot
   // arrives, we splice it into optionsSnapshots which triggers re-scoring.
@@ -2032,6 +2208,36 @@ function App() {
     // Refetch when refresh count changes (manual re-rank) or owned/watch
     // changes meaningfully. We deliberately do NOT depend on the full
     // universe array because it remounts on every score run.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [refreshCount, ownedKey, watchKey])
+
+  // Background quant analysis: for the top tickers we'd actually trade,
+  // run Monte Carlo + GARCH + BSM. Each takes 50-100ms so we cap at 12
+  // (smaller than the options enhancement cap of 20). As each completes
+  // it splices into quantAnalyses which triggers re-scoring with quant
+  // overlays.
+  useEffect(() => {
+    if (universe.length === 0) return
+    const tickers = pickTickersToEnhance(universe, ownedTickers, watchTickers, 12)
+    if (tickers.length === 0) return
+    let cancelled = false
+    void (async () => {
+      for (const ticker of tickers) {
+        if (cancelled) return
+        const signal = universe.find((row) => row.ticker === ticker)
+        if (!signal) continue
+        const analysis = await cachedComputeQuantAnalysis(signal)
+        if (cancelled || !analysis) continue
+        setQuantAnalyses((current) => {
+          const next = new Map(current)
+          next.set(ticker, analysis)
+          return next
+        })
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [refreshCount, ownedKey, watchKey])
 
@@ -2368,6 +2574,21 @@ function App() {
             >
               {theme === 'dark' ? <Sun size={15} /> : <Moon size={15} />}
             </button>
+            {mlModel ? (
+              <label className="select-control" title="Decision mode: rules / ML / ensemble">
+                <span>Mode</span>
+                <select
+                  onChange={(event) =>
+                    setDecisionMode(event.target.value as 'rules' | 'ml' | 'ensemble')
+                  }
+                  value={decisionMode}
+                >
+                  <option value="rules">Rules</option>
+                  <option value="ml">ML</option>
+                  <option value="ensemble">Ensemble</option>
+                </select>
+              </label>
+            ) : null}
           </div>
         </header>
 
@@ -2466,11 +2687,30 @@ function App() {
 
         {visibleRows.length === 0 ? <EmptyState query={query} reason={noRowsReason} /> : null}
 
+        {activeView === 'brief' ? (
+          <ExecutiveBrief
+            activeScenario={activeScenario}
+            asOf={lastRefresh.toISOString()}
+            holdings={holdings}
+            marketContext={activeMarketContext as MarketContext}
+            mlPredictions={mlPredictions}
+            onOpenStock={(ticker) => {
+              setSelectedTicker(ticker)
+              setActiveView('decision')
+            }}
+            ownedTickers={ownedTickers}
+            portfolioMetrics={portfolioMetrics}
+            universe={universe}
+            watchTickers={watchTickers}
+          />
+        ) : null}
+
         {activeView === 'decision' && visibleRows.length > 0 ? (
           <section className="main-grid" data-testid="view-decision">
             <DecisionTable
               enrichedTickers={enrichedTickers}
               isLoading={feedStatus === 'loading'}
+              mlPredictions={mlPredictions}
               onOpen={openSignal}
               ownedTickers={ownedTickers}
               rows={visibleRows}
@@ -2479,6 +2719,7 @@ function App() {
               watchTickers={watchTickers}
             />
             <DetailPanel
+              holdings={holdings}
               isDrawerOpen={detailDrawerOpen}
               onClose={() => {
                 setSelectedTicker(null)
@@ -2499,6 +2740,7 @@ function App() {
           <section className="main-grid" data-testid="view-buy">
             <BuyBoard rows={visibleRows} onOpen={openSignal} />
             <DetailPanel
+              holdings={holdings}
               isDrawerOpen={detailDrawerOpen}
               onClose={() => {
                 setSelectedTicker(null)
@@ -2519,6 +2761,7 @@ function App() {
           <section className="main-grid" data-testid="view-hold">
             <HoldBoard rows={visibleRows} onOpen={openSignal} />
             <DetailPanel
+              holdings={holdings}
               isDrawerOpen={detailDrawerOpen}
               onClose={() => {
                 setSelectedTicker(null)
@@ -2539,6 +2782,7 @@ function App() {
           <section className="main-grid" data-testid="view-sell">
             <SellBoard rows={visibleRows} onOpen={openSignal} />
             <DetailPanel
+              holdings={holdings}
               isDrawerOpen={detailDrawerOpen}
               onClose={() => {
                 setSelectedTicker(null)
@@ -2633,7 +2877,11 @@ function App() {
         ) : null}
 
         {activeView === 'readiness' ? (
-          <ModelReadinessPanel feed={decisionFeed} universe={universe} />
+          <section className="workflow-stack" data-testid="view-readiness">
+            <ModelReadinessPanel feed={decisionFeed} universe={universe} />
+            <ModelDecayMonitor />
+            <BacktestPanel />
+          </section>
         ) : null}
 
         {activeView === 'scenario' && visibleRows.length > 0 ? (
@@ -2641,6 +2889,7 @@ function App() {
             <ScenarioLab
               activeScenario={activeScenario}
               enrichedTickers={enrichedTickers}
+              mlPredictions={mlPredictions}
               onOpen={openSignal}
               onScenarioChange={setActiveScenario}
               ownedTickers={ownedTickers}
@@ -2649,6 +2898,7 @@ function App() {
               watchTickers={watchTickers}
             />
             <DetailPanel
+              holdings={holdings}
               isDrawerOpen={detailDrawerOpen}
               onClose={() => {
                 setSelectedTicker(null)

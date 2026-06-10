@@ -69,7 +69,7 @@ type YahooChartResponse = {
 
 export async function fetchDailyBars(
   ticker: string,
-  range: '1mo' | '3mo' | '6mo' | '1y' = '3mo',
+  range: '1mo' | '3mo' | '6mo' | '1y' | '2y' | '5y' | '10y' | 'max' = '3mo',
 ): Promise<DailyBar[]> {
   const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(
     ticker,
@@ -238,7 +238,7 @@ function memoize<T>(key: string, ttlMs: number, factory: () => Promise<T>): Prom
   })
 }
 
-export const cachedFetchDailyBars = (ticker: string, range: '1mo' | '3mo' | '6mo' | '1y' = '3mo') =>
+export const cachedFetchDailyBars = (ticker: string, range: '1mo' | '3mo' | '6mo' | '1y' | '2y' | '5y' | '10y' | 'max' = '3mo') =>
   memoize(`bars:${ticker}:${range}`, 5 * 60 * 1000, () => fetchDailyBars(ticker, range))
 
 export const cachedFetchNews = (ticker: string, name: string, limit = 8) =>
@@ -246,3 +246,89 @@ export const cachedFetchNews = (ticker: string, name: string, limit = 8) =>
 
 export const cachedFetchEarnings = (ticker: string) =>
   memoize(`earnings:${ticker}`, 60 * 60 * 1000, () => fetchNextEarnings(ticker))
+
+/* =========================================================================
+   FRED — risk-free rate (DGS1MO = 1-month Treasury constant maturity)
+   -------------------------------------------------------------------------
+   Source: Federal Reserve Bank of St. Louis, https://fred.stlouisfed.org/series/DGS1MO.
+   The 1-month T-bill is the standard short-rate proxy for BSM and Kelly.
+
+   Cached for 24 hours since this is a daily-published series.
+   ========================================================================= */
+
+type FredObservation = { date?: string; value?: string }
+type FredResponse = { observations?: FredObservation[] }
+
+export async function fetchRiskFreeRate(): Promise<number | null> {
+  const apiKey = import.meta.env.VITE_FRED_API_KEY as string | undefined
+  if (!apiKey) {
+    // Without a FRED key we can't fetch. Honest about that rather than guessing.
+    return null
+  }
+  const url = `https://api.stlouisfed.org/fred/series/observations?series_id=DGS1MO&api_key=${apiKey}&file_type=json&limit=10&sort_order=desc`
+  const payload = await safeJson<FredResponse>(proxied(url))
+  const obs = payload?.observations ?? []
+  for (const observation of obs) {
+    const value = observation.value
+    if (value && value !== '.' && Number.isFinite(Number(value))) {
+      // FRED returns rates in percent; convert to decimal
+      return Number(value) / 100
+    }
+  }
+  return null
+}
+
+export const cachedFetchRiskFreeRate = () =>
+  memoize('rfr:DGS1MO', 24 * 60 * 60 * 1000, () => fetchRiskFreeRate())
+
+/* =========================================================================
+   Yahoo — per-stock dividend yield from quoteSummary
+   -------------------------------------------------------------------------
+   Replaces the hardcoded 1.5% so BSM is evaluated with the actual dividend
+   yield each stock pays. ETFs and non-payers correctly come back as 0.
+   ========================================================================= */
+
+type YahooSummaryDetail = {
+  quoteSummary?: {
+    result?: Array<{
+      summaryDetail?: {
+        dividendYield?: { raw?: number }
+        trailingAnnualDividendYield?: { raw?: number }
+      }
+      defaultKeyStatistics?: {
+        beta?: { raw?: number }
+      }
+    }>
+  }
+}
+
+export type StockFundamentals = {
+  ticker: string
+  dividendYield: number  // decimal, 0 if not paying
+  beta?: number          // CAPM beta vs S&P 500, when Yahoo provides it
+  source: 'yahoo' | 'none'
+}
+
+export async function fetchStockFundamentals(ticker: string): Promise<StockFundamentals> {
+  const url = `https://query1.finance.yahoo.com/v10/finance/quoteSummary/${encodeURIComponent(
+    ticker,
+  )}?modules=summaryDetail,defaultKeyStatistics`
+  const payload = await safeJson<YahooSummaryDetail>(proxied(url))
+  const result = payload?.quoteSummary?.result?.[0]
+  const detail = result?.summaryDetail
+  const stats = result?.defaultKeyStatistics
+  const dividendYieldRaw =
+    detail?.dividendYield?.raw ?? detail?.trailingAnnualDividendYield?.raw
+  const beta = stats?.beta?.raw
+  return {
+    ticker,
+    dividendYield: typeof dividendYieldRaw === 'number' && Number.isFinite(dividendYieldRaw)
+      ? dividendYieldRaw
+      : 0,
+    beta: typeof beta === 'number' && Number.isFinite(beta) ? beta : undefined,
+    source: typeof dividendYieldRaw === 'number' ? 'yahoo' : 'none',
+  }
+}
+
+export const cachedFetchStockFundamentals = (ticker: string) =>
+  memoize(`fundamentals:${ticker}`, 24 * 60 * 60 * 1000, () => fetchStockFundamentals(ticker))

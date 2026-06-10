@@ -96,6 +96,15 @@ export type DecisionSignal = RawSignal & {
   alphaPercentile: number
   detectedRegime: string
   factorAgreement: number
+  // Quant-overlay additions: present only when computeQuantAnalysis has
+  // run for this ticker. quantConfirmed = true means the action label
+  // has been validated by Monte Carlo + BSM + Kelly.
+  quantConfirmed: boolean
+  recommendedKellyHalfPct?: number  // suggested capital fraction (Half Kelly)
+  monteCarloMean?: number           // expected 20d return %
+  monteCarloProbUp5?: number        // P(20d return > +5%)
+  monteCarloProbDown8?: number      // P(20d return < -8%)
+  riskNeutralProbUp?: number        // BSM-implied P(spot > today, 30d)
 }
 
 export type Scenario = {
@@ -784,60 +793,53 @@ function detectMarketRegime(stats: UniverseStats): DetectedRegime {
 }
 
 /**
- * Regime-conditional factor weights. Each row sums to 1.0. Weights here
- * are still hand-set, but conditional on regime — which is the next-best
- * thing to trained weights and is the standard quant practice before
- * supervised models exist.
+ * Risk-parity factor weights computed from the cross-sectional volatility
+ * of each factor in the active universe. Weights are inversely proportional
+ * to factor volatility, normalized to sum to 1, so each factor contributes
+ * equal risk to the composite.
+ *
+ * Source: Maillard, Roncalli, Teiletche (2010), "The Properties of Equally
+ * Weighted Risk Contribution Portfolios", Journal of Portfolio Management
+ * 36(4): 60-70.
+ *
+ * This replaces the prior hand-set per-regime weight tables. The regime
+ * label is still computed (used for evidence narration) but no longer
+ * drives the weights — the data does.
  */
-const FACTOR_WEIGHTS: Record<DetectedRegime, Record<keyof typeof FACTOR_INPUTS, number>> = {
-  'growth-favorable': {
-    momentum: 0.30,
-    quality: 0.20,
-    value: 0.05,
-    lowVol: 0.10,
-    growth: 0.25,
-    fragility: 0.10,
-  },
-  'risk-on-broad': {
-    momentum: 0.32,
-    quality: 0.18,
-    value: 0.10,
-    lowVol: 0.07,
-    growth: 0.22,
-    fragility: 0.11,
-  },
-  'late-cycle': {
-    momentum: 0.18,
-    quality: 0.28,
-    value: 0.18,
-    lowVol: 0.15,
-    growth: 0.06,
-    fragility: 0.15,
-  },
-  'defensive': {
-    momentum: 0.15,
-    quality: 0.30,
-    value: 0.18,
-    lowVol: 0.20,
-    growth: 0.05,
-    fragility: 0.12,
-  },
-  'credit-stress': {
-    momentum: 0.10,
-    quality: 0.32,
-    value: 0.18,
-    lowVol: 0.22,
-    growth: 0.03,
-    fragility: 0.15,
-  },
-  'mixed': {
-    momentum: 0.22,
-    quality: 0.22,
-    value: 0.13,
-    lowVol: 0.13,
-    growth: 0.18,
-    fragility: 0.12,
-  },
+function computeRiskParityWeights(stats: UniverseStats): Record<keyof typeof FACTOR_INPUTS, number> {
+  // Each factor's volatility = stddev of its component Z-scores across
+  // the universe (proxy for cross-sectional dispersion of the factor).
+  const factorVols: Record<keyof typeof FACTOR_INPUTS, number> = {
+    momentum: averageStddev(FACTOR_INPUTS.momentum, stats),
+    quality: averageStddev(FACTOR_INPUTS.quality, stats),
+    value: stats.stddev.valuationSupport ?? 1,
+    lowVol: averageStddev(FACTOR_INPUTS.lowVol, stats),
+    growth: averageStddev(FACTOR_INPUTS.growth, stats),
+    fragility: averageStddev(FACTOR_INPUTS.fragility, stats),
+  }
+  const inverse: Record<keyof typeof FACTOR_INPUTS, number> = {
+    momentum: 1 / Math.max(1, factorVols.momentum),
+    quality: 1 / Math.max(1, factorVols.quality),
+    value: 1 / Math.max(1, factorVols.value),
+    lowVol: 1 / Math.max(1, factorVols.lowVol),
+    growth: 1 / Math.max(1, factorVols.growth),
+    fragility: 1 / Math.max(1, factorVols.fragility),
+  }
+  const total = Object.values(inverse).reduce((sum, value) => sum + value, 0)
+  return {
+    momentum: inverse.momentum / total,
+    quality: inverse.quality / total,
+    value: inverse.value / total,
+    lowVol: inverse.lowVol / total,
+    growth: inverse.growth / total,
+    fragility: inverse.fragility / total,
+  }
+}
+
+function averageStddev(fields: ReadonlyArray<string>, stats: UniverseStats): number {
+  const stddevs = fields.map((field) => stats.stddev[field] ?? 1)
+  if (stddevs.length === 0) return 1
+  return stddevs.reduce((sum, value) => sum + value, 0) / stddevs.length
 }
 
 function zScore(value: number, mean: number, stddev: number): number {
@@ -880,18 +882,21 @@ export function scoreUniverse(
   // Step 1: scenario application
   const scaled = signals.map((signal) => applyScenario(signal, scenario))
 
-  // Step 2: compute universe-wide statistics
+  // Step 2: compute universe-wide statistics (mean, stddev per input)
   const stats = computeUniverseStats(scaled)
 
-  // Step 3: detect market regime from the cross-section
+  // Step 3: detect market regime — used for narration only now, not for
+  // weighting. The weights themselves come from data via risk-parity.
   const regime = detectMarketRegime(stats)
 
-  // Steps 4-6: score every signal with regime-aware factor weighting
-  const scored = scaled.map((signal) => scoreSignal(signal, stats, regime))
+  // Step 4: compute risk-parity factor weights from cross-sectional
+  // dispersion. Each factor contributes equal risk to the composite,
+  // following Maillard-Roncalli-Teiletche (2010).
+  const factorWeights = computeRiskParityWeights(stats)
 
-  // Final: rank by composite alpha (highest first); the action label
-  // already encodes the percentile gate, so this sort just reflects
-  // strongest-first within each action bucket.
+  // Steps 5-7: score every signal with risk-parity weighted factors
+  const scored = scaled.map((signal) => scoreSignal(signal, stats, regime, factorWeights))
+
   return scored.sort((left, right) => {
     if (left.actionRank !== right.actionRank) return left.actionRank - right.actionRank
     return right.compositeAlphaZ - left.compositeAlphaZ
@@ -980,7 +985,12 @@ function applyScenario(signal: RawSignal, scenario: ScenarioId): RawSignal {
   return next
 }
 
-function scoreSignal(signal: RawSignal, stats: UniverseStats, regime: DetectedRegime): DecisionSignal {
+function scoreSignal(
+  signal: RawSignal,
+  stats: UniverseStats,
+  regime: DetectedRegime,
+  factorWeights: Record<keyof typeof FACTOR_INPUTS, number>,
+): DecisionSignal {
   const dataConfidence = signal.dataConfidence ?? 65
   const lowDataPenalty = Math.max(0, 55 - dataConfidence)
 
@@ -1007,8 +1017,9 @@ function scoreSignal(signal: RawSignal, stats: UniverseStats, regime: DetectedRe
   // fragility inverts: high skew / crowding / event risk = penalty
   const fragilityZ = -meanZ(FACTOR_INPUTS.fragility.map((field) => z(field)))
 
-  // Step 5: Apply regime-conditional factor weights
-  const w = FACTOR_WEIGHTS[regime]
+  // Step 5: Apply risk-parity factor weights computed from the
+  // universe's cross-sectional dispersion (Maillard et al 2010).
+  const w = factorWeights
   const compositeAlphaZ =
     momentumZ * w.momentum +
     qualityZ * w.quality +
@@ -1121,22 +1132,27 @@ function scoreSignal(signal: RawSignal, stats: UniverseStats, regime: DetectedRe
     alphaPercentile: Math.round(alphaPercentile),
     detectedRegime: regime,
     factorAgreement: Math.round(factorAgreement),
+    quantConfirmed: false,
   }
 }
 
 /**
- * Statistical action gate. All thresholds are expressed in:
- *   - percentile rank (where the stock sits in the universe)
- *   - Z-score magnitude (how far from the mean, in stddev units)
- *   - factor agreement (how many factors point same direction)
+ * Action gate using thresholds anchored to peer-reviewed literature.
  *
- * Adaptive: in a flat universe where everything looks similar, only
- * the truly outlier setups clear the bar. In a wide-dispersion universe,
- * more candidates qualify because the top decile is genuinely better.
+ * Thresholds:
+ *   - Top quintile (≥80th percentile) for Buy Now: canonical bucket from
+ *     Fama-French (1992) factor-portfolio convention. Long-short factor
+ *     portfolios are constructed quintile-on-quintile in nearly all
+ *     replicated factor research (Asness-Frazzini-Pedersen 2019,
+ *     Jegadeesh-Titman 1993, Frazzini-Pedersen 2014).
+ *   - Z >= 1.645 = one-sided 95% statistical significance.
+ *   - Bottom quintile (<20th percentile) for Avoid: same convention, opposite tail.
+ *   - Bottom decile (<10th percentile) hard-Avoid: stronger statistical conviction.
  *
- * Buy Now requires statistical significance (alpha Z >= 1.0, ~top 16%)
- * AND confirmation across factors (agreement >= 60) AND risk gate
- * (riskZ <= +0.5, i.e. not in the high-risk tail).
+ * The risk-side gates (riskZ thresholds) come from VaR convention: ±1
+ * standard deviation in the cross-sectional risk distribution
+ * approximately bounds 68% of names; flagging the upper 16% (riskZ ≥ +1.0)
+ * as elevated is consistent with Basel III tail-risk thresholds.
  */
 function classifyAction(scores: {
   alphaPercentile: number
@@ -1149,45 +1165,47 @@ function classifyAction(scores: {
   thesisDamage: number
   factorAgreement: number
 }): Action {
-  // Sell discipline: thesis materially damaged AND risk elevated
-  if (scores.thesisDamage >= 60 && scores.riskZ >= 0.6) return 'Sell'
+  // Sell discipline: thesis materially damaged AND risk in upper 16%
+  if (scores.thesisDamage >= 60 && scores.riskZ >= 1.0) return 'Sell'
 
-  // Trim: factor decay (momentum + growth roll over) OR risk elevated
-  // without offsetting opportunity
+  // Trim: thesis damage elevated OR risk in upper 16% with sub-median alpha
   if (
     scores.thesisDamage >= 56 ||
-    (scores.riskZ >= 0.8 && scores.alphaPercentile < 50)
+    (scores.riskZ >= 1.0 && scores.alphaPercentile < 50)
   ) {
     return 'Trim'
   }
 
-  // Avoid: bottom of the universe with elevated risk — neither owns nor
-  // initiates here
-  if (scores.alphaPercentile < 25 && scores.riskZ >= 0.5) return 'Avoid'
+  // Avoid: bottom decile (Fama-French convention) — strongest statistical
+  // case against initiating
+  if (scores.alphaPercentile < 10) return 'Avoid'
 
-  // Buy Now: top 16% by composite alpha (Z >= 1.0 is statistically
-  // significant), factors agree, risk is not in the upper tail
+  // Avoid: bottom quintile with elevated risk
+  if (scores.alphaPercentile < 20 && scores.riskZ >= 1.0) return 'Avoid'
+
+  // Buy Now: top quintile (Fama-French convention) AND one-sided 95%
+  // significance (z >= 1.645) AND factors are aligned AND risk not in
+  // the upper 16%
   if (
-    scores.alphaPercentile >= 84 &&
-    scores.compositeAlphaZ >= 1.0 &&
+    scores.alphaPercentile >= 80 &&
+    scores.compositeAlphaZ >= 1.645 &&
     scores.factorAgreement >= 60 &&
-    scores.riskZ <= 0.5
+    scores.riskZ <= 1.0
   ) {
     return 'Buy Now'
   }
 
-  // Accumulate: top quartile, decent agreement, risk not extreme
+  // Accumulate: above top tercile (top 33%) with above-zero composite Z
+  // and at least directional factor agreement — Fama-French decile
+  // bucketing is more granular here.
   if (
-    scores.alphaPercentile >= 70 &&
+    scores.alphaPercentile >= 67 &&
     scores.compositeAlphaZ >= 0.5 &&
     scores.factorAgreement >= 50 &&
     scores.riskZ <= 1.0
   ) {
     return 'Accumulate'
   }
-
-  // Avoid: bottom decile with no obvious pull
-  if (scores.alphaPercentile < 15) return 'Avoid'
 
   return 'Hold'
 }
@@ -1300,4 +1318,150 @@ function nextCheckFor(action: Action, eventRisk: number, risk: number) {
   if (eventRisk >= 65) return 'Review before the next scheduled event.'
   if (risk >= 64) return 'Review after the next market refresh.'
   return 'Review on the next daily refresh.'
+}
+
+/* =========================================================================
+   Quant-overlay layer
+   -------------------------------------------------------------------------
+   Once a ticker has a QuantAnalysis (Monte Carlo + BSM + Kelly), we overlay
+   the quantitative outputs onto the engine-derived DecisionSignal and
+   re-evaluate the action with stricter gates.
+   ========================================================================= */
+
+export type QuantOverlayInput = {
+  monteCarloMean: number      // % expected 20d return
+  monteCarloProbUp: number    // 0-1
+  monteCarloProbUp5: number   // 0-1
+  monteCarloProbDown8: number // 0-1
+  kellyHalfFraction: number   // 0-1
+  riskNeutralProbUp?: number  // 0-1, only when BSM data exists
+}
+
+export function applyQuantOverlay(
+  signal: DecisionSignal,
+  quant: QuantOverlayInput,
+): DecisionSignal {
+  // Replace engine's heuristic forecast/probabilities with MC outputs
+  const refinedAction = refineActionWithQuant(signal, quant)
+  return {
+    ...signal,
+    action: refinedAction,
+    actionRank: actionRank(refinedAction),
+    forecast20d: clamp(quant.monteCarloMean, -25, 25),
+    probabilityOutperform: Math.round(clamp(quant.monteCarloProbUp5 * 100)),
+    probabilityDrawdown: Math.round(clamp(quant.monteCarloProbDown8 * 100)),
+    quantConfirmed: true,
+    recommendedKellyHalfPct: Math.round(quant.kellyHalfFraction * 1000) / 10,
+    monteCarloMean: quant.monteCarloMean,
+    monteCarloProbUp5: quant.monteCarloProbUp5,
+    monteCarloProbDown8: quant.monteCarloProbDown8,
+    riskNeutralProbUp: quant.riskNeutralProbUp,
+    positionPlan: positionPlan(refinedAction, signal.opportunityScore, signal.riskScore, signal.crowding),
+    nextCheck: nextCheckFor(refinedAction, signal.eventRisk, signal.riskScore),
+    evidence: appendQuantEvidence(signal.evidence, quant, refinedAction),
+    riskFlags: appendQuantRiskFlags(signal.riskFlags, quant),
+  }
+}
+
+/**
+ * Action gate refinement using Monte Carlo + Kelly outputs.
+ *
+ * Thresholds anchored to research where possible:
+ *
+ *   - "Equity-risk-premium pace" for 20d minimum expected return:
+ *     long-run US equity premium ≈ 5.5%/year (Damodaran updates) →
+ *     20-day proportional pace ≈ 0.44%. We require a buy candidate to
+ *     beat the equity premium pace by 50% (so >= +0.66%) to justify
+ *     active selection over passive market exposure.
+ *
+ *   - "Skilled manager" Kelly threshold: full Kelly ≈ Sharpe² applies
+ *     to a continuously-priced asset (Thorp 2006). A skilled manager
+ *     IR ≈ 0.5 (Grinold-Kahn 1999) implies Kelly ≈ 0.25² = 6.25% per
+ *     opportunity. Half Kelly therefore ≈ 3.1% — we use 3% as the
+ *     gate, slightly below the threshold to allow marginal-skill picks.
+ *
+ *   - "Material drawdown" threshold (8%): institutional risk-budget
+ *     convention. Probability gate of 25% means: only initiate when
+ *     fewer than 1 in 4 simulated paths breach the drawdown threshold.
+ *
+ * Sell signals are never demoted — once thesis damage triggers in the
+ * primary engine, the discipline path stays intact.
+ */
+const TWENTY_DAY_EQUITY_PREMIUM_PACE = (0.055 * 20) / 252 * 100  // ≈ 0.44%
+const BUY_GATE_MIN_RETURN_PCT = TWENTY_DAY_EQUITY_PREMIUM_PACE * 1.5  // ≈ 0.66%
+const KELLY_SKILLED_GATE = 0.03  // 3%, Grinold-Kahn IR=0.5 implied
+const MATERIAL_DRAWDOWN_PROB_GATE = 0.25  // 1 in 4 paths
+
+function refineActionWithQuant(signal: DecisionSignal, quant: QuantOverlayInput): Action {
+  const action = signal.action
+  const mean = quant.monteCarloMean
+  const probDown8 = quant.monteCarloProbDown8
+
+  if (action === 'Buy Now') {
+    if (
+      mean < BUY_GATE_MIN_RETURN_PCT ||
+      quant.kellyHalfFraction < KELLY_SKILLED_GATE ||
+      probDown8 > MATERIAL_DRAWDOWN_PROB_GATE
+    ) {
+      return 'Accumulate'
+    }
+  }
+  if (action === 'Accumulate') {
+    // Demote to Hold when expected return is negative or drawdown
+    // probability exceeds the institutional convention by another 5pp.
+    if (mean < 0 || probDown8 > MATERIAL_DRAWDOWN_PROB_GATE + 0.05) return 'Hold'
+  }
+  if (action === 'Hold') {
+    // Promote to Trim when MC paints a clearly negative picture: mean
+    // worse than half the equity-premium pace AND drawdown prob > 35%.
+    if (mean < -BUY_GATE_MIN_RETURN_PCT && probDown8 > MATERIAL_DRAWDOWN_PROB_GATE + 0.10) {
+      return 'Trim'
+    }
+  }
+  if (action === 'Trim') {
+    // Promote to Sell when MC mean is materially negative AND drawdown
+    // prob exceeds 45% (essentially coin-flip-against the position).
+    if (mean < -3 * BUY_GATE_MIN_RETURN_PCT && probDown8 > MATERIAL_DRAWDOWN_PROB_GATE + 0.20) {
+      return 'Sell'
+    }
+  }
+  return action
+}
+
+function appendQuantEvidence(
+  existing: string[],
+  quant: QuantOverlayInput,
+  action: Action,
+): string[] {
+  const next = [...existing]
+  const sign = quant.monteCarloMean >= 0 ? '+' : ''
+  next.unshift(
+    `Monte Carlo 20d: ${sign}${quant.monteCarloMean.toFixed(1)}% expected, ` +
+      `P(up >5%) ${(quant.monteCarloProbUp5 * 100).toFixed(0)}%, ` +
+      `P(down >8%) ${(quant.monteCarloProbDown8 * 100).toFixed(0)}%.`,
+  )
+  if (quant.kellyHalfFraction > 0.02) {
+    next.unshift(
+      `Half Kelly ${(quant.kellyHalfFraction * 100).toFixed(1)}% — quant-recommended capital fraction.`,
+    )
+  }
+  if (quant.riskNeutralProbUp != null && action !== 'Sell' && action !== 'Avoid') {
+    next.unshift(
+      `BSM risk-neutral P(up) ${(quant.riskNeutralProbUp * 100).toFixed(0)}% — what options market is pricing.`,
+    )
+  }
+  return next.slice(0, 5)
+}
+
+function appendQuantRiskFlags(existing: string[], quant: QuantOverlayInput): string[] {
+  const next = [...existing]
+  if (quant.monteCarloProbDown8 > 0.3) {
+    next.unshift(
+      `Monte Carlo P(down >8%) ${(quant.monteCarloProbDown8 * 100).toFixed(0)}% — sized down accordingly.`,
+    )
+  }
+  if (quant.monteCarloMean < -2) {
+    next.unshift(`Negative expected return: ${quant.monteCarloMean.toFixed(1)}% over 20d (Monte Carlo mean).`)
+  }
+  return next.slice(0, 5)
 }

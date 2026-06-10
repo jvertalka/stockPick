@@ -64,21 +64,26 @@ type TradierExpirationsResponse = {
   expirations?: { date?: string | string[] } | null
 }
 
-type TradierGreeks = {
+export type TradierGreeks = {
   delta?: number
   mid_iv?: number
   ask_iv?: number
   bid_iv?: number
+  gamma?: number
+  vega?: number
+  theta?: number
 }
 
-type TradierOption = {
+export type TradierOption = {
   symbol?: string
   strike?: number
   option_type?: 'put' | 'call'
   expiration_date?: string
   bid?: number
   ask?: number
+  last?: number
   open_interest?: number
+  volume?: number
   greeks?: TradierGreeks
 }
 
@@ -307,4 +312,88 @@ export function optionsProviderStatus(): {
     configured: provider.isConfigured(),
   }))
   return { active, candidates }
+}
+
+/* =========================================================================
+   Full chain access for the Options Strategy Recommender
+   ========================================================================= */
+
+export type OptionsChain = {
+  ticker: string
+  underlyingPrice: number
+  expiration: string
+  daysToExpiry: number
+  calls: TradierOption[]
+  puts: TradierOption[]
+}
+
+/**
+ * Fetch the full options chain for the expiration closest to `targetDays`
+ * out. Returns null when no provider is configured or the ticker has no
+ * listed options.
+ */
+export async function fetchOptionsChainNear(
+  ticker: string,
+  targetDays = 30,
+): Promise<OptionsChain | null> {
+  const token = import.meta.env.VITE_TRADIER_TOKEN as string | undefined
+  if (!token) return null
+  const env = tradierEnv()
+  const base = tradierBase(env)
+
+  const quoteResp = await tradierFetch<TradierQuoteResponse>(
+    `${base}/markets/quotes?symbols=${encodeURIComponent(ticker)}`,
+    token,
+  )
+  const last = quoteResp?.quotes?.quote?.last
+  if (!last || !Number.isFinite(last) || last <= 0) return null
+
+  const expirationsResp = await tradierFetch<TradierExpirationsResponse>(
+    `${base}/markets/options/expirations?symbol=${encodeURIComponent(ticker)}`,
+    token,
+  )
+  const dates = normalizeExpirations(expirationsResp)
+  if (dates.length === 0) return null
+  const target = new Date()
+  target.setDate(target.getDate() + targetDays)
+  const expiry = dates.reduce((closest, candidate) =>
+    Math.abs(daysBetween(target, candidate)) < Math.abs(daysBetween(target, closest))
+      ? candidate
+      : closest,
+  )
+
+  const chainResp = await tradierFetch<TradierChainResponse>(
+    `${base}/markets/options/chains?symbol=${encodeURIComponent(ticker)}&expiration=${expiry}&greeks=true`,
+    token,
+  )
+  const options = normalizeChain(chainResp)
+  if (options.length === 0) return null
+
+  const calls = options.filter((opt) => opt.option_type === 'call')
+  const puts = options.filter((opt) => opt.option_type === 'put')
+  const daysToExpiry = Math.max(1, daysBetween(new Date(), expiry))
+
+  return {
+    ticker,
+    underlyingPrice: last,
+    expiration: expiry,
+    daysToExpiry,
+    calls,
+    puts,
+  }
+}
+
+const chainCache = new Map<string, { expires: number; value: Promise<OptionsChain | null> }>()
+
+export function cachedFetchOptionsChainNear(
+  ticker: string,
+  targetDays = 30,
+): Promise<OptionsChain | null> {
+  const key = `${ticker}:${targetDays}`
+  const now = Date.now()
+  const existing = chainCache.get(key)
+  if (existing && existing.expires > now) return existing.value
+  const value = fetchOptionsChainNear(ticker, targetDays)
+  chainCache.set(key, { expires: now + 5 * 60 * 1000, value })
+  return value
 }

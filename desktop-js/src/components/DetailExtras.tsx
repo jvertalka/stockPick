@@ -69,11 +69,13 @@ export function PositionSizer({
   action,
   lastPrice,
   riskScore,
+  kellyHalfPct,
 }: {
   ticker: string
   action: string
   lastPrice?: number
   riskScore: number
+  kellyHalfPct?: number
 }) {
   const [prefs, setPrefs] = useState<SizerPrefs>(() => readSizerPrefs())
   const [editing, setEditing] = useState(false)
@@ -88,14 +90,37 @@ export function PositionSizer({
     const riskMult = riskAdjust[prefs.riskTolerance]
     // High-risk names get sized down so the dollar-stop loss stays bounded.
     const riskDamper = riskScore >= 65 ? 0.6 : riskScore >= 55 ? 0.8 : 1.0
-    const targetDollars = baseDollars * actionMult * riskMult * riskDamper
+
+    // Quant Kelly path (preferred when available): half Kelly directly
+    // replaces the heuristic action × risk multipliers. We still cap at
+    // the user's max-position-% so a runaway Kelly doesn't suggest 30%
+    // of the portfolio in a single name.
+    let targetDollars: number
+    let usingKelly = false
+    if (kellyHalfPct != null && kellyHalfPct > 0 && actionMult > 0) {
+      const kellyDollars = (prefs.accountValue * kellyHalfPct) / 100
+      const cappedKelly = Math.min(kellyDollars, baseDollars * 1.5)
+      targetDollars = cappedKelly * riskMult
+      usingKelly = true
+    } else {
+      targetDollars = baseDollars * actionMult * riskMult * riskDamper
+    }
     const shares =
       lastPrice && lastPrice > 0 && targetDollars > 0
         ? Math.max(1, Math.floor(targetDollars / lastPrice))
         : 0
     const realizedDollars = shares * (lastPrice ?? 0)
-    return { targetDollars, shares, realizedDollars, baseDollars, actionMult, riskMult, riskDamper }
-  }, [prefs, action, lastPrice, riskScore])
+    return {
+      targetDollars,
+      shares,
+      realizedDollars,
+      baseDollars,
+      actionMult,
+      riskMult,
+      riskDamper,
+      usingKelly,
+    }
+  }, [prefs, action, lastPrice, riskScore, kellyHalfPct])
 
   if (!actionMultiplier[action] || actionMultiplier[action] === 0) {
     return (
@@ -188,9 +213,9 @@ export function PositionSizer({
         </div>
       </div>
       <p className="sizer-note">
-        {prefs.maxPositionPct}% of {formatCurrency(prefs.accountValue)} max position ·
-        {action} sizing × {prefs.riskTolerance} tolerance
-        {calculation.riskDamper < 1 ? ` · risk damper ${calculation.riskDamper.toFixed(1)}×` : ''}
+        {calculation.usingKelly
+          ? `Half Kelly = ${kellyHalfPct?.toFixed(1)}% (capped) × ${prefs.riskTolerance} tolerance · capital fraction from Monte Carlo expected return / variance.`
+          : `${prefs.maxPositionPct}% of ${formatCurrency(prefs.accountValue)} max position · ${action} sizing × ${prefs.riskTolerance} tolerance${calculation.riskDamper < 1 ? ` · risk damper ${calculation.riskDamper.toFixed(1)}×` : ''}.`}
         <span className="sizer-disclaimer"> Not investment advice — your numbers, your call on {ticker}.</span>
       </p>
     </section>
