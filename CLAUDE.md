@@ -75,5 +75,11 @@ adding decision speed, it belongs behind a click, not on the main path.
 - `desktop-js/src/data/quantConfig.ts` — every research-backed constant.
 - `desktop-js/src/data/historicalBacktest.ts` + `tools/backtest-cli.ts` —
   walk-forward training/evaluation (UI panel and headless CLI share it).
-- `start-workstation.ps1` / `.cmd` — the only supported way to launch.
+- **Packaged desktop app is the primary runtime**: `build-desktop.ps1`
+  compiles the Dart backend to a native sidecar
+  (`desktop-js/src-tauri/binaries/`, gitignored) and builds the Tauri
+  app. The Rust supervisor (`src-tauri/src/lib.rs`) spawns the sidecar,
+  reuses an already-running backend instead of double-binding the port,
+  auto-restarts it on crash with backoff, and kills it on exit.
+- `start-workstation.ps1` / `.cmd` — dev-mode launcher (Vite + `dart run`).
 - The Flutter app at repo root is legacy; the JS workstation is canonical.
