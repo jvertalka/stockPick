@@ -209,24 +209,27 @@ export const MARKET_EQUITY_RISK_PREMIUM = 0.055
 /* =========================================================================
    9. ML regime gate
    -------------------------------------------------------------------------
-   Source: our own walk-forward backtest (2026-05-12, pruned 12-feature
-   GBT, 5,340 samples, 35 out-of-sample windows, purged + embargoed),
-   regime-labeled with point-in-time Hamilton (1989) Markov switching on
-   SPY returns:
+   Source: our own walk-forward backtests, regime-labeled with
+   point-in-time Hamilton (1989) Markov switching on SPY returns.
 
+   2026-05-12 (12 price features, 5,340 samples, 60 names):
      low-vol  (28 steps): IC 0.089, hit 59.4%, L/S net +2.81%/20d
-     high-vol  (7 steps): IC 0.021, hit 50.2%, L/S net +1.50%/20d
+     high-vol  (7 steps): IC 0.021, hit 50.2% (coin flip)
 
-   In the high-vol state the model's hit rate is indistinguishable from
-   a coin flip and the IC is within noise of zero — so ML-driven action
-   overrides are suppressed there and the engine falls back to rules.
-   Honest caveat: only 7 high-vol windows in the sample, so this gate is
-   a conservative default, not a precise estimate. Re-measure as data
-   accumulates.
+   2026-06-10 (40 features incl. EDGAR fundamentals, 19,658 samples,
+   221 names):
+     low-vol  (31 steps): IC 0.033, hit 54.1%, L/S net +0.81%/20d
+     high-vol  (4 steps): IC 0.135, hit 67.6%, L/S net +5.01%/20d
+
+   The two vintages DISAGREE about high-vol skill, on 7 and 4 windows
+   respectively — neither is close to statistically meaningful. Doctrine
+   says gate where skill isn't PROVEN, and high-vol skill remains
+   unproven either way, so the conservative gate stays until enough
+   high-vol windows accumulate to measure it properly.
    ========================================================================= */
 export const ML_REGIME_GATE = {
   /** Regime in which ML action overrides are suppressed; null disables gating. */
   gatedRegime: 'high-vol' as 'high-vol' | 'low-vol' | null,
   rationale:
-    'Backtest (2026-05-12): in high-vol regimes the ML model scored IC 0.021 with a 50.2% hit rate (coin flip) vs IC 0.089 / 59.4% in low-vol. ML action overrides are paused until the regime normalizes.',
+    'High-vol ML skill is unproven: 2026-05-12 measured a coin flip there (IC 0.021, 7 windows); 2026-06-10 measured IC 0.135 on just 4 windows. Until enough high-vol windows accumulate for a real estimate, ML action overrides pause in that regime and the engine falls back to rules.',
 } as const

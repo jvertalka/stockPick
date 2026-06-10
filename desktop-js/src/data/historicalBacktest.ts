@@ -49,16 +49,50 @@ export type { DailyBar }
 /**
  * Default liquid-universe ticker set for backtests. Shared by the
  * BacktestPanel UI and the Node CLI (tools/backtest-cli.ts) so both
- * train on the same names.
+ * train on the same names. ~200 large/mid-cap US names across all
+ * GICS sectors (wider cross-sections shrink the variance of per-date
+ * Z-scores and of quintile portfolio returns) plus 8 index/sector ETFs
+ * kept for regime context — ETFs carry no fundamentals and use the
+ * neutral fundamental encoding.
  */
 export const DEFAULT_BACKTEST_TICKERS = [
+  // Mega/large tech + communication
   'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META', 'NVDA', 'TSLA', 'AVGO',
   'ORCL', 'CRM', 'ADBE', 'CSCO', 'NFLX', 'AMD', 'INTC', 'QCOM',
-  'TXN', 'IBM', 'NOW', 'PANW',
+  'TXN', 'IBM', 'NOW', 'PANW', 'MU', 'AMAT', 'LRCX', 'KLAC',
+  'SNPS', 'CDNS', 'CRWD', 'FTNT', 'WDAY', 'TEAM', 'DDOG', 'NET',
+  'ZS', 'MDB', 'SNOW', 'PLTR', 'UBER', 'ABNB', 'SHOP', 'SQ',
+  'PYPL', 'INTU', 'ANET', 'MRVL', 'NXPI', 'ON', 'ADI', 'MCHP',
+  'DIS', 'CMCSA', 'T', 'VZ', 'TMUS', 'CHTR', 'EA', 'TTWO',
+  // Financials
   'JPM', 'V', 'MA', 'BAC', 'WFC', 'GS', 'MS', 'BLK',
+  'SCHW', 'AXP', 'C', 'USB', 'PNC', 'TFC', 'COF', 'BK',
+  'SPGI', 'MCO', 'ICE', 'CME', 'AON', 'MMC', 'PGR', 'TRV',
+  'ALL', 'MET', 'PRU', 'AIG', 'KKR', 'BX', 'APO', 'COIN',
+  // Health care
   'UNH', 'JNJ', 'LLY', 'MRK', 'ABBV', 'PFE', 'TMO', 'ABT',
+  'DHR', 'BMY', 'AMGN', 'GILD', 'VRTX', 'REGN', 'ISRG', 'SYK',
+  'BSX', 'MDT', 'EW', 'ZTS', 'CI', 'CVS', 'ELV', 'HUM',
+  'MCK', 'BIIB', 'MRNA', 'HCA',
+  // Consumer staples + discretionary
   'WMT', 'PG', 'KO', 'PEP', 'COST', 'HD', 'NKE', 'MCD',
-  'XOM', 'CVX', 'COP', 'CAT', 'BA', 'DE', 'GE', 'HON',
+  'LOW', 'TGT', 'SBUX', 'CMG', 'BKNG', 'MAR', 'HLT', 'YUM',
+  'DG', 'DLTR', 'ROST', 'TJX', 'ORLY', 'AZO', 'EL', 'CL',
+  'KMB', 'GIS', 'KHC', 'HSY', 'STZ', 'MDLZ', 'MO', 'PM',
+  'F', 'GM', 'RIVN', 'LULU',
+  // Energy + materials
+  'XOM', 'CVX', 'COP', 'EOG', 'SLB', 'PSX', 'MPC', 'VLO',
+  'OXY', 'PXD', 'KMI', 'WMB', 'LIN', 'APD', 'SHW', 'ECL',
+  'FCX', 'NEM', 'NUE', 'DOW',
+  // Industrials
+  'CAT', 'BA', 'DE', 'GE', 'HON', 'UNP', 'UPS', 'FDX',
+  'RTX', 'LMT', 'NOC', 'GD', 'MMM', 'EMR', 'ETN', 'ITW',
+  'PH', 'CMI', 'PCAR', 'CSX', 'NSC', 'WM', 'RSG', 'URI',
+  'PWR', 'GWW', 'TT', 'CARR',
+  // Utilities + real estate
+  'NEE', 'DUK', 'SO', 'D', 'AEP', 'EXC', 'SRE', 'XEL',
+  'PLD', 'AMT', 'EQIX', 'CCI', 'PSA', 'SPG', 'O', 'WELL',
+  // Index/sector ETFs (regime context; no fundamentals)
   'SPY', 'QQQ', 'IWM', 'DIA', 'XLK', 'XLF', 'XLE', 'XLV',
 ]
 
@@ -132,9 +166,36 @@ export const HISTORICAL_FEATURE_NAMES: FeatureNames = [
   // Range/extension (2)
   'range_compression_20d',    // (high-low)/close, last 20d
   'price_velocity_acceleration',  // 20d vel - 60d vel (momentum of momentum)
+  // Fundamentals (10) — point-in-time from SEC EDGAR filings, keyed by
+  // FILED date so a sample at date t only sees statements filed <= t.
+  // Directions per the factor literature: profitability (Novy-Marx 2013),
+  // value as earnings yield (Basu 1977), issuance (Pontiff-Woodgate 2008),
+  // leverage (Fama-French 1992). Values are winsorized at fixed economic
+  // bounds (Gu-Kelly-Xiu 2020 winsorize characteristics the same way).
+  ...[
+    'fund_revenue_growth_yoy',
+    'fund_revenue_accel',
+    'fund_net_margin',
+    'fund_margin_trend',
+    'fund_fcf_margin',
+    'fund_leverage',
+    'fund_roe',
+    'fund_share_change_yoy',
+    'fund_earnings_yield',
+    'fund_filing_age',
+  ],
 ]
 
-export function computeFeaturesAtDate(bars: DailyBar[], dateIndex: number): number[] | null {
+export const FUNDAMENTAL_FEATURE_COUNT = 10
+/** Sentinel for fund_filing_age when a name has no usable filing at the
+ * sample date (ETF, non-filer, or pre-coverage history). */
+export const FUNDAMENTAL_MISSING_AGE_DAYS = 400
+
+export function computeFeaturesAtDate(
+  bars: DailyBar[],
+  dateIndex: number,
+  fundamentals?: FundamentalsTimeline | null,
+): number[] | null {
   if (dateIndex < 252) return null  // need 252 bars for the 1-year features
   const window = bars.slice(0, dateIndex)
   const closes = window.map((bar) => bar.close)
@@ -296,7 +357,336 @@ export function computeFeaturesAtDate(bars: DailyBar[], dateIndex: number): numb
     // Range/extension (2)
     rangeCompression,
     velocityAccel,
+    // Fundamentals (10) — point-in-time as of this bar's date
+    ...fundamentalFeaturesAt(fundamentals ?? null, bars[dateIndex].date, lastClose),
   ]
+}
+
+/* =========================================================================
+   Point-in-time fundamentals (SEC EDGAR via the backend's
+   /fundamentals/history endpoint)
+   -------------------------------------------------------------------------
+   The endpoint returns EVERY filing occurrence (originals + restatements)
+   with both the period `end` and the `filed` date. At a sample date t we
+   use only rows with filed <= t, then per period keep the latest such
+   filing — exactly what an investor could have known at t. TTM totals use
+   latest-FY + post-FY quarters − matching prior-year quarters (US filers
+   never file Q4 flows separately), falling back to four contiguous
+   quarters, then to the latest annual.
+   ========================================================================= */
+
+type FundamentalRow = {
+  end: number      // period end, ms epoch
+  start: number | null
+  filed: number    // ms epoch
+  value: number
+  span: 'quarter' | 'annual' | 'instant' | 'other'
+}
+
+type FundamentalSnapshot = {
+  filed: number
+  revenueGrowthYoY: number | null
+  revenueAccel: number | null
+  netMargin: number | null
+  marginTrend: number | null
+  fcfMargin: number | null
+  leverage: number | null
+  roe: number | null
+  shareChangeYoY: number | null
+  ttmNetIncome: number | null
+  shares: number | null
+}
+
+export class FundamentalsTimeline {
+  private readonly snapshots: FundamentalSnapshot[]
+
+  private constructor(snapshots: FundamentalSnapshot[]) {
+    this.snapshots = snapshots
+  }
+
+  /** Latest snapshot whose filing date is on or before `dateMs`. */
+  at(dateMs: number): FundamentalSnapshot | null {
+    let lo = 0
+    let hi = this.snapshots.length - 1
+    let best = -1
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1
+      if (this.snapshots[mid].filed <= dateMs) {
+        best = mid
+        lo = mid + 1
+      } else {
+        hi = mid - 1
+      }
+    }
+    return best >= 0 ? this.snapshots[best] : null
+  }
+
+  get size(): number {
+    return this.snapshots.length
+  }
+
+  /** Build from the backend's /fundamentals/history payload: one snapshot
+   * per distinct filing date, each computed using only rows filed by then. */
+  static fromHistory(payload: {
+    series?: Record<string, Array<Record<string, unknown>>>
+  }): FundamentalsTimeline {
+    const series = payload.series ?? {}
+    const parse = (key: string): FundamentalRow[] =>
+      (series[key] ?? [])
+        .map((row) => ({
+          end: Date.parse(String(row.end ?? '')),
+          start: row.start ? Date.parse(String(row.start)) : null,
+          filed: Date.parse(String(row.filed ?? '')),
+          value: Number(row.value),
+          span: (row.span as FundamentalRow['span']) ?? 'other',
+        }))
+        .filter((row) => Number.isFinite(row.end) && Number.isFinite(row.filed) && Number.isFinite(row.value))
+
+    const revenue = parse('revenue')
+    const netIncome = parse('netIncome')
+    const cashFlow = parse('operatingCashFlow')
+    const capex = parse('capex')
+    const assets = parse('assets')
+    const liabilities = parse('liabilities')
+    const equity = parse('equity')
+    const shares = parse('shares')
+
+    const filedDates = new Set<number>()
+    for (const rows of [revenue, netIncome, cashFlow, assets, equity, shares]) {
+      for (const row of rows) filedDates.add(row.filed)
+    }
+    const sortedFiled = [...filedDates].sort((a, b) => a - b)
+
+    const snapshots: FundamentalSnapshot[] = []
+    for (const filed of sortedFiled) {
+      const rev = visibleAt(revenue, filed)
+      const ni = visibleAt(netIncome, filed)
+      const cfo = visibleAt(cashFlow, filed)
+      const cap = visibleAt(capex, filed)
+      const ast = visibleAt(assets, filed)
+      const lia = visibleAt(liabilities, filed)
+      const eq = visibleAt(equity, filed)
+      const sh = visibleAt(shares, filed)
+
+      const ttmRev = ttmOf(rev)
+      const ttmNi = ttmOf(ni)
+      const latestRevEnd = rev.length > 0 ? rev[rev.length - 1].end : null
+
+      let revenueGrowthYoY: number | null = null
+      let revenueAccel: number | null = null
+      let marginTrend: number | null = null
+      if (ttmRev != null && latestRevEnd != null) {
+        const priorEnd = shiftYears(latestRevEnd, -1)
+        const priorTtm = ttmOf(rev, priorEnd)
+        if (priorTtm != null && priorTtm > 0) {
+          revenueGrowthYoY = (ttmRev / priorTtm - 1) * 100
+          const lagEnd = shiftMonths(latestRevEnd, -3)
+          const lagTtm = ttmOf(rev, lagEnd)
+          const lagPrior = ttmOf(rev, shiftYears(lagEnd, -1))
+          if (lagTtm != null && lagPrior != null && lagPrior > 0) {
+            revenueAccel = revenueGrowthYoY - (lagTtm / lagPrior - 1) * 100
+          }
+        }
+        if (ttmNi != null && ttmRev > 0) {
+          const priorNi = ttmOf(ni, priorEnd)
+          const priorRev = ttmOf(rev, priorEnd)
+          if (priorNi != null && priorRev != null && priorRev > 0) {
+            marginTrend = (ttmNi / ttmRev) * 100 - (priorNi / priorRev) * 100
+          }
+        }
+      }
+
+      const netMargin =
+        ttmRev != null && ttmRev > 0 && ttmNi != null ? (ttmNi / ttmRev) * 100 : null
+
+      let fcfMargin: number | null = null
+      const ttmCfo = ttmOf(cfo)
+      if (ttmCfo != null && ttmRev != null && ttmRev > 0) {
+        const ttmCap = ttmOf(cap) ?? 0
+        fcfMargin = ((ttmCfo - Math.abs(ttmCap)) / ttmRev) * 100
+      }
+
+      const lastAsset = lastInstant(ast)
+      const lastLiability = lastInstant(lia)
+      const leverage =
+        lastAsset != null && lastAsset > 0 && lastLiability != null
+          ? (lastLiability / lastAsset) * 100
+          : null
+
+      const lastEquity = lastInstant(eq)
+      const roe =
+        ttmNi != null && lastEquity != null && lastEquity > 0
+          ? (ttmNi / lastEquity) * 100
+          : null
+
+      const lastShares = lastInstant(sh)
+      let shareChangeYoY: number | null = null
+      if (sh.length >= 2 && lastShares != null && lastShares > 0) {
+        const latest = sh[sh.length - 1]
+        const prior = closestByEnd(sh, shiftYears(latest.end, -1), 100)
+        if (prior && prior.value > 0 && prior !== latest) {
+          shareChangeYoY = (latest.value / prior.value - 1) * 100
+        }
+      }
+
+      snapshots.push({
+        filed,
+        revenueGrowthYoY,
+        revenueAccel,
+        netMargin,
+        marginTrend,
+        fcfMargin,
+        leverage,
+        roe,
+        shareChangeYoY,
+        ttmNetIncome: ttmNi,
+        shares: lastShares,
+      })
+    }
+    return new FundamentalsTimeline(snapshots)
+  }
+}
+
+/** Rows filed on or before `dateMs`, deduped per period keeping the latest
+ * such filing, sorted by period end — the point-in-time view. */
+function visibleAt(rows: FundamentalRow[], dateMs: number): FundamentalRow[] {
+  const byPeriod = new Map<string, FundamentalRow>()
+  for (const row of rows) {
+    if (row.filed > dateMs) continue
+    const key = `${row.start ?? 'instant'}:${row.end}`
+    const existing = byPeriod.get(key)
+    if (!existing || row.filed > existing.filed) byPeriod.set(key, row)
+  }
+  return [...byPeriod.values()].sort((a, b) => a.end - b.end)
+}
+
+/** TTM flow total at `asOf` (default: latest available period end). */
+function ttmOf(rows: FundamentalRow[], asOf?: number): number | null {
+  const eligible = asOf == null ? rows : rows.filter((row) => row.end <= asOf)
+  if (eligible.length === 0) return null
+  const annuals = eligible.filter((row) => row.span === 'annual')
+  const quarters = eligible.filter((row) => row.span === 'quarter')
+  if (annuals.length > 0) {
+    const fy = annuals[annuals.length - 1]
+    const after = quarters.filter((q) => q.end > fy.end)
+    if (after.length === 0) return fy.value
+    let sumAfter = 0
+    let sumPrior = 0
+    let matched = true
+    for (const quarter of after) {
+      sumAfter += quarter.value
+      const prior = closestByEnd(quarters, shiftYears(quarter.end, -1), 21)
+      if (!prior) {
+        matched = false
+        break
+      }
+      sumPrior += prior.value
+    }
+    if (matched) return fy.value + sumAfter - sumPrior
+  }
+  if (quarters.length >= 4) {
+    const last4 = quarters.slice(-4)
+    const spanDays = (last4[3].end - last4[0].end) / 86_400_000
+    if (spanDays >= 240 && spanDays <= 320) {
+      return last4.reduce((sum, row) => sum + row.value, 0)
+    }
+  }
+  return annuals.length > 0 ? annuals[annuals.length - 1].value : null
+}
+
+function lastInstant(rows: FundamentalRow[]): number | null {
+  return rows.length > 0 ? rows[rows.length - 1].value : null
+}
+
+function closestByEnd(
+  rows: FundamentalRow[],
+  targetMs: number,
+  toleranceDays: number,
+): FundamentalRow | null {
+  let best: FundamentalRow | null = null
+  let bestDelta = toleranceDays + 1
+  for (const row of rows) {
+    const delta = Math.abs(row.end - targetMs) / 86_400_000
+    if (delta < bestDelta) {
+      best = row
+      bestDelta = delta
+    }
+  }
+  return best
+}
+
+function shiftYears(ms: number, years: number): number {
+  const date = new Date(ms)
+  return Date.UTC(date.getUTCFullYear() + years, date.getUTCMonth(), date.getUTCDate())
+}
+
+function shiftMonths(ms: number, months: number): number {
+  const date = new Date(ms)
+  return Date.UTC(date.getUTCFullYear(), date.getUTCMonth() + months, date.getUTCDate())
+}
+
+const clampTo = (value: number | null, lo: number, hi: number): number =>
+  value == null || !Number.isFinite(value) ? 0 : Math.max(lo, Math.min(hi, value))
+
+/** The 10 fundamental feature values at a sample date. Missing data maps
+ * to 0 (≈ cross-sectional neutral after Z-scoring) with fund_filing_age
+ * pinned at the missing sentinel so the model can tell "no data" apart
+ * from "average company". */
+function fundamentalFeaturesAt(
+  fundamentals: FundamentalsTimeline | null,
+  isoDate: string,
+  lastClose: number,
+): number[] {
+  const dateMs = Date.parse(isoDate)
+  const snap = fundamentals && Number.isFinite(dateMs) ? fundamentals.at(dateMs) : null
+  if (!snap) {
+    return [0, 0, 0, 0, 0, 0, 0, 0, 0, FUNDAMENTAL_MISSING_AGE_DAYS]
+  }
+  const earningsYield =
+    snap.ttmNetIncome != null && snap.shares != null && snap.shares > 0 && lastClose > 0
+      ? (snap.ttmNetIncome / (snap.shares * lastClose)) * 100
+      : null
+  const ageDays = Math.min(
+    FUNDAMENTAL_MISSING_AGE_DAYS,
+    Math.max(0, (dateMs - snap.filed) / 86_400_000),
+  )
+  return [
+    clampTo(snap.revenueGrowthYoY, -100, 300),
+    clampTo(snap.revenueAccel, -100, 100),
+    clampTo(snap.netMargin, -100, 100),
+    clampTo(snap.marginTrend, -50, 50),
+    clampTo(snap.fcfMargin, -100, 100),
+    clampTo(snap.leverage, 0, 200),
+    clampTo(snap.roe, -150, 150),
+    clampTo(snap.shareChangeYoY, -50, 50),
+    clampTo(earningsYield, -25, 25),
+    ageDays,
+  ]
+}
+
+/** In-module cache: one history fetch per ticker per process. */
+const fundamentalsCache = new Map<string, Promise<FundamentalsTimeline | null>>()
+
+export function fetchFundamentalsTimeline(ticker: string): Promise<FundamentalsTimeline | null> {
+  const cached = fundamentalsCache.get(ticker)
+  if (cached) return cached
+  const promise = (async () => {
+    try {
+      const base = import.meta.env.VITE_ORACLE_BACKEND_URL ?? 'http://127.0.0.1:8787'
+      const response = await fetch(
+        `${base}/fundamentals/history?symbol=${encodeURIComponent(ticker)}`,
+        { headers: { Accept: 'application/json' } },
+      )
+      if (!response.ok) return null  // 404 = ETF / non-filer — features stay neutral
+      const payload = (await response.json()) as Parameters<typeof FundamentalsTimeline.fromHistory>[0]
+      const timeline = FundamentalsTimeline.fromHistory(payload)
+      return timeline.size > 0 ? timeline : null
+    } catch {
+      return null
+    }
+  })()
+  fundamentalsCache.set(ticker, promise)
+  return promise
 }
 
 export function computeForwardReturn(
@@ -319,6 +709,8 @@ export type DatasetBuildResult = {
     tickersWithUsableBars: number
     tickersWithZeroBars: number
     tickersBelowMinBars: number
+    /** Names whose samples carry real point-in-time EDGAR fundamentals. */
+    tickersWithFundamentals?: number
     perTickerSummary: Array<{
       ticker: string
       bars: number
@@ -397,6 +789,7 @@ export async function buildHistoricalDataset(
   let tickersWithUsableBars = 0
   let tickersWithZeroBars = 0
   let tickersBelowMinBars = 0
+  let tickersWithFundamentals = 0
 
   for (let t = 0; t < tickers.length; t++) {
     const ticker = tickers[t]
@@ -422,11 +815,15 @@ export async function buildHistoricalDataset(
       })
       continue
     }
+    // Point-in-time fundamentals (null for ETFs/non-filers — the ten
+    // fundamental features stay at their neutral encoding for them).
+    const fundamentals = await fetchFundamentalsTimeline(ticker)
+    if (fundamentals) tickersWithFundamentals++
     let generated = 0
     // Need 252 bars history (for 252d momentum, vol, moments) + 120 future
     // (longest horizon in the ensemble)
     for (let i = 252; i < bars.length - 120; i += cadence) {
-      const features = computeFeaturesAtDate(bars, i)
+      const features = computeFeaturesAtDate(bars, i, fundamentals)
       if (!features) continue
       const fwd5 = computeForwardReturn(bars, i, 5)
       const fwd20 = computeForwardReturn(bars, i, 20)
@@ -460,9 +857,36 @@ export async function buildHistoricalDataset(
       tickersWithUsableBars,
       tickersWithZeroBars,
       tickersBelowMinBars,
+      tickersWithFundamentals,
       perTickerSummary,
     },
   }
+}
+
+/**
+ * Per-feature mean/std of the RAW (pre-normalization) feature values.
+ * These are what live single-name prediction must normalize against —
+ * training Z-scores cross-sectionally per date, and the global raw stats
+ * are the stationary approximation of that transform for a lone ticker.
+ * Compute AFTER pruning so the columns line up with the stored model.
+ */
+export function computeFeatureStats(samples: HistoricalSample[]): {
+  means: number[]
+  stds: number[]
+} {
+  if (samples.length === 0) return { means: [], stds: [] }
+  const featureCount = samples[0].rawFeatures.length
+  const means = new Array(featureCount).fill(0)
+  const stds = new Array(featureCount).fill(1)
+  for (let f = 0; f < featureCount; f++) {
+    const values = samples.map((sample) => sample.rawFeatures[f])
+    const mean = values.reduce((sum, value) => sum + value, 0) / values.length
+    const variance =
+      values.reduce((sum, value) => sum + (value - mean) ** 2, 0) / values.length
+    means[f] = mean
+    stds[f] = Math.sqrt(Math.max(1e-12, variance))
+  }
+  return { means, stds }
 }
 
 /* =========================================================================
@@ -489,6 +913,13 @@ export type WalkForwardResult = {
   maxDrawdown: number
   // Feature importance — IC drop when each feature is permuted
   featureImportance: number[]
+  // Split-conformal interval diagnostics (Romano-Patterson-Candès 2019):
+  // share of test actuals inside the conformalized 80% interval (target
+  // 0.80) and the interval's mean width in return points. Absent when
+  // interval training was skipped.
+  intervalCoverage80?: number
+  intervalMeanWidthPct?: number
+  conformalOffsetPct?: number
 }
 
 /**
@@ -519,6 +950,15 @@ export function walkForwardStep(
     horizonDays?: number
     txCostBps?: number
     modelOptions?: { numTrees?: number; depth?: number; learningRate?: number }
+    /** Train q10/q90 models + split-conformal calibration per step (two
+     * extra GBT fits). Default true; the nested-CV inner loop turns it
+     * off for speed. */
+    computeIntervals?: boolean
+    /** Column of the long-horizon momentum feature used as the naive
+     * baseline. Callers that prune/reorder features MUST pass the real
+     * index (featureNames.indexOf('momentum_252d')) or the "edge over
+     * momentum" metric silently compares against the wrong feature. */
+    baselineMomentumFeatureIndex?: number
   } = {},
 ): WalkForwardResult | null {
   if (splitIndex <= 0 || splitIndex + testSize > samples.length) return null
@@ -550,6 +990,53 @@ export function walkForwardStep(
 
   const predictions = testSamples.map((sample) => predictGradientBoosting(model, sample.features))
   const actuals = testSamples.map((sample) => sample.forwardReturn20d)
+
+  // SPLIT-CONFORMAL 80% INTERVALS (Romano, Patterson, Candès 2019 —
+  // "Conformalized Quantile Regression", NeurIPS). Fit q10/q90 on the
+  // older 75% of train; on the newest 25% (calibration — still entirely
+  // before the test window, so no leakage) compute conformity scores
+  // E = max(q10(x) − y, y − q90(x)); the finite-sample (1−α) quantile of
+  // E widens the test interval to [q10−Q, q90+Q], which guarantees ≥80%
+  // marginal coverage under exchangeability. We then MEASURE realized
+  // test coverage instead of asserting it.
+  let intervalCoverage80: number | undefined
+  let intervalMeanWidthPct: number | undefined
+  let conformalOffsetPct: number | undefined
+  if (options.computeIntervals !== false && trainSamples.length >= 200) {
+    const calibrationSize = Math.max(50, Math.floor(trainSamples.length * 0.25))
+    const properTrain = trainSamples.slice(0, trainSamples.length - calibrationSize)
+    const calibration = trainSamples.slice(trainSamples.length - calibrationSize)
+    const properFeatures = properTrain.map((sample) => sample.features)
+    const properTargets = properTrain.map((sample) => sample.forwardReturn20d)
+    const q10Model = fitGradientBoosting(properFeatures, properTargets, {
+      ...options.modelOptions,
+      quantile: 0.1,
+    })
+    const q90Model = fitGradientBoosting(properFeatures, properTargets, {
+      ...options.modelOptions,
+      quantile: 0.9,
+    })
+    const scores = calibration.map((sample) => {
+      const lo = predictGradientBoosting(q10Model, sample.features)
+      const hi = predictGradientBoosting(q90Model, sample.features)
+      return Math.max(lo - sample.forwardReturn20d, sample.forwardReturn20d - hi)
+    })
+    scores.sort((a, b) => a - b)
+    const n = scores.length
+    const rank = Math.min(n - 1, Math.ceil((n + 1) * 0.8) - 1)
+    const offset = scores[rank]
+    let covered = 0
+    let widthSum = 0
+    for (const sample of testSamples) {
+      const lo = predictGradientBoosting(q10Model, sample.features) - offset
+      const hi = predictGradientBoosting(q90Model, sample.features) + offset
+      if (sample.forwardReturn20d >= lo && sample.forwardReturn20d <= hi) covered++
+      widthSum += hi - lo
+    }
+    intervalCoverage80 = covered / testSamples.length
+    intervalMeanWidthPct = widthSum / testSamples.length
+    conformalOffsetPct = offset
+  }
 
   const ic = pearsonCorrelation(predictions, actuals)
   const spearmanIc = spearmanCorrelation(predictions, actuals)
@@ -591,8 +1078,9 @@ export function walkForwardStep(
   const randomPredictions = predictions.map(() => Math.random())
   const baselineRandomIc = pearsonCorrelation(randomPredictions, actuals)
 
-  // BASELINE: 12-month momentum (feature index 2 = momentum_120d)
-  const momentumPredictions = testSamples.map((sample) => sample.features[2])
+  // BASELINE: long-horizon momentum ranking (Jegadeesh-Titman)
+  const momentumIndex = options.baselineMomentumFeatureIndex ?? 2
+  const momentumPredictions = testSamples.map((sample) => sample.features[momentumIndex])
   const baselineMomentumIc = pearsonCorrelation(momentumPredictions, actuals)
 
   // DRAWDOWN: cumulative L/S return path through the test window
@@ -652,6 +1140,9 @@ export function walkForwardStep(
     cumulativeReturn,
     maxDrawdown: maxDD,
     featureImportance,
+    intervalCoverage80,
+    intervalMeanWidthPct,
+    conformalOffsetPct,
   }
 }
 
@@ -686,6 +1177,11 @@ export type HorizonModelBundle = {
   meanIC: number
   meanHitRate: number
   icCI: ConfidenceInterval
+  /** Split-conformal widening for [p10−Q, p90+Q] (Romano et al. 2019),
+   * calibrated on the most recent held-out slice. Add to live intervals. */
+  conformalOffsetPct?: number
+  /** How many held-out samples calibrated the offset. */
+  conformalCalibrationSize?: number
 }
 
 export type FullBacktestResult = {
@@ -714,6 +1210,11 @@ export type FullBacktestResult = {
   hitRateCI: ConfidenceInterval
   longShortReturnNetCI: ConfidenceInterval
   longShortSharpeCI: ConfidenceInterval
+  /** Out-of-sample coverage of the conformalized 80% interval across
+   * walk-forward steps (target 0.80) with bootstrap CI, plus mean width.
+   * Honest interval validation per Romano et al. 2019. */
+  intervalCoverage80CI?: ConfidenceInterval
+  intervalMeanWidthPct?: number
   hyperparameters: { numTrees: number; depth: number; learningRate: number }
 }
 
@@ -784,6 +1285,7 @@ function nestedCvHyperparameterSearch(
         embargoDays,
         horizonDays,
         modelOptions: params,
+        computeIntervals: false,  // hyperparameter scoring needs IC only
       })
       if (result) {
         total += result.informationCoefficient
@@ -814,6 +1316,8 @@ export function runWalkForwardBacktest(
     modelOptions?: { numTrees?: number; depth?: number; learningRate?: number }
     /** When true, runs nested CV to pick hyperparameters. Default true. */
     nestedHyperparameterSearch?: boolean
+    /** See walkForwardStep — pass featureNames.indexOf('momentum_252d'). */
+    baselineMomentumFeatureIndex?: number
   } = {},
 ): FullBacktestResult | null {
   const sorted = indexSamples(samples)
@@ -846,13 +1350,19 @@ export function runWalkForwardBacktest(
       horizonDays,
       txCostBps,
       modelOptions: chosenParams,
+      baselineMomentumFeatureIndex: options.baselineMomentumFeatureIndex,
     })
     if (result) steps.push(result)
     splitIndex += stepSize
   }
   if (steps.length === 0) return null
 
-  // Final ensemble: per-horizon median + p10 + p90 models
+  // Final ensemble: per-horizon median + p10 + p90 models.
+  // Median trains on ALL samples (best point estimate). Quantile models
+  // train on the older 85% with the newest 15% held out as the conformal
+  // calibration slice (split-conformal needs calibration data the
+  // quantile models never saw — Romano et al. 2019), purged by the
+  // horizon so calibration labels don't overlap quantile training.
   const allFeatures = sorted.map((sample) => sample.features)
   const targetForHorizon = (sample: HistoricalSample, horizon: HorizonKey): number => {
     if (horizon === 5) return sample.forwardReturn5d
@@ -866,14 +1376,40 @@ export function runWalkForwardBacktest(
       ...chosenParams,
       quantile: 0.5,
     })
-    const p10Model = fitGradientBoosting(allFeatures, horizonTargets, {
+
+    const calibrationSize = Math.max(100, Math.floor(sorted.length * 0.15))
+    const calibrationStart = sorted.length - calibrationSize
+    // Purge: quantile-train samples whose forward window reaches into the
+    // calibration slice would leak label information into the models the
+    // slice is supposed to test.
+    const calibrationStartTime = new Date(sorted[calibrationStart].asOf).getTime()
+    const quantileTrain = sorted
+      .slice(0, calibrationStart)
+      .filter(
+        (sample) =>
+          new Date(sample.asOf).getTime() + horizon * 86_400_000 <= calibrationStartTime,
+      )
+    const quantileFeatures = quantileTrain.map((sample) => sample.features)
+    const quantileTargets = quantileTrain.map((sample) => targetForHorizon(sample, horizon))
+    const p10Model = fitGradientBoosting(quantileFeatures, quantileTargets, {
       ...chosenParams,
       quantile: 0.1,
     })
-    const p90Model = fitGradientBoosting(allFeatures, horizonTargets, {
+    const p90Model = fitGradientBoosting(quantileFeatures, quantileTargets, {
       ...chosenParams,
       quantile: 0.9,
     })
+    const calibration = sorted.slice(calibrationStart)
+    const scores = calibration.map((sample) => {
+      const lo = predictGradientBoosting(p10Model, sample.features)
+      const hi = predictGradientBoosting(p90Model, sample.features)
+      const y = targetForHorizon(sample, horizon)
+      return Math.max(lo - y, y - hi)
+    })
+    scores.sort((a, b) => a - b)
+    const rank = Math.min(scores.length - 1, Math.ceil((scores.length + 1) * 0.8) - 1)
+    const conformalOffsetPct = scores.length > 0 ? scores[rank] : 0
+
     // Estimate this horizon's IC using a quick in-sample correlation
     // between median predictions and actuals (cheap proxy — real IC
     // would need its own walk-forward at this horizon).
@@ -889,6 +1425,8 @@ export function runWalkForwardBacktest(
       meanIC: inSampleIC,
       meanHitRate: hits / Math.max(1, predictions.length),
       icCI: { lower: inSampleIC, mean: inSampleIC, upper: inSampleIC },
+      conformalOffsetPct,
+      conformalCalibrationSize: calibration.length,
     }
   })
   const trainedModel = horizonBundles.find((bundle) => bundle.horizon === 20)?.medianModel ??
@@ -925,6 +1463,16 @@ export function runWalkForwardBacktest(
   const hitRateCI = bootstrapCI(steps.map((step) => step.hitRate))
   const longShortReturnNetCI = bootstrapCI(steps.map((step) => step.longShortReturnNet))
   const longShortSharpeCI = bootstrapCI(steps.map((step) => step.longShortSharpe))
+  const coverageSteps = steps.filter((step) => step.intervalCoverage80 != null)
+  const intervalCoverage80CI =
+    coverageSteps.length > 0
+      ? bootstrapCI(coverageSteps.map((step) => step.intervalCoverage80!))
+      : undefined
+  const intervalMeanWidthPct =
+    coverageSteps.length > 0
+      ? coverageSteps.reduce((sum, step) => sum + (step.intervalMeanWidthPct ?? 0), 0) /
+        coverageSteps.length
+      : undefined
 
   return {
     steps,
@@ -948,6 +1496,8 @@ export function runWalkForwardBacktest(
     hitRateCI,
     longShortReturnNetCI,
     longShortSharpeCI,
+    intervalCoverage80CI,
+    intervalMeanWidthPct,
     hyperparameters: {
       numTrees: chosenParams.numTrees ?? 50,
       depth: chosenParams.depth ?? 3,
@@ -967,24 +1517,36 @@ export function runWalkForwardBacktest(
    ========================================================================= */
 
 /**
- * Survivors of the 2026-05-12 full-feature run (5,340 samples, 35 steps):
- * every feature whose mean permutation importance was >= +0.001 IC.
- * Volatility features dominated; momentum beyond 60d, skew, and most
- * trend-extension features measured as noise or actively harmful.
+ * Survivors of the 2026-06-10 full-feature run (40 features incl. 10
+ * point-in-time EDGAR fundamentals; 19,658 samples, 221 tickers, 35
+ * out-of-sample steps): every feature whose mean permutation importance
+ * was >= +0.001 IC. Volatility + long momentum still dominate; five
+ * fundamental features earned their place — revenue acceleration and
+ * revenue growth ranked 6th-7th overall (Jegadeesh-Livnat 2006 revenue
+ * momentum), then leverage, net margin, and earnings yield. Notably
+ * fund_margin_trend measured most harmful of all 40 (-0.011) and
+ * momentum_20d/60d + Amihud, survivors of the smaller 2026-05-12 study
+ * (5,340 samples, 60 names), measured negative on the wider universe.
  */
 export const PRUNED_FEATURE_NAMES: string[] = [
-  'volatility_20d',
   'volatility_252d',
-  'kurt_252d',
-  'range_compression_20d',
-  'momentum_60d',
-  'vol_change_60_20',
-  'price_to_low_60d',
+  'volatility_20d',
   'momentum_252d',
-  'amihud_illiquidity_20d',
+  'volatility_60d',
+  'price_to_low_60d',
+  'fund_revenue_accel',
+  'fund_revenue_growth_yoy',
+  'momentum_5d',
+  'fund_leverage',
+  'momentum_120d',
+  'fund_net_margin',
+  'price_to_high_252d',
+  'range_compression_20d',
+  'sma_200_distance',
   'sma_50_distance',
-  'momentum_20d',
-  'price_velocity_acceleration',
+  'price_to_high_60d',
+  'vol_change_60_20',
+  'fund_earnings_yield',
 ]
 
 /**

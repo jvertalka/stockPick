@@ -3,6 +3,7 @@
 import {
   PRUNED_FEATURE_NAMES,
   buildHistoricalDataset,
+  computeFeatureStats,
   pruneSampleFeatures,
   runWalkForwardBacktest,
   type DatasetBuildResult,
@@ -22,8 +23,9 @@ import {
  *   { type: 'error', message }
  *
  * Moving the dataset build + walk-forward training off the main thread
- * means the UI stays responsive (60 FPS) during the 20-60 second
- * compute. Vite handles bundling automatically when imported via
+ * means the UI stays responsive (60 FPS) during the multi-minute
+ * compute (~200-name universe with conformal interval fits). Vite
+ * handles bundling automatically when imported via
  * `new Worker(new URL('./backtest.worker.ts', import.meta.url),
  * { type: 'module' })`.
  */
@@ -39,7 +41,13 @@ type RunMessage = {
 type WorkerOutbound =
   | { type: 'progress'; current: number; total: number; ticker: string }
   | { type: 'dataset-built'; diagnostics: DatasetBuildResult['diagnostics']; sampleCount: number }
-  | { type: 'done'; result: FullBacktestResult }
+  | {
+      type: 'done'
+      result: FullBacktestResult
+      /** Raw-feature mean/std for the pruned columns — what live
+       * predictions must normalize against (NOT 0/1). */
+      featureStats: { means: number[]; stds: number[] }
+    }
   | { type: 'error'; message: string }
 
 const ctx = self as unknown as DedicatedWorkerGlobalScope
@@ -78,18 +86,27 @@ ctx.onmessage = async (event: MessageEvent<RunMessage>) => {
     // with zero/negative permutation importance.
     const pruned = pruneSampleFeatures(built.samples, PRUNED_FEATURE_NAMES)
 
+    // Test window ≈ one cross-sectional date so quintile long-short
+    // portfolios are formed within a date, and the step count stays
+    // manageable as the universe widens.
+    const testSize = Math.max(60, built.diagnostics.tickersWithUsableBars)
     const result = runWalkForwardBacktest(pruned.samples, {
       initialTrainSize: Math.floor(pruned.samples.length * 0.6),
-      testSize: 60,
-      stepSize: 60,
+      testSize,
+      stepSize: testSize,
       modelOptions,
+      baselineMomentumFeatureIndex: Math.max(0, pruned.featureNames.indexOf('momentum_252d')),
     })
     if (!result) {
       const err: WorkerOutbound = { type: 'error', message: 'Walk-forward validation produced no usable steps.' }
       ctx.postMessage(err)
       return
     }
-    const done: WorkerOutbound = { type: 'done', result }
+    const done: WorkerOutbound = {
+      type: 'done',
+      result,
+      featureStats: computeFeatureStats(pruned.samples),
+    }
     ctx.postMessage(done)
   } catch (error) {
     const err: WorkerOutbound = {

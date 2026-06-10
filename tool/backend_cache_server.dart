@@ -200,6 +200,51 @@ class BackendCacheServer {
         );
         return;
       }
+      if (path == '/ml/model') {
+        // Trained-model store: the backtest CLI PUTs the walk-forward-
+        // validated model bundle here; app instances (dev browser AND the
+        // packaged desktop app) adopt it on boot when it is newer than
+        // their IndexedDB copy. One retrain reaches every surface.
+        final modelFile = File(
+          '${config.cacheDirectory.path}${Platform.pathSeparator}ml_trained_model.json',
+        );
+        if (request.method == 'PUT') {
+          final body = await utf8.decoder.bind(request).join();
+          final decoded = jsonDecode(body);
+          if (decoded is! Map || decoded['model'] == null) {
+            request.response.statusCode = HttpStatus.badRequest;
+            await _writeJson(request.response, {
+              'error': 'invalid_model_payload',
+              'detail': 'Expected a StoredMlModel-shaped JSON object.',
+            });
+            return;
+          }
+          await modelFile.writeAsString(body, flush: true);
+          await _writeJson(request.response, {
+            'ok': true,
+            'bytes': body.length,
+            'trainedAt': decoded['trainedAt'],
+          });
+          return;
+        }
+        if (!await modelFile.exists()) {
+          request.response.statusCode = HttpStatus.notFound;
+          await _writeJson(request.response, {
+            'error': 'no_model',
+            'detail':
+                'No trained model stored yet. Run the backtest CLI with '
+                '--persist or train in the app\'s Model Lab.',
+          });
+          return;
+        }
+        request.response.headers.set(
+          HttpHeaders.contentTypeHeader,
+          'application/json; charset=utf-8',
+        );
+        await request.response.addStream(modelFile.openRead());
+        await request.response.close();
+        return;
+      }
       if (path == '/fundamentals/history') {
         final symbol =
             request.uri.queryParameters['symbol']?.trim().toUpperCase() ?? '';
@@ -353,7 +398,7 @@ class BackendCacheServer {
     response.headers.set(HttpHeaders.accessControlAllowOriginHeader, '*');
     response.headers.set(
       HttpHeaders.accessControlAllowMethodsHeader,
-      'GET, OPTIONS',
+      'GET, PUT, OPTIONS',
     );
     response.headers.set(
       HttpHeaders.accessControlAllowHeadersHeader,
@@ -2524,11 +2569,20 @@ class SecFundamentalsService {
         },
     ];
 
+    // dedup: false — keep every filing occurrence (originals AND
+    // restatements) so point-in-time consumers can use only what was
+    // filed on or before their sample date.
     var shares = _series(facts, 'dei', const [
       'EntityCommonStockSharesOutstanding',
-    ], 'shares');
+    ], 'shares', dedup: false);
     if (shares.isEmpty) {
-      shares = _series(facts, 'us-gaap', _shareFallbackConcepts, 'shares');
+      shares = _series(
+        facts,
+        'us-gaap',
+        _shareFallbackConcepts,
+        'shares',
+        dedup: false,
+      );
     }
 
     return {
@@ -2536,22 +2590,44 @@ class SecFundamentalsService {
       'cik': cik,
       'source': 'sec-edgar-xbrl',
       'note':
-          'Rows carry period end AND filed dates. Use filed for '
-          'look-ahead-safe (point-in-time) features.',
+          'Rows carry period end AND filed dates, including restatement '
+          'duplicates. For look-ahead-safe features, keep only rows with '
+          'filed <= your sample date, then per period keep the latest '
+          'such filing.',
       'series': {
-        'revenue': rows(_series(facts, 'us-gaap', _revenueConcepts, 'USD')),
+        'revenue': rows(
+          _series(facts, 'us-gaap', _revenueConcepts, 'USD', dedup: false),
+        ),
         'netIncome': rows(
-          _series(facts, 'us-gaap', _netIncomeConcepts, 'USD'),
+          _series(facts, 'us-gaap', _netIncomeConcepts, 'USD', dedup: false),
         ),
         'operatingCashFlow': rows(
-          _series(facts, 'us-gaap', _operatingCashFlowConcepts, 'USD'),
+          _series(
+            facts,
+            'us-gaap',
+            _operatingCashFlowConcepts,
+            'USD',
+            dedup: false,
+          ),
         ),
-        'capex': rows(_series(facts, 'us-gaap', _capexConcepts, 'USD')),
-        'assets': rows(_series(facts, 'us-gaap', const ['Assets'], 'USD')),
+        'capex': rows(
+          _series(facts, 'us-gaap', _capexConcepts, 'USD', dedup: false),
+        ),
+        'assets': rows(
+          _series(facts, 'us-gaap', const ['Assets'], 'USD', dedup: false),
+        ),
         'liabilities': rows(
-          _series(facts, 'us-gaap', const ['Liabilities'], 'USD'),
+          _series(
+            facts,
+            'us-gaap',
+            const ['Liabilities'],
+            'USD',
+            dedup: false,
+          ),
         ),
-        'equity': rows(_series(facts, 'us-gaap', _equityConcepts, 'USD')),
+        'equity': rows(
+          _series(facts, 'us-gaap', _equityConcepts, 'USD', dedup: false),
+        ),
         'shares': rows(shares),
       },
       'metrics': _bySymbol[symbol]?.toJson(),
@@ -2793,15 +2869,20 @@ class SecFundamentalsService {
     return best;
   }
 
-  /// Extract one concept's filing series: statement forms only, deduped by
-  /// period (keeping the latest-filed restatement), sorted by period end.
-  /// Concepts are tried in order; the first with data wins.
+  /// Extract one concept's filing series: statement forms only, sorted by
+  /// period end. Concepts are tried in order; the first with data wins.
+  /// With [dedup] (default), one row per period keeping the latest-filed
+  /// restatement — right for "current best estimate" metrics. With
+  /// dedup: false every filing occurrence is kept so point-in-time
+  /// consumers can reconstruct what was knowable at any date without
+  /// future restatements leaking backward.
   List<_FactRow> _series(
     Map facts,
     String taxonomy,
     List<String> concepts,
-    String unitKey,
-  ) {
+    String unitKey, {
+    bool dedup = true,
+  }) {
     final tax = facts[taxonomy];
     if (tax is! Map) {
       return const [];
@@ -2835,8 +2916,10 @@ class SecFundamentalsService {
           continue;
         }
         final start = DateTime.tryParse((raw['start'] as String?) ?? '');
-        final key =
-            '${start?.toIso8601String() ?? 'instant'}:${end.toIso8601String()}';
+        final key = dedup
+            ? '${start?.toIso8601String() ?? 'instant'}:${end.toIso8601String()}'
+            : '${start?.toIso8601String() ?? 'instant'}:${end.toIso8601String()}'
+                  ':${filed.toIso8601String()}';
         final row = _FactRow(
           end: end,
           start: start,
@@ -2852,7 +2935,12 @@ class SecFundamentalsService {
       if (deduped.isEmpty) {
         continue;
       }
-      return deduped.values.toList()..sort((a, b) => a.end.compareTo(b.end));
+      final list = deduped.values.toList()
+        ..sort((a, b) {
+          final byEnd = a.end.compareTo(b.end);
+          return byEnd != 0 ? byEnd : a.filed.compareTo(b.filed);
+        });
+      return list;
     }
     return const [];
   }

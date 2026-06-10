@@ -1133,22 +1133,26 @@ export function hestonCallPrice(
 
   // P_j = 0.5 + (1/π) · ∫₀^∞ Re[exp(-i·φ·ln K)·f_j(φ) / (i·φ)] dφ
   function pj(j: 1 | 2): number {
+    // Midpoint rule: nodes at (i+½)·dx fully cover [0, upper] INCLUDING
+    // the near-zero region where the integrand carries its largest mass
+    // (it has a finite φ→0 limit). The previous left-open trapezoid
+    // started at φ=dx and skipped that slice entirely, biasing prices
+    // ≈5% low (measured: 9.93 vs BSM 10.45 on the σ_v→0 test; 6.93 vs
+    // the MC-verified 7.27 Albrecher case). Midpoint also avoids
+    // evaluating the removable 1/φ singularity at φ=0 itself.
     const upper = 200
-    const steps = 256
+    const steps = 1024
     const dx = upper / steps
     let sum = 0
-    for (let i = 1; i <= steps; i++) {
-      const phi = i * dx
+    for (let i = 0; i < steps; i++) {
+      const phi = (i + 0.5) * dx
       const f = charFn(phi, j)
       // exp(-i·φ·ln K) · f / (i·φ)
       // exp(-i·φ·ln K) = cos(φ·ln K) - i·sin(φ·ln K)
       const expFactor: Complex = { re: Math.cos(phi * lnK), im: -Math.sin(phi * lnK) }
       const numerator = cMul(expFactor, f)
       // Divide by i·φ: 1/(i·φ) = -i/φ → re = numerator.im / φ
-      const realPart = numerator.im / phi
-      // Trapezoidal weight (endpoints half)
-      const weight = i === steps ? 0.5 : 1
-      sum += weight * realPart * dx
+      sum += (numerator.im / phi) * dx
     }
     return 0.5 + sum / Math.PI
   }
@@ -2198,70 +2202,155 @@ export type GradientBoostingModel = {
   numFeatures: number
 }
 
-function buildBoostTree(
-  features: number[][],
+/* Histogram-based split finding (Ke et al. 2017, "LightGBM: A Highly
+ * Efficient Gradient Boosting Decision Tree", NeurIPS). Instead of
+ * re-sorting every feature column at every node — O(F·N·logN) per node,
+ * which made large fits take hours — features are bucketed ONCE per fit
+ * into ≤64 quantile bins, and each node scans bin statistics in
+ * O(F·(N_node + B)). With B = 64 quantile bins the candidate-threshold
+ * grid is statistically indistinguishable from exact search at our
+ * sample sizes (LightGBM defaults to 255 bins for millions of rows).
+ * The produced tree format is identical to the exact-search version. */
+
+const HISTOGRAM_BINS = 64
+
+type FeatureBins = {
+  /** Ascending candidate thresholds per feature (≤ B−1 after dedup). */
+  edges: Float64Array[]
+  /** Per-feature bin index per sample: number of edges ≤ value. */
+  binIndex: Uint8Array[]
+}
+
+function binFeatures(features: number[][]): FeatureBins {
+  const N = features.length
+  const F = features[0]?.length ?? 0
+  const edges: Float64Array[] = []
+  const binIndex: Uint8Array[] = []
+  for (let f = 0; f < F; f++) {
+    const column = new Float64Array(N)
+    for (let i = 0; i < N; i++) column[i] = features[i][f]
+    const sorted = Float64Array.from(column).sort()
+    const rawEdges: number[] = []
+    for (let b = 1; b < HISTOGRAM_BINS; b++) {
+      const value = sorted[Math.floor((b * N) / HISTOGRAM_BINS)]
+      if (
+        Number.isFinite(value) &&
+        (rawEdges.length === 0 || value > rawEdges[rawEdges.length - 1])
+      ) {
+        rawEdges.push(value)
+      }
+    }
+    const featureEdges = Float64Array.from(rawEdges)
+    const index = new Uint8Array(N)
+    for (let i = 0; i < N; i++) {
+      // Bin = count of edges ≤ value, found by binary search.
+      let lo = 0
+      let hi = featureEdges.length
+      const v = column[i]
+      while (lo < hi) {
+        const mid = (lo + hi) >> 1
+        if (featureEdges[mid] <= v) lo = mid + 1
+        else hi = mid
+      }
+      index[i] = lo
+    }
+    edges.push(featureEdges)
+    binIndex.push(index)
+  }
+  return { edges, binIndex }
+}
+
+function buildBoostTreeBinned(
+  indices: Int32Array,
   residuals: number[],
+  bins: FeatureBins,
   depth: number,
   minSamples = 5,
 ): BoostTreeNode {
-  const N = features.length
+  const N = indices.length
+  let total = 0
+  for (let k = 0; k < N; k++) total += residuals[indices[k]]
+  const mean = N > 0 ? total / N : 0
   if (N <= minSamples || depth === 0) {
-    const mean = residuals.reduce((sum, value) => sum + value, 0) / Math.max(1, residuals.length)
     return { isLeaf: true, value: mean }
   }
-  // Find best split via variance reduction
-  let bestVarReduction = 0
-  let bestFeature = 0
-  let bestThreshold = 0
-  const F = features[0].length
-  const totalMean = residuals.reduce((sum, value) => sum + value, 0) / N
-  const totalVar = residuals.reduce((sum, value) => sum + (value - totalMean) ** 2, 0)
+  let totalSq = 0
+  for (let k = 0; k < N; k++) {
+    const r = residuals[indices[k]]
+    totalSq += r * r
+  }
+  const totalVar = totalSq - (total * total) / N
+
+  const F = bins.binIndex.length
+  let bestGain = 0
+  let bestFeature = -1
+  let bestEdge = -1
+  const sums = new Float64Array(HISTOGRAM_BINS)
+  const squares = new Float64Array(HISTOGRAM_BINS)
+  const counts = new Int32Array(HISTOGRAM_BINS)
   for (let f = 0; f < F; f++) {
-    const sorted = features.map((row, idx) => ({ value: row[f], target: residuals[idx] }))
-      .sort((left, right) => left.value - right.value)
+    const featureEdges = bins.edges[f]
+    if (featureEdges.length === 0) continue  // constant feature
+    sums.fill(0)
+    squares.fill(0)
+    counts.fill(0)
+    const index = bins.binIndex[f]
+    for (let k = 0; k < N; k++) {
+      const i = indices[k]
+      const b = index[i]
+      const r = residuals[i]
+      sums[b] += r
+      squares[b] += r * r
+      counts[b]++
+    }
+    // Prefix scan: splitting after bin t sends bins 0..t left
+    // (value < edges[t] ⟺ binIndex ≤ t), matching predictTree's
+    // `features < threshold` convention.
     let leftSum = 0
-    let leftSumSq = 0
-    let rightSum = sorted.reduce((sum, item) => sum + item.target, 0)
-    let rightSumSq = sorted.reduce((sum, item) => sum + item.target * item.target, 0)
-    for (let i = 1; i < sorted.length; i++) {
-      leftSum += sorted[i - 1].target
-      leftSumSq += sorted[i - 1].target * sorted[i - 1].target
-      rightSum -= sorted[i - 1].target
-      rightSumSq -= sorted[i - 1].target * sorted[i - 1].target
-      if (i < minSamples || N - i < minSamples) continue
-      if (sorted[i].value === sorted[i - 1].value) continue
-      const leftVar = leftSumSq - (leftSum * leftSum) / i
-      const rightVar = rightSumSq - (rightSum * rightSum) / (N - i)
-      const reduction = totalVar - (leftVar + rightVar)
-      if (reduction > bestVarReduction) {
-        bestVarReduction = reduction
+    let leftSq = 0
+    let leftCount = 0
+    for (let t = 0; t < featureEdges.length; t++) {
+      leftSum += sums[t]
+      leftSq += squares[t]
+      leftCount += counts[t]
+      const rightCount = N - leftCount
+      if (leftCount < minSamples || rightCount < minSamples) continue
+      const rightSum = total - leftSum
+      const rightSq = totalSq - leftSq
+      const leftVar = leftSq - (leftSum * leftSum) / leftCount
+      const rightVar = rightSq - (rightSum * rightSum) / rightCount
+      const gain = totalVar - (leftVar + rightVar)
+      if (gain > bestGain) {
+        bestGain = gain
         bestFeature = f
-        bestThreshold = (sorted[i].value + sorted[i - 1].value) / 2
+        bestEdge = t
       }
     }
   }
-  if (bestVarReduction <= 0) {
-    return { isLeaf: true, value: totalMean }
+  if (bestFeature < 0 || bestGain <= 0) {
+    return { isLeaf: true, value: mean }
   }
-  const leftFeatures: number[][] = []
-  const leftResiduals: number[] = []
-  const rightFeatures: number[][] = []
-  const rightResiduals: number[] = []
-  for (let i = 0; i < N; i++) {
-    if (features[i][bestFeature] < bestThreshold) {
-      leftFeatures.push(features[i])
-      leftResiduals.push(residuals[i])
-    } else {
-      rightFeatures.push(features[i])
-      rightResiduals.push(residuals[i])
-    }
+
+  const splitIndex = bins.binIndex[bestFeature]
+  let leftN = 0
+  for (let k = 0; k < N; k++) {
+    if (splitIndex[indices[k]] <= bestEdge) leftN++
+  }
+  const left = new Int32Array(leftN)
+  const right = new Int32Array(N - leftN)
+  let li = 0
+  let ri = 0
+  for (let k = 0; k < N; k++) {
+    const i = indices[k]
+    if (splitIndex[i] <= bestEdge) left[li++] = i
+    else right[ri++] = i
   }
   return {
     isLeaf: false,
     featureIndex: bestFeature,
-    threshold: bestThreshold,
-    left: buildBoostTree(leftFeatures, leftResiduals, depth - 1, minSamples),
-    right: buildBoostTree(rightFeatures, rightResiduals, depth - 1, minSamples),
+    threshold: bins.edges[bestFeature][bestEdge],
+    left: buildBoostTreeBinned(left, residuals, bins, depth - 1, minSamples),
+    right: buildBoostTreeBinned(right, residuals, bins, depth - 1, minSamples),
   }
 }
 
@@ -2310,6 +2399,11 @@ export function fitGradientBoosting(
   const predictions = new Array(targets.length).fill(baseValue)
   const trees: BoostTree[] = []
 
+  // Quantile-bin the features once per fit; every tree reuses the bins.
+  const bins = binFeatures(features)
+  const allIndices = new Int32Array(features.length)
+  for (let i = 0; i < allIndices.length; i++) allIndices[i] = i
+
   for (let m = 0; m < numTrees; m++) {
     let pseudoResiduals: number[]
     if (isQuantile) {
@@ -2320,7 +2414,7 @@ export function fitGradientBoosting(
     } else {
       pseudoResiduals = targets.map((target, i) => target - predictions[i])
     }
-    const root = buildBoostTree(features, pseudoResiduals, depth)
+    const root = buildBoostTreeBinned(allIndices, pseudoResiduals, bins, depth)
     trees.push({ root })
 
     // For quantile loss, refine leaves by replacing leaf mean with the

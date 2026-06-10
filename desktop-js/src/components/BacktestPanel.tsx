@@ -73,7 +73,11 @@ export function BacktestPanel() {
         const data = event.data as
           | { type: 'progress'; current: number; total: number; ticker: string }
           | { type: 'dataset-built'; diagnostics: DatasetBuildResult['diagnostics']; sampleCount: number }
-          | { type: 'done'; result: FullBacktestResult }
+          | {
+              type: 'done'
+              result: FullBacktestResult
+              featureStats: { means: number[]; stds: number[] }
+            }
           | { type: 'error'; message: string }
         if (data.type === 'progress') {
           setProgress({ current: data.current, total: data.total, ticker: data.ticker })
@@ -97,19 +101,21 @@ export function BacktestPanel() {
           const { trainedModel, ...cacheable } = backtestResult
           await kvSet(CACHE_KEY, { ...cacheable, trainedModel })
 
-          const featureMeans = new Array(trainedModel.numFeatures).fill(0)
-          const featureStds = new Array(trainedModel.numFeatures).fill(1)
           // Find the 20-day horizon bundle so we can persist p10/p90 too
           const bundle20 = backtestResult.horizonBundles?.find((entry) => entry.horizon === 20)
           await persistModel(trainedModel, {
-            featureMeans,
-            featureStds,
+            // Raw-feature stats from the training dataset — live
+            // single-name predictions Z-score against these (training
+            // itself Z-scores cross-sectionally per date).
+            featureMeans: data.featureStats.means,
+            featureStds: data.featureStats.stds,
             meanIC: backtestResult.meanIC,
             meanLongShortReturnNet: backtestResult.meanLongShortReturnNet,
             meanLongShortSharpe: backtestResult.meanLongShortSharpe,
             hyperparameters: backtestResult.hyperparameters,
             p10Model: bundle20?.p10Model,
             p90Model: bundle20?.p90Model,
+            conformalOffset20dPct: bundle20?.conformalOffsetPct,
             // Persist every horizon's median so the conviction stack can
             // vote on cross-horizon sign agreement (5/20/60/120d).
             horizonModels: backtestResult.horizonBundles?.map((bundle) => ({
@@ -117,6 +123,7 @@ export function BacktestPanel() {
               medianModel: bundle.medianModel,
               meanIC: bundle.meanIC,
               icCI: bundle.icCI,
+              conformalOffsetPct: bundle.conformalOffsetPct,
             })),
             // The worker trains on the pruned feature set; live predictions
             // must slice the same columns.
@@ -191,6 +198,9 @@ export function BacktestPanel() {
         <details className="backtest-diagnostics">
           <summary>
             Dataset diagnostics: {diagnostics.tickersWithUsableBars}/{diagnostics.tickersAttempted} tickers usable
+            {diagnostics.tickersWithFundamentals != null
+              ? ` · ${diagnostics.tickersWithFundamentals} with point-in-time EDGAR fundamentals`
+              : ''}
             {diagnostics.tickersWithZeroBars > 0
               ? ` · ${diagnostics.tickersWithZeroBars} fetch failures`
               : ''}
@@ -293,6 +303,26 @@ export function BacktestPanel() {
                 -{result.maxDrawdown.toFixed(2)}%
               </strong>
             </div>
+            {result.intervalCoverage80CI ? (
+              <div>
+                <span>80% interval coverage (conformal)</span>
+                <strong
+                  className={tone(
+                    -Math.abs(result.intervalCoverage80CI.mean - 0.8),
+                    -0.07,
+                  )}
+                  title="Share of realized 20d returns inside the conformalized [p10, p90] interval, out of sample (Romano-Patterson-Candès 2019). Target: 80%."
+                >
+                  {(result.intervalCoverage80CI.mean * 100).toFixed(1)}%
+                </strong>
+                <small style={{ fontSize: 10, color: 'var(--muted)' }}>
+                  [{(result.intervalCoverage80CI.lower * 100).toFixed(0)}%, {(result.intervalCoverage80CI.upper * 100).toFixed(0)}%]
+                  {result.intervalMeanWidthPct != null
+                    ? ` · width ${result.intervalMeanWidthPct.toFixed(1)}pp`
+                    : ''}
+                </small>
+              </div>
+            ) : null}
           </div>
 
           <h3 className="backtest-section-title">Baseline comparison (mean IC across walk-forward)</h3>

@@ -24,6 +24,7 @@ async function main() {
     HISTORICAL_FEATURE_NAMES,
     PRUNED_FEATURE_NAMES,
     buildHistoricalDataset,
+    computeFeatureStats,
     labelStepsByRegime,
     pruneSampleFeatures,
     runWalkForwardBacktest,
@@ -32,6 +33,9 @@ async function main() {
   const { cachedFetchDailyBars } = await import('../src/data/marketData')
 
   const usePruned = process.argv.includes('--pruned')
+  // --persist: PUT the trained bundle to the backend's /ml/model store so
+  // every app instance adopts it on next boot (newest trainedAt wins).
+  const persist = process.argv.includes('--persist')
 
   console.log(`Building dataset for ${DEFAULT_BACKTEST_TICKERS.length} tickers (5y bars via proxy)…`)
   const started = Date.now()
@@ -45,6 +49,7 @@ async function main() {
   const d = built.diagnostics
   console.log(
     `Dataset: ${built.samples.length} samples · ${d.tickersWithUsableBars}/${d.tickersAttempted} tickers usable` +
+      ` · ${d.tickersWithFundamentals ?? 0} with point-in-time EDGAR fundamentals` +
       (d.tickersWithZeroBars ? ` · ${d.tickersWithZeroBars} fetch failures` : '') +
       (d.tickersBelowMinBars ? ` · ${d.tickersBelowMinBars} below history threshold` : ''),
   )
@@ -70,10 +75,14 @@ async function main() {
   }
 
   console.log('Running purged+embargoed walk-forward (nested-CV hyperparameters)…')
+  // Test window ≈ one cross-sectional date: quintile portfolios form
+  // within a date and the step count stays stable as the universe widens.
+  const testSize = Math.max(60, d.tickersWithUsableBars)
   const result = runWalkForwardBacktest(samples, {
     initialTrainSize: Math.floor(samples.length * 0.6),
-    testSize: 60,
-    stepSize: 60,
+    testSize,
+    stepSize: testSize,
+    baselineMomentumFeatureIndex: Math.max(0, featureNames.indexOf('momentum_252d')),
   })
   if (!result) {
     console.error('Walk-forward produced no usable steps.')
@@ -113,9 +122,22 @@ async function main() {
   console.log(`Sharpe (ann): ${f(result.meanLongShortSharpe, 2)}  CI [${f(result.longShortSharpeCI.lower, 2)}, ${f(result.longShortSharpeCI.upper, 2)}]`)
   console.log(`Cumulative:   ${f(result.cumulativeReturn, 2)}%  MaxDD: ${f(result.maxDrawdown, 2)}%`)
   console.log('')
-  console.log('--- Multi-horizon in-sample IC ---')
+  if (result.intervalCoverage80CI) {
+    console.log('--- Conformal 80% intervals (Romano-Patterson-Candès 2019, out of sample) ---')
+    console.log(
+      `Coverage: ${f(result.intervalCoverage80CI.mean * 100, 1)}%  CI [${f(result.intervalCoverage80CI.lower * 100, 1)}%, ${f(result.intervalCoverage80CI.upper * 100, 1)}%]  (target 80%)` +
+        (result.intervalMeanWidthPct != null ? `  mean width ${f(result.intervalMeanWidthPct, 1)}pp` : ''),
+    )
+    console.log('')
+  }
+  console.log('--- Multi-horizon in-sample IC + conformal offsets ---')
   for (const bundle of result.horizonBundles) {
-    console.log(`  ${String(bundle.horizon).padStart(3)}d: IC ${f(bundle.meanIC)} hit ${f(bundle.meanHitRate * 100, 1)}%`)
+    console.log(
+      `  ${String(bundle.horizon).padStart(3)}d: IC ${f(bundle.meanIC)} hit ${f(bundle.meanHitRate * 100, 1)}%` +
+        (bundle.conformalOffsetPct != null
+          ? `  conformal +/-${f(bundle.conformalOffsetPct, 2)}pp (n=${bundle.conformalCalibrationSize})`
+          : ''),
+    )
   }
   console.log('')
   console.log('--- Regime breakdown (Hamilton Markov on SPY, point-in-time) ---')
@@ -142,6 +164,50 @@ async function main() {
     console.log(
       `  ${step.testStartDate} → ${step.testEndDate}  IC ${f(step.informationCoefficient)}  hit ${f(step.hitRate * 100, 0)}%  L/S net ${f(step.longShortReturnNet, 2)}%  [${regimeTag}]`,
     )
+  }
+
+  if (persist) {
+    const stats = computeFeatureStats(samples)
+    const bundle20 = result.horizonBundles.find((bundle) => bundle.horizon === 20)
+    const payload = {
+      model: result.trainedModel,
+      p10Model: bundle20?.p10Model,
+      p90Model: bundle20?.p90Model,
+      horizonModels: result.horizonBundles.map((bundle) => ({
+        horizon: bundle.horizon,
+        medianModel: bundle.medianModel,
+        meanIC: bundle.meanIC,
+        icCI: bundle.icCI,
+        conformalOffsetPct: bundle.conformalOffsetPct,
+      })),
+      conformalOffset20dPct: bundle20?.conformalOffsetPct,
+      trainedAt: new Date().toISOString(),
+      featureCount: result.trainedModel.numFeatures,
+      featureNames,
+      featureMeans: stats.means,
+      featureStds: stats.stds,
+      meanIC: result.meanIC,
+      meanLongShortReturnNet: result.meanLongShortReturnNet,
+      meanLongShortSharpe: result.meanLongShortSharpe,
+      hyperparameters: result.hyperparameters,
+    }
+    const base = import.meta.env.VITE_ORACLE_BACKEND_URL ?? 'http://127.0.0.1:8787'
+    const response = await fetch(`${base}/ml/model`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+    const body = (await response.json()) as { ok?: boolean; bytes?: number; detail?: string }
+    if (response.ok && body.ok) {
+      console.log('')
+      console.log(
+        `Persisted trained bundle to backend /ml/model (${((body.bytes ?? 0) / 1024).toFixed(0)} KB) — app instances adopt it on next boot.`,
+      )
+    } else {
+      console.error('')
+      console.error(`Persist FAILED: ${body.detail ?? response.status}`)
+      process.exitCode = 1
+    }
   }
 }
 

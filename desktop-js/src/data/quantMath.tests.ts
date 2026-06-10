@@ -22,6 +22,7 @@ import {
   empiricalJumpStats,
   fitGarch,
   fitGjrGarch,
+  fitGradientBoosting,
   fitHarRv,
   fitMarkovRegime,
   garchVolatilityForecast,
@@ -31,6 +32,7 @@ import {
   impliedVolatility,
   inverseNormalCdf,
   normalCdf,
+  predictGradientBoosting,
   putGreeks,
   quasiUniform,
   riskNeutralProbAbove,
@@ -429,6 +431,50 @@ const tests: Array<() => TestResult> = [
       name: 'Quasi-uniform sequence in [0,1) and varies with index',
       passed: a >= 0 && a < 1 && a !== b && b !== c,
       detail: `q(1)=${a.toFixed(4)}, q(2)=${b.toFixed(4)}, q(100)=${c.toFixed(4)}`,
+    }
+  },
+
+  () => {
+    // GBT (histogram splits) recovers a known linear signal: y = 3·x0 − 2·x1 + ε.
+    // In-sample correlation should be high and quantile heads must order
+    // p10 ≤ p50 ≤ p90 on average (pinball loss, Friedman 2001; histogram
+    // split finding per Ke et al. 2017).
+    const n = 600
+    const features: number[][] = []
+    const targets: number[] = []
+    for (let i = 0; i < n; i++) {
+      const x0 = quasiUniform(i * 3 + 1) * 4 - 2
+      const x1 = quasiUniform(i * 3 + 2) * 4 - 2
+      const noise = (quasiUniform(i * 3 + 3) - 0.5) * 1.5
+      features.push([x0, x1, quasiUniform(i * 7 + 5)])
+      targets.push(3 * x0 - 2 * x1 + noise)
+    }
+    const median = fitGradientBoosting(features, targets, { numTrees: 60, depth: 3, learningRate: 0.1 })
+    const p10 = fitGradientBoosting(features, targets, { numTrees: 60, depth: 3, learningRate: 0.1, quantile: 0.1 })
+    const p90 = fitGradientBoosting(features, targets, { numTrees: 60, depth: 3, learningRate: 0.1, quantile: 0.9 })
+    const predictions = features.map((row) => predictGradientBoosting(median, row))
+    const meanP = predictions.reduce((s, v) => s + v, 0) / n
+    const meanT = targets.reduce((s, v) => s + v, 0) / n
+    let cov = 0
+    let varP = 0
+    let varT = 0
+    for (let i = 0; i < n; i++) {
+      cov += (predictions[i] - meanP) * (targets[i] - meanT)
+      varP += (predictions[i] - meanP) ** 2
+      varT += (targets[i] - meanT) ** 2
+    }
+    const correlation = cov / Math.sqrt(Math.max(1e-12, varP * varT))
+    let ordered = 0
+    for (let i = 0; i < n; i++) {
+      const lo = predictGradientBoosting(p10, features[i])
+      const hi = predictGradientBoosting(p90, features[i])
+      if (lo <= predictions[i] + 0.5 && predictions[i] - 0.5 <= hi && lo < hi) ordered++
+    }
+    const orderedShare = ordered / n
+    return {
+      name: 'GBT recovers linear signal (r > 0.9) with ordered quantile heads',
+      passed: correlation > 0.9 && orderedShare > 0.9,
+      detail: `r=${correlation.toFixed(3)}, quantile-ordered=${(orderedShare * 100).toFixed(0)}%`,
     }
   },
 ]

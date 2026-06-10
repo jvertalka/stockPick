@@ -1,6 +1,7 @@
 import { cachedFetchDailyBars } from './marketData'
 import {
   computeFeaturesAtDate,
+  fetchFundamentalsTimeline,
   HISTORICAL_FEATURE_NAMES,
   type RegimeLabel,
 } from './historicalBacktest'
@@ -41,6 +42,9 @@ export type StoredHorizonModel = {
   medianModel: GradientBoostingModel
   meanIC: number
   icCI: { lower: number; mean: number; upper: number }
+  /** Split-conformal interval widening (Romano et al. 2019) measured on
+   * the backtest's held-out calibration slice. */
+  conformalOffsetPct?: number
 }
 
 export type StoredMlModel = {
@@ -53,6 +57,9 @@ export type StoredMlModel = {
   /** Median models for every trained horizon (5/20/60/120d) — feeds the
    * conviction stack's multi-horizon agreement layer. */
   horizonModels?: StoredHorizonModel[]
+  /** Conformal widening for the 20d p10/p90 interval; live predictions
+   * report [p10−Q, p90+Q] so the 80% label is calibrated, not aspirational. */
+  conformalOffset20dPct?: number
   trainedAt: string
   featureCount: number
   featureNames: string[]
@@ -109,6 +116,7 @@ export async function persistModel(
     /** Median models per horizon from the backtest's ensemble — persisting
      * all of them enables the multi-horizon agreement conviction layer. */
     horizonModels?: StoredHorizonModel[]
+    conformalOffset20dPct?: number
     /** Names of the features the model was trained on, in column order.
      * Defaults to the full set; pruned models MUST pass their subset so
      * live predictions slice the same columns. */
@@ -120,6 +128,7 @@ export async function persistModel(
     p10Model: meta.p10Model,
     p90Model: meta.p90Model,
     horizonModels: meta.horizonModels,
+    conformalOffset20dPct: meta.conformalOffset20dPct,
     trainedAt: new Date().toISOString(),
     featureCount: model.numFeatures,
     featureNames: meta.featureNames ?? HISTORICAL_FEATURE_NAMES,
@@ -135,12 +144,59 @@ export async function persistModel(
     means: meta.featureMeans,
     stds: meta.featureStds,
   })
+  // Mirror to the backend's model store (best effort) so other app
+  // instances — packaged desktop, other browsers — adopt this retrain
+  // on their next boot.
+  void putModelToBackend(stored)
 }
 
+function mlBackendBase(): string {
+  return import.meta.env.VITE_ORACLE_BACKEND_URL ?? 'http://127.0.0.1:8787'
+}
+
+async function putModelToBackend(stored: StoredMlModel): Promise<void> {
+  try {
+    await fetch(`${mlBackendBase()}/ml/model`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(stored),
+    })
+  } catch {
+    // Backend down — IDB copy still works; next persist retries.
+  }
+}
+
+async function fetchModelFromBackend(): Promise<StoredMlModel | null> {
+  try {
+    const response = await fetch(`${mlBackendBase()}/ml/model`, {
+      headers: { Accept: 'application/json' },
+    })
+    if (!response.ok) return null
+    const payload = (await response.json()) as StoredMlModel
+    return payload?.model && payload.featureMeans ? payload : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Load the trained model: newest of the IndexedDB copy and the backend
+ * store wins. The backend store is how a CLI retrain (or another app
+ * instance's run) reaches this instance without re-clicking Run backtest.
+ */
 export async function loadModel(): Promise<StoredMlModel | null> {
-  const stored = await kvGet<StoredMlModel>(MODEL_KEY)
-  if (!stored || !stored.model || !stored.featureMeans) return null
-  return stored
+  const local = await kvGet<StoredMlModel>(MODEL_KEY)
+  const localValid = local?.model && local.featureMeans ? local : null
+  const remote = await fetchModelFromBackend()
+  if (remote && (!localValid || remote.trainedAt > localValid.trainedAt)) {
+    await kvSet(MODEL_KEY, remote)
+    await kvSet(FEATURE_NORM_KEY, {
+      means: remote.featureMeans,
+      stds: remote.featureStds,
+    })
+    return remote
+  }
+  return localValid
 }
 
 export async function clearModel(): Promise<void> {
@@ -163,7 +219,10 @@ export async function predictForTicker(
 ): Promise<LivePrediction | null> {
   const bars = await cachedFetchDailyBars(ticker, '5y')
   if (bars.length < 280) return null
-  const fullFeatures = computeFeaturesAtDate(bars, bars.length - 1)
+  // Same inputs as training: price features + point-in-time fundamentals
+  // (null for ETFs/non-filers — those columns use the neutral encoding).
+  const fundamentals = await fetchFundamentalsTimeline(ticker)
+  const fullFeatures = computeFeaturesAtDate(bars, bars.length - 1, fundamentals)
   if (!fullFeatures) return null
   // Respect the model's feature subset: a model trained on pruned
   // features stores its featureNames, and live features must be sliced
@@ -183,8 +242,16 @@ export async function predictForTicker(
     return (value - mean) / Math.max(1e-12, std)
   })
   const prediction = predictGradientBoosting(model.model, normalized)
-  const p10 = model.p10Model ? predictGradientBoosting(model.p10Model, normalized) : undefined
-  const p90 = model.p90Model ? predictGradientBoosting(model.p90Model, normalized) : undefined
+  // Conformal widening (Romano et al. 2019): the stored offset is what the
+  // backtest measured on held-out calibration data, so the 80% interval
+  // label is earned rather than assumed.
+  const conformal = model.conformalOffset20dPct ?? 0
+  const p10 = model.p10Model
+    ? predictGradientBoosting(model.p10Model, normalized) - conformal
+    : undefined
+  const p90 = model.p90Model
+    ? predictGradientBoosting(model.p90Model, normalized) + conformal
+    : undefined
   // Horizon ensemble: all horizons trained on the same feature matrix
   // (labels differ), so the one normalized vector feeds every median.
   const horizonReturns = model.horizonModels?.length
