@@ -22,3 +22,6 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Bundled CLI artifacts (rebuilt via esbuild on demand)
+tools/*.mjs
