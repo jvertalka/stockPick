@@ -6,7 +6,8 @@ import tseslint from 'typescript-eslint'
 import { defineConfig, globalIgnores } from 'eslint/config'
 
 export default defineConfig([
-  globalIgnores(['dist']),
+  // src-tauri holds Rust build output (incl. generated JS assets) — never lint it.
+  globalIgnores(['dist', 'src-tauri', 'tools/*.mjs']),
   {
     files: ['**/*.{ts,tsx}'],
     extends: [

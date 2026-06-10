@@ -4733,3 +4733,88 @@ table.decision-table td.actions button {
   border-color: color-mix(in srgb, var(--danger) 45%, transparent);
   color: var(--danger);
 }
+
+/* =========================================================================
+   Decision Desk toolbar — mode tabs (Rankings / Compare / Radar) + scenario
+   ========================================================================= */
+
+.desk-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.desk-modes {
+  display: inline-flex;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+
+.desk-modes button {
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  padding: 7px 14px;
+  font-size: var(--t-body);
+  cursor: pointer;
+}
+
+.desk-modes button + button {
+  border-left: 1px solid var(--border-soft);
+}
+
+.desk-modes button.active {
+  background: var(--surface-elev);
+  color: var(--text-strong);
+}
+
+.desk-scenario-note {
+  margin: 0;
+  color: var(--muted);
+  font-size: var(--t-meta);
+}
+
+/* =========================================================================
+   Detail panel collapsible groups (Evidence / Options / Journal)
+   ========================================================================= */
+
+.detail-group {
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+}
+
+.detail-group summary {
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 9px 10px;
+  cursor: pointer;
+  color: var(--text-strong);
+  font-weight: 600;
+  font-size: var(--t-body);
+  user-select: none;
+}
+
+.detail-group summary::-webkit-details-marker {
+  display: none;
+}
+
+.detail-group summary svg {
+  transition: transform 0.15s ease;
+  color: var(--muted);
+}
+
+.detail-group[open] summary svg {
+  transform: rotate(90deg);
+}
+
+.detail-group-body {
+  display: grid;
+  gap: 14px;
+  padding: 4px 10px 12px;
+  border-top: 1px solid var(--border-soft);
+}

@@ -56,6 +56,9 @@ export type DecisionUniverseResponse = {
   universeSize: number
   returned: number
   excludedForInsufficientData?: number
+  /** How many returned names carry SEC EDGAR fundamentals (0 while the
+   * backend's warm queue is still draining). */
+  fundamentalsCoverage?: number
   scenario: string
   marketContext: Partial<MarketContext>
   rawSignals: RawSignal[]
@@ -131,6 +134,7 @@ export async function loadDecisionUniverse({
       universeSize: numberOr(payload.universeSize, payload.rawSignals.length),
       returned: numberOr(payload.returned, payload.rawSignals.length),
       excludedForInsufficientData: numberOr(payload.excludedForInsufficientData, 0),
+      fundamentalsCoverage: numberOr(payload.fundamentalsCoverage, 0),
       scenario: payload.scenario ?? 'base',
       marketContext: payload.marketContext ?? {},
       rawSignals: payload.rawSignals as RawSignal[],
@@ -164,6 +168,7 @@ function fallbackUniverse(
     universeSize: 0,
     returned: 0,
     excludedForInsufficientData: 0,
+    fundamentalsCoverage: 0,
     scenario: 'base',
     marketContext,
     rawSignals: [],

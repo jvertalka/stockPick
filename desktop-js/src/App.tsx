@@ -5,7 +5,6 @@ import {
   ArrowUpRight,
   BarChart3,
   Bell,
-  Columns,
   CheckCircle2,
   ChevronDown,
   ChevronRight,
@@ -13,18 +12,14 @@ import {
   Clipboard,
   FileDown,
   Filter,
-  Gauge,
   GraduationCap,
   Keyboard,
   LineChart,
   Moon,
   RefreshCcw,
   Search,
-  ShieldAlert,
-  SlidersHorizontal,
   Sparkles,
   Sun,
-  Target,
   X,
 } from 'lucide-react'
 import { DecisionHistory, PositionSizer, TickerNotes } from './components/DetailExtras'
@@ -112,7 +107,14 @@ import {
 } from './data/decisionApi'
 import './App.css'
 
-type ViewId = 'brief' | 'decision' | 'buy' | 'hold' | 'sell' | 'radar' | 'scenario' | 'compare' | 'workflow' | 'readiness'
+/** Four surfaces (was ten views). Doctrine: the app does the synthesis —
+ * Brief answers "what do I do", the Desk is where a decision is examined,
+ * Workflows handle portfolio chores, the Lab owns model training/health.
+ * Everything that used to be its own view (Buy/Hold/Sell boards, Scenario
+ * Lab, Compare, Radar) is a filter or mode INSIDE the Desk. */
+type ViewId = 'brief' | 'desk' | 'workflows' | 'lab'
+/** Sub-modes of the Decision Desk. */
+type DeskMode = 'table' | 'compare' | 'radar'
 type ActionFilter = 'All' | 'Buy' | 'Hold' | 'Risk'
 type FeedStatus = 'loading' | 'backend' | 'fallback'
 
@@ -133,69 +135,53 @@ const navItems: NavItem[] = [
     icon: Sparkles,
   },
   {
-    id: 'decision',
+    id: 'desk',
     label: 'Decision Desk',
     eyebrow: 'Decision Desk',
-    heading: 'What to buy, hold, trim, sell, and avoid',
+    heading: 'What to buy, hold, trim, sell, and avoid — and why',
     icon: CircleDollarSign,
   },
   {
-    id: 'buy',
-    label: 'Buy Board',
-    eyebrow: 'Buy Board',
-    heading: 'Highest-confidence accumulation candidates',
-    icon: Target,
-  },
-  {
-    id: 'hold',
-    label: 'Hold Board',
-    eyebrow: 'Hold Board',
-    heading: 'Positions with enough evidence to stay patient',
-    icon: CheckCircle2,
-  },
-  {
-    id: 'sell',
-    label: 'Sell Board',
-    eyebrow: 'Sell Board',
-    heading: 'Deterioration clusters that need action',
-    icon: ShieldAlert,
-  },
-  {
-    id: 'radar',
-    label: 'Market Radar',
-    eyebrow: 'Market Radar',
-    heading: 'Regime, breadth, volatility, and sector rotation',
-    icon: Gauge,
-  },
-  {
-    id: 'scenario',
-    label: 'Scenario Lab',
-    eyebrow: 'Scenario Lab',
-    heading: 'Stress the market and re-rank the universe',
-    icon: SlidersHorizontal,
-  },
-  {
-    id: 'compare',
-    label: 'Compare',
-    eyebrow: 'Side-by-side',
-    heading: 'Pit two to four tickers head-to-head',
-    icon: Columns,
-  },
-  {
-    id: 'workflow',
+    id: 'workflows',
     label: 'Workflows',
     eyebrow: 'Portfolio workflows',
     heading: 'Tax-loss harvest, rebalance, and weekly digest',
     icon: FileDown,
   },
   {
-    id: 'readiness',
-    label: 'Model Path',
-    eyebrow: 'Path to trained models',
-    heading: 'Gates between rules-only today and trained ML someday',
+    id: 'lab',
+    label: 'Model Lab',
+    eyebrow: 'Model training & health',
+    heading: 'Backtests, readiness gates, and live decay monitoring',
     icon: GraduationCap,
   },
 ]
+
+/** Legacy view ids (pre-consolidation) → surviving surface, so persisted
+ * state from older builds lands somewhere sensible. */
+function migrateViewId(stored: string | undefined): ViewId | undefined {
+  switch (stored) {
+    case 'brief':
+    case 'desk':
+    case 'workflows':
+    case 'lab':
+      return stored
+    case 'decision':
+    case 'buy':
+    case 'hold':
+    case 'sell':
+    case 'scenario':
+    case 'compare':
+    case 'radar':
+      return 'desk'
+    case 'workflow':
+      return 'workflows'
+    case 'readiness':
+      return 'lab'
+    default:
+      return undefined
+  }
+}
 
 const actionFilters: ActionFilter[] = ['All', 'Buy', 'Hold', 'Risk']
 const sortOptions: Array<{ value: SortKey; label: string }> = [
@@ -211,11 +197,10 @@ const ownedStorageKey = 'finance-oracle-owned-tickers'
 const watchStorageKey = 'finance-oracle-watch-tickers'
 const viewStateStorageKey = 'finance-oracle-view-state'
 const maxTableRows = 260
-const maxBoardCards = 96
-const maxRiskRows = 140
 
 type PersistedViewState = {
   activeView?: ViewId
+  deskMode?: DeskMode
   actionFilter?: ActionFilter
   sector?: string
   sortKey?: SortKey
@@ -229,7 +214,8 @@ function readPersistedViewState(): PersistedViewState {
     if (!stored) return {}
     const decoded = JSON.parse(stored) as unknown
     if (typeof decoded !== 'object' || decoded === null) return {}
-    return decoded as PersistedViewState
+    const state = decoded as PersistedViewState & { activeView?: string }
+    return { ...state, activeView: migrateViewId(state.activeView) }
   } catch {
     return {}
   }
@@ -399,25 +385,8 @@ function actionFilterFor(action: Action): ActionFilter {
   return 'Risk'
 }
 
-function viewForAction(action: Action): ViewId {
-  if (action === 'Buy Now' || action === 'Accumulate') return 'buy'
-  if (action === 'Hold') return 'hold'
-  return 'sell'
-}
-
-function actionFilterForView(view: ViewId): ActionFilter {
-  if (view === 'buy') return 'Buy'
-  if (view === 'hold') return 'Hold'
-  if (view === 'sell') return 'Risk'
-  return 'All'
-}
-
-function viewForActionFilter(filter: ActionFilter): ViewId {
-  if (filter === 'Buy') return 'buy'
-  if (filter === 'Hold') return 'hold'
-  if (filter === 'Risk') return 'sell'
-  return 'decision'
-}
+// Focusing an action bucket always lands on the Desk with the matching
+// filter — the boards that used to be separate views are now just filters.
 
 function portfolioActionFor(signal: DecisionSignal, owned: boolean, watched: boolean) {
   if (owned) {
@@ -439,22 +408,22 @@ function portfolioActionFor(signal: DecisionSignal, owned: boolean, watched: boo
 
 function signalReadiness(signal: DecisionSignal): { label: string; tone: Tone; detail: string } {
   const dataConfidence = signal.dataConfidence ?? 0
-  const warnings = signal.dataWarnings ?? []
-  const missingCoreFeeds = warnings.some((warning) =>
-    ['Fundamental', 'estimate', 'Listed-options'].some((needle) => warning.includes(needle)),
-  )
-  if (dataConfidence >= 72 && !missingCoreFeeds) {
+  const hasFundamentals = signal.fundamentalsSource === 'sec-edgar-xbrl'
+  if (dataConfidence >= 80 && hasFundamentals) {
     return {
       label: 'Decision grade',
       tone: 'positive',
-      detail: 'Full evidence stack is available.',
+      detail:
+        'Price history + SEC-filing fundamentals back this case; estimate revisions and listed options remain neutral/proxied.',
     }
   }
   if (dataConfidence >= 60) {
     return {
       label: 'Price-backed',
       tone: 'caution',
-      detail: 'Market-data case is live; fundamental and options confirmation are incomplete.',
+      detail: hasFundamentals
+        ? 'Market data and SEC fundamentals are live; confidence is held back by data gaps.'
+        : 'Market-data case is live; SEC fundamentals are not computed for this name yet.',
     }
   }
   return {
@@ -462,12 +431,6 @@ function signalReadiness(signal: DecisionSignal): { label: string; tone: Tone; d
     tone: 'danger',
     detail: 'Evidence is too thin for a high-conviction decision.',
   }
-}
-
-function missingEvidenceCount(signal: DecisionSignal) {
-  return (signal.dataWarnings ?? []).filter((warning) =>
-    ['not connected', 'neutral', 'stale', 'Short price', 'thin'].some((needle) => warning.includes(needle)),
-  ).length
 }
 
 function actionableRows(rows: DecisionSignal[]) {
@@ -614,6 +577,7 @@ function StatusStrip({
   const qualified = feed?.returned ?? rows.length
   const universeSize = feed?.universeSize ?? rows.length
   const excluded = feed?.excludedForInsufficientData ?? Math.max(0, universeSize - qualified)
+  const fundamentals = feed?.fundamentalsCoverage ?? 0
   const actionable = actionableRows(rows).length
   const tone: Tone =
     status === 'backend' && qualified > 0 ? 'caution' : status === 'loading' ? 'neutral' : 'danger'
@@ -621,7 +585,9 @@ function StatusStrip({
     status === 'loading'
       ? 'Loading evidence'
       : status === 'backend' && qualified > 0
-        ? 'Price-backed - missing fundamentals & options'
+        ? fundamentals > 0
+          ? `Price + SEC fundamentals (${fundamentals} names) - options proxied`
+          : 'Price-backed - fundamentals warming, options proxied'
         : 'Recommendations paused'
 
   return (
@@ -1287,32 +1253,10 @@ function DetailPanel({
         </div>
       </section>
 
-      <div className="detail-metrics">
-        <Metric label="Opportunity" value={`${signal.opportunityScore}`} tone="positive" />
-        <Metric label="Confidence" value={`${signal.confidence}`} />
-        <Metric label="Risk" value={`${signal.riskScore}`} tone={signal.riskScore >= 68 ? 'danger' : 'caution'} />
-        <Metric
-          label="Data confidence"
-          value={`${Math.round(signal.dataConfidence ?? 65)}%`}
-          detail={signal.dataSource ?? 'local'}
-          tone={(signal.dataConfidence ?? 65) < 45 ? 'danger' : 'neutral'}
-        />
-        <Metric label="Drawdown odds" value={`${signal.probabilityDrawdown}%`} tone="caution" />
-        <Metric
-          label="Price as of"
-          value={formatDate(signal.priceAsOf)}
-          detail={signal.historyBars ? `${signal.historyBars} bars` : 'no OHLCV yet'}
-        />
-      </div>
-
-      <PriceChart ticker={signal.ticker} />
-      <FactorBreakdown signal={signal} />
-      <QuantAnalysisCard signal={signal} />
-      <OptionsStrategiesCard
-        holding={findHoldingForSignal(signal, holdings)}
-        signal={signal}
-      />
-      <OptionsCard ticker={signal.ticker} />
+      {/* Verdict zone ends here: action, conviction, thesis, readiness,
+          sizing, and the chart stay above the fold. Everything deeper is
+          grouped behind a click (doctrine: information that doesn't speed
+          the decision stays off the main path). */}
       <PositionSizer
         action={signal.action}
         kellyHalfPct={signal.recommendedKellyHalfPct}
@@ -1320,14 +1264,65 @@ function DetailPanel({
         riskScore={signal.riskScore}
         ticker={signal.ticker}
       />
-      <TickerNotes ticker={signal.ticker} />
-      <DecisionHistory ticker={signal.ticker} />
-      <NewsStream name={signal.name} ticker={signal.ticker} />
+      <PriceChart ticker={signal.ticker} />
 
-      <InfoList title="Why it ranks here" items={signal.evidence} tone="positive" />
-      <InfoList title="What could go wrong" items={signal.riskFlags} tone="caution" />
-      <EvidenceLedger signal={signal} />
-      <InfoList title="Invalidation triggers" items={signal.invalidation} tone="danger" />
+      <details className="detail-group" data-testid="detail-group-evidence" open>
+        <summary>
+          <ChevronRight size={14} />
+          Evidence &amp; analysis
+        </summary>
+        <div className="detail-group-body">
+          <div className="detail-metrics">
+            <Metric label="Opportunity" value={`${signal.opportunityScore}`} tone="positive" />
+            <Metric label="Confidence" value={`${signal.confidence}`} />
+            <Metric label="Risk" value={`${signal.riskScore}`} tone={signal.riskScore >= 68 ? 'danger' : 'caution'} />
+            <Metric
+              label="Data confidence"
+              value={`${Math.round(signal.dataConfidence ?? 65)}%`}
+              detail={signal.dataSource ?? 'local'}
+              tone={(signal.dataConfidence ?? 65) < 45 ? 'danger' : 'neutral'}
+            />
+            <Metric label="Drawdown odds" value={`${signal.probabilityDrawdown}%`} tone="caution" />
+            <Metric
+              label="Price as of"
+              value={formatDate(signal.priceAsOf)}
+              detail={signal.historyBars ? `${signal.historyBars} bars` : 'no OHLCV yet'}
+            />
+          </div>
+          <FactorBreakdown signal={signal} />
+          <QuantAnalysisCard signal={signal} />
+          <InfoList title="Why it ranks here" items={signal.evidence} tone="positive" />
+          <InfoList title="What could go wrong" items={signal.riskFlags} tone="caution" />
+          <EvidenceLedger signal={signal} />
+          <InfoList title="Invalidation triggers" items={signal.invalidation} tone="danger" />
+        </div>
+      </details>
+
+      <details className="detail-group" data-testid="detail-group-options">
+        <summary>
+          <ChevronRight size={14} />
+          Options strategies &amp; chain
+        </summary>
+        <div className="detail-group-body">
+          <OptionsStrategiesCard
+            holding={findHoldingForSignal(signal, holdings)}
+            signal={signal}
+          />
+          <OptionsCard ticker={signal.ticker} />
+        </div>
+      </details>
+
+      <details className="detail-group" data-testid="detail-group-journal">
+        <summary>
+          <ChevronRight size={14} />
+          Journal, history &amp; news
+        </summary>
+        <div className="detail-group-body">
+          <TickerNotes ticker={signal.ticker} />
+          <DecisionHistory ticker={signal.ticker} />
+          <NewsStream name={signal.name} ticker={signal.ticker} />
+        </div>
+      </details>
 
       <button
         className={reviewed ? 'reviewed-button' : ''}
@@ -1380,208 +1375,6 @@ function EvidenceLedger({ signal }: { signal: DecisionSignal }) {
           <span>{gap}</span>
         </div>
       ))}
-    </section>
-  )
-}
-
-function SignalCard({
-  signal,
-  onOpen,
-}: {
-  signal: DecisionSignal
-  onOpen: (signal: DecisionSignal) => void
-}) {
-  const readiness = signalReadiness(signal)
-  return (
-    <article
-      aria-label={`${signal.ticker} - ${signal.action}`}
-      className={`signal-card ${actionTone(signal.action)}`}
-      onClick={() => onOpen(signal)}
-      onKeyDown={(event) => {
-        if (event.key === 'Enter' || event.key === ' ') {
-          event.preventDefault()
-          onOpen(signal)
-        }
-      }}
-      role="button"
-      tabIndex={0}
-    >
-      <div className="signal-card-top">
-        <div>
-          <strong>{signal.ticker}</strong>
-          <span>{signal.name}</span>
-        </div>
-        <ActionPill action={signal.action} />
-      </div>
-      <p className="why-line">{synthesizeReason(signal)}</p>
-      <div className="card-bars">
-        <label title={`Opportunity ${signal.opportunityScore} - ${scoreLabel(signal.opportunityScore)}`}>
-          Opp {signal.opportunityScore}
-          <span className="score">
-            <span style={{ width: `${signal.opportunityScore}%` }} />
-          </span>
-        </label>
-        <label title={`Risk ${signal.riskScore} - ${riskLabel(signal.riskScore)}`}>
-          Risk {signal.riskScore}
-          <span className="score">
-            <span style={{ width: `${signal.riskScore}%` }} />
-          </span>
-        </label>
-      </div>
-      <div className="card-evidence">
-        <span className={readiness.tone}>{readiness.label}</span>
-        <span>{missingEvidenceCount(signal)} gaps</span>
-      </div>
-      <footer>
-        <span>{formatSignedPercent(signal.forecast20d)} 20d</span>
-        <span className="pill neutral">View detail</span>
-      </footer>
-    </article>
-  )
-}
-
-function SectorGroup({
-  sector,
-  rows,
-  defaultOpen,
-  onOpen,
-}: {
-  sector: string
-  rows: DecisionSignal[]
-  defaultOpen: boolean
-  onOpen: (signal: DecisionSignal) => void
-}) {
-  const [open, setOpen] = useState(defaultOpen)
-  if (rows.length === 0) return null
-  return (
-    <section className={open ? 'sector-group' : 'sector-group collapsed'}>
-      <button
-        aria-expanded={open}
-        aria-label={`${open ? 'Collapse' : 'Expand'} ${sector} group`}
-        className="sector-group-head"
-        onClick={() => setOpen((current) => !current)}
-        type="button"
-      >
-        <span>
-          {open ? <ChevronDown size={14} /> : <ChevronRight size={14} />} {sector}
-        </span>
-        <span className="count">{rows.length} names</span>
-      </button>
-      <div className="sector-group-body">
-        {rows.map((row) => (
-          <SignalCard key={row.ticker} signal={row} onOpen={onOpen} />
-        ))}
-      </div>
-    </section>
-  )
-}
-
-function groupBySector(rows: DecisionSignal[]) {
-  const map = new Map<string, DecisionSignal[]>()
-  rows.forEach((row) => {
-    const list = map.get(row.sector) ?? []
-    list.push(row)
-    map.set(row.sector, list)
-  })
-  return [...map.entries()].sort((left, right) => right[1].length - left[1].length)
-}
-
-function BuyBoard({ rows, onOpen }: { rows: DecisionSignal[]; onOpen: (signal: DecisionSignal) => void }) {
-  const buyRows = rows.filter((row) => row.action === 'Buy Now' || row.action === 'Accumulate')
-  const displayedRows = buyRows.slice(0, maxBoardCards)
-  const groups = groupBySector(displayedRows)
-  return (
-    <section className="panel">
-      <header className="panel-header">
-        <div>
-          <p>Buy focus</p>
-          <h2>
-            {displayedRows.length} of {buyRows.length} candidates cleared the buy bar
-          </h2>
-        </div>
-        <span className="pill positive">Ranked</span>
-      </header>
-      {buyRows.length > 0 ? (
-        groups.map(([sector, list], index) => (
-          <SectorGroup
-            defaultOpen={index === 0}
-            key={sector}
-            onOpen={onOpen}
-            rows={list}
-            sector={sector}
-          />
-        ))
-      ) : (
-        <InlineEmptyState message="No buy candidates match the current filters." />
-      )}
-    </section>
-  )
-}
-
-function HoldBoard({ rows, onOpen }: { rows: DecisionSignal[]; onOpen: (signal: DecisionSignal) => void }) {
-  const holdRows = rows.filter((row) => row.action === 'Hold')
-  const displayedRows = holdRows.slice(0, maxBoardCards)
-  const groups = groupBySector(displayedRows)
-  return (
-    <section className="panel">
-      <header className="panel-header">
-        <div>
-          <p>Hold focus</p>
-          <h2>
-            {displayedRows.length} of {holdRows.length} names have balanced evidence
-          </h2>
-        </div>
-        <span className="pill neutral">Patience</span>
-      </header>
-      {holdRows.length > 0 ? (
-        groups.map(([sector, list], index) => (
-          <SectorGroup
-            defaultOpen={index === 0}
-            key={sector}
-            onOpen={onOpen}
-            rows={list}
-            sector={sector}
-          />
-        ))
-      ) : (
-        <InlineEmptyState message="No hold candidates match the current filters." />
-      )}
-    </section>
-  )
-}
-
-function SellBoard({ rows, onOpen }: { rows: DecisionSignal[]; onOpen: (signal: DecisionSignal) => void }) {
-  const riskRows = rows
-    .filter((row) => row.action === 'Sell' || row.action === 'Trim' || row.action === 'Avoid')
-    .sort(byRiskPriority)
-  const displayedRows = riskRows.slice(0, maxRiskRows)
-  return (
-    <section className="panel">
-      <header className="panel-header">
-        <div>
-          <p>Sell discipline</p>
-          <h2>{displayedRows.length} of {riskRows.length} names need risk-control review</h2>
-        </div>
-        <span className="pill danger">Deterioration</span>
-      </header>
-      {riskRows.length > 0 ? (
-        <div className="risk-list">
-          {displayedRows.map((row) => (
-            <article key={row.ticker}>
-              <div>
-                <strong>{row.ticker}</strong>
-                <span>{row.name}</span>
-              </div>
-              <ActionPill action={row.action} />
-              <span>Damage {row.thesisDamage}</span>
-              <span>Risk {row.riskScore}</span>
-              <SignalButton context="risk" signal={row} onOpen={onOpen} />
-            </article>
-          ))}
-        </div>
-      ) : (
-        <InlineEmptyState message="No trim, sell, or avoid signals match the current filters." />
-      )}
     </section>
   )
 }
@@ -1656,65 +1449,6 @@ function MarketRadar({
   )
 }
 
-function ScenarioLab({
-  rows,
-  activeScenario,
-  sourceLabel,
-  ownedTickers,
-  watchTickers,
-  enrichedTickers,
-  mlPredictions,
-  onScenarioChange,
-  onOpen,
-}: {
-  rows: DecisionSignal[]
-  activeScenario: ScenarioId
-  sourceLabel: string
-  ownedTickers: Set<string>
-  watchTickers: Set<string>
-  enrichedTickers: Set<string>
-  mlPredictions?: Map<string, LivePrediction>
-  onScenarioChange: (scenario: ScenarioId) => void
-  onOpen: (signal: DecisionSignal) => void
-}) {
-  const scenario = scenarios.find((item) => item.id === activeScenario) ?? scenarios[0]
-  return (
-    <section className="panel">
-      <header className="panel-header">
-        <div>
-          <p>Scenario controls</p>
-          <h2>{scenario.shock}</h2>
-        </div>
-        <span className="pill neutral">{scenario.interpretation}</span>
-      </header>
-      <div className="scenario-buttons">
-        {scenarios.map((item) => (
-          <button
-            className={activeScenario === item.id ? 'active scenario-button' : 'scenario-button'}
-            data-testid={`scenario-${item.id}`}
-            key={item.id}
-            onClick={() => onScenarioChange(item.id)}
-            type="button"
-          >
-            <SlidersHorizontal size={16} />
-            {item.label}
-          </button>
-        ))}
-      </div>
-      <DecisionTable
-        enrichedTickers={enrichedTickers}
-        mlPredictions={mlPredictions}
-        onOpen={onOpen}
-        ownedTickers={ownedTickers}
-        rows={rows}
-        selectedTicker={null}
-        sourceLabel={sourceLabel}
-        watchTickers={watchTickers}
-      />
-    </section>
-  )
-}
-
 function EmptyState({ query, reason }: { query: string; reason?: string }) {
   return (
     <section className="panel empty-state">
@@ -1724,18 +1458,16 @@ function EmptyState({ query, reason }: { query: string; reason?: string }) {
   )
 }
 
-function InlineEmptyState({ message }: { message: string }) {
-  return (
-    <div className="inline-empty">
-      <strong>No visible signals</strong>
-      <span>{message}</span>
-    </div>
-  )
-}
-
 function App() {
   const persisted = useMemo(() => readPersistedViewState(), [])
-  const [activeView, setActiveView] = useState<ViewId>(persisted.activeView ?? 'brief')
+  // Deep-link override: ?view=brief|desk|workflows|lab (legacy ids migrate).
+  const [activeView, setActiveView] = useState<ViewId>(() => {
+    const fromUrl = migrateViewId(
+      new URLSearchParams(window.location.search).get('view') ?? undefined,
+    )
+    return fromUrl ?? persisted.activeView ?? 'brief'
+  })
+  const [deskMode, setDeskMode] = useState<DeskMode>(persisted.deskMode ?? 'table')
   const [query, setQuery] = useState('')
   const [actionFilter, setActionFilter] = useState<ActionFilter>(persisted.actionFilter ?? 'All')
   const [sector, setSector] = useState(persisted.sector ?? 'All')
@@ -1996,8 +1728,8 @@ function App() {
 
   // Persist filter and view choices so reopening the app lands the user where they left off.
   useEffect(() => {
-    persistViewState({ activeView, actionFilter, sector, sortKey, highConvictionOnly, activeScenario })
-  }, [activeView, actionFilter, sector, sortKey, highConvictionOnly, activeScenario])
+    persistViewState({ activeView, deskMode, actionFilter, sector, sortKey, highConvictionOnly, activeScenario })
+  }, [activeView, deskMode, actionFilter, sector, sortKey, highConvictionOnly, activeScenario])
 
   // Theme: apply on mount and whenever it changes; persist for next launch.
   useEffect(() => {
@@ -2336,6 +2068,10 @@ function App() {
 
   function openSignal(signal: DecisionSignal) {
     setSelectedTicker(signal.ticker)
+    // Examining a ticker always happens on the Desk's table mode — other
+    // surfaces/modes hand off here so the detail panel is in view.
+    setActiveView('desk')
+    setDeskMode('table')
     if (window.matchMedia('(max-width: 1280px)').matches) {
       setDetailDrawerOpen(true)
     }
@@ -2483,23 +2219,25 @@ function App() {
 
   function focusAction(action: Action) {
     setActionFilter(actionFilterFor(action))
-    setActiveView(viewForAction(action))
+    setActiveView('desk')
+    setDeskMode('table')
   }
 
   function activateView(view: ViewId) {
     setActiveView(view)
-    setActionFilter(actionFilterForView(view))
   }
 
   function activateActionFilter(filter: ActionFilter) {
     setActionFilter(filter)
-    setActiveView(viewForActionFilter(filter))
+    setActiveView('desk')
+    setDeskMode('table')
   }
 
   function clearFilters() {
     setQuery('')
     setActionFilter('All')
-    setActiveView('decision')
+    setActiveView('desk')
+    setDeskMode('table')
     setSector('All')
     setSortKey('action')
     setHighConvictionOnly(false)
@@ -2717,6 +2455,31 @@ function App() {
               </section>
             ) : null}
 
+          </>
+        )}
+
+        {activeView === 'brief' ? (
+          <ExecutiveBrief
+            activeScenario={activeScenario}
+            asOf={lastRefresh.toISOString()}
+            convictionStacks={convictionStacks}
+            holdings={holdings}
+            marketContext={activeMarketContext as MarketContext}
+            mlPredictions={mlPredictions}
+            onOpenStock={(ticker) => {
+              setSelectedTicker(ticker)
+              setActiveView('desk')
+              setDeskMode('table')
+            }}
+            ownedTickers={ownedTickers}
+            portfolioMetrics={portfolioMetrics}
+            universe={universe}
+            watchTickers={watchTickers}
+          />
+        ) : null}
+
+        {activeView === 'desk' ? (
+          <>
             {pulse ? (
               <PortfolioPulseStrip
                 metrics={portfolioMetrics}
@@ -2742,173 +2505,133 @@ function App() {
                 tone="danger"
               />
             </section>
+
+            <ActionSummaryStrip rows={universe} activeFilter={actionFilter} onActionFocus={focusAction} />
+
+            <div className="desk-toolbar" data-testid="desk-toolbar">
+              <div className="desk-modes" role="tablist" aria-label="Desk mode">
+                {(
+                  [
+                    ['table', 'Rankings'],
+                    ['compare', 'Compare'],
+                    ['radar', 'Market radar'],
+                  ] as Array<[DeskMode, string]>
+                ).map(([mode, label]) => (
+                  <button
+                    aria-selected={deskMode === mode}
+                    className={deskMode === mode ? 'active' : ''}
+                    key={mode}
+                    onClick={() => setDeskMode(mode)}
+                    role="tab"
+                    type="button"
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+              <label className="select-control" title="Stress-test: re-rank the universe under a hypothetical shock">
+                <span>Scenario</span>
+                <select
+                  onChange={(event) => setActiveScenario(event.target.value as ScenarioId)}
+                  value={activeScenario}
+                >
+                  {scenarios.map((scenario) => (
+                    <option key={scenario.id} value={scenario.id}>
+                      {scenario.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </div>
+            {activeScenario !== 'base' ? (
+              <p className="desk-scenario-note">
+                {scenarios.find((scenario) => scenario.id === activeScenario)?.interpretation}
+              </p>
+            ) : null}
+
+            {deskMode === 'table' ? (
+              <>
+                <FilterBuilder onChange={setFilterRules} rules={filterRules} universe={universe} />
+
+                <Controls
+                  actionFilter={actionFilter}
+                  highConvictionOnly={highConvictionOnly}
+                  onActionFilterChange={activateActionFilter}
+                  onClear={clearFilters}
+                  onHighConvictionChange={setHighConvictionOnly}
+                  onQueryChange={setQuery}
+                  onSectorChange={setSector}
+                  onSortChange={setSortKey}
+                  query={query}
+                  sector={sector}
+                  sectors={sectors}
+                  sortKey={sortKey}
+                />
+
+                {visibleRows.length === 0 ? (
+                  <EmptyState query={query} reason={noRowsReason} />
+                ) : (
+                  <section className="main-grid" data-testid="view-desk">
+                    <DecisionTable
+                      enrichedTickers={enrichedTickers}
+                      isLoading={feedStatus === 'loading'}
+                      mlPredictions={mlPredictions}
+                      onOpen={openSignal}
+                      ownedTickers={ownedTickers}
+                      rows={visibleRows}
+                      selectedTicker={selectedDisplayTicker}
+                      sourceLabel={sourceLabel}
+                      watchTickers={watchTickers}
+                    />
+                    <DetailPanel
+                      conviction={selectedConviction}
+                      holdings={holdings}
+                      isDrawerOpen={detailDrawerOpen}
+                      onClose={() => {
+                        setSelectedTicker(null)
+                        setDetailDrawerOpen(false)
+                      }}
+                      onReview={markReviewed}
+                      onToggleOwned={toggleOwned}
+                      onToggleWatch={toggleWatch}
+                      owned={selectedOwned}
+                      reviewed={reviewed}
+                      signal={selectedSignal}
+                      watched={selectedWatched}
+                    />
+                  </section>
+                )}
+              </>
+            ) : null}
+
+            {deskMode === 'compare' ? (
+              <ComparisonView
+                initialTickers={[
+                  ...Array.from(ownedTickers).slice(0, 2),
+                  ...visibleRows
+                    .filter((row) => !ownedTickers.has(row.ticker))
+                    .slice(0, 2)
+                    .map((row) => row.ticker),
+                ].slice(0, 4)}
+                onOpenStock={(ticker) => {
+                  setSelectedTicker(ticker)
+                  setDeskMode('table')
+                }}
+                universe={universe}
+              />
+            ) : null}
+
+            {deskMode === 'radar' ? (
+              <MarketRadar
+                context={activeMarketContext}
+                history={decisionFeed?.history ?? []}
+                rows={universe}
+              />
+            ) : null}
           </>
-        )}
-
-        <ActionSummaryStrip rows={universe} activeFilter={actionFilter} onActionFocus={focusAction} />
-
-        <FilterBuilder onChange={setFilterRules} rules={filterRules} universe={universe} />
-
-        <Controls
-          actionFilter={actionFilter}
-          highConvictionOnly={highConvictionOnly}
-          onActionFilterChange={activateActionFilter}
-          onClear={clearFilters}
-          onHighConvictionChange={setHighConvictionOnly}
-          onQueryChange={setQuery}
-          onSectorChange={setSector}
-          onSortChange={setSortKey}
-          query={query}
-          sector={sector}
-          sectors={sectors}
-          sortKey={sortKey}
-        />
-
-        {visibleRows.length === 0 ? <EmptyState query={query} reason={noRowsReason} /> : null}
-
-        {activeView === 'brief' ? (
-          <ExecutiveBrief
-            activeScenario={activeScenario}
-            asOf={lastRefresh.toISOString()}
-            convictionStacks={convictionStacks}
-            holdings={holdings}
-            marketContext={activeMarketContext as MarketContext}
-            mlPredictions={mlPredictions}
-            onOpenStock={(ticker) => {
-              setSelectedTicker(ticker)
-              setActiveView('decision')
-            }}
-            ownedTickers={ownedTickers}
-            portfolioMetrics={portfolioMetrics}
-            universe={universe}
-            watchTickers={watchTickers}
-          />
         ) : null}
 
-        {activeView === 'decision' && visibleRows.length > 0 ? (
-          <section className="main-grid" data-testid="view-decision">
-            <DecisionTable
-              enrichedTickers={enrichedTickers}
-              isLoading={feedStatus === 'loading'}
-              mlPredictions={mlPredictions}
-              onOpen={openSignal}
-              ownedTickers={ownedTickers}
-              rows={visibleRows}
-              selectedTicker={selectedDisplayTicker}
-              sourceLabel={sourceLabel}
-              watchTickers={watchTickers}
-            />
-            <DetailPanel
-              conviction={selectedConviction}
-              holdings={holdings}
-              isDrawerOpen={detailDrawerOpen}
-              onClose={() => {
-                setSelectedTicker(null)
-                setDetailDrawerOpen(false)
-              }}
-              onReview={markReviewed}
-              onToggleOwned={toggleOwned}
-              onToggleWatch={toggleWatch}
-              owned={selectedOwned}
-              reviewed={reviewed}
-              signal={selectedSignal}
-              watched={selectedWatched}
-            />
-          </section>
-        ) : null}
-
-        {activeView === 'buy' && visibleRows.length > 0 ? (
-          <section className="main-grid" data-testid="view-buy">
-            <BuyBoard rows={visibleRows} onOpen={openSignal} />
-            <DetailPanel
-              conviction={selectedConviction}
-              holdings={holdings}
-              isDrawerOpen={detailDrawerOpen}
-              onClose={() => {
-                setSelectedTicker(null)
-                setDetailDrawerOpen(false)
-              }}
-              onReview={markReviewed}
-              onToggleOwned={toggleOwned}
-              onToggleWatch={toggleWatch}
-              owned={selectedOwned}
-              reviewed={reviewed}
-              signal={selectedSignal}
-              watched={selectedWatched}
-            />
-          </section>
-        ) : null}
-
-        {activeView === 'hold' && visibleRows.length > 0 ? (
-          <section className="main-grid" data-testid="view-hold">
-            <HoldBoard rows={visibleRows} onOpen={openSignal} />
-            <DetailPanel
-              conviction={selectedConviction}
-              holdings={holdings}
-              isDrawerOpen={detailDrawerOpen}
-              onClose={() => {
-                setSelectedTicker(null)
-                setDetailDrawerOpen(false)
-              }}
-              onReview={markReviewed}
-              onToggleOwned={toggleOwned}
-              onToggleWatch={toggleWatch}
-              owned={selectedOwned}
-              reviewed={reviewed}
-              signal={selectedSignal}
-              watched={selectedWatched}
-            />
-          </section>
-        ) : null}
-
-        {activeView === 'sell' && visibleRows.length > 0 ? (
-          <section className="main-grid" data-testid="view-sell">
-            <SellBoard rows={visibleRows} onOpen={openSignal} />
-            <DetailPanel
-              conviction={selectedConviction}
-              holdings={holdings}
-              isDrawerOpen={detailDrawerOpen}
-              onClose={() => {
-                setSelectedTicker(null)
-                setDetailDrawerOpen(false)
-              }}
-              onReview={markReviewed}
-              onToggleOwned={toggleOwned}
-              onToggleWatch={toggleWatch}
-              owned={selectedOwned}
-              reviewed={reviewed}
-              signal={selectedSignal}
-              watched={selectedWatched}
-            />
-          </section>
-        ) : null}
-
-        {activeView === 'radar' ? (
-          <MarketRadar
-            context={activeMarketContext}
-            history={decisionFeed?.history ?? []}
-            rows={universe}
-          />
-        ) : null}
-
-        {activeView === 'compare' ? (
-          <ComparisonView
-            initialTickers={[
-              ...Array.from(ownedTickers).slice(0, 2),
-              ...visibleRows
-                .filter((row) => !ownedTickers.has(row.ticker))
-                .slice(0, 2)
-                .map((row) => row.ticker),
-            ].slice(0, 4)}
-            onOpenStock={(ticker) => {
-              setSelectedTicker(ticker)
-              setActiveView('decision')
-            }}
-            universe={universe}
-          />
-        ) : null}
-
-        {activeView === 'workflow' ? (
+        {activeView === 'workflows' ? (
           <section className="workflow-stack" data-testid="view-workflow">
             <section className="panel">
               <header className="panel-header">
@@ -2960,43 +2683,11 @@ function App() {
           </section>
         ) : null}
 
-        {activeView === 'readiness' ? (
-          <section className="workflow-stack" data-testid="view-readiness">
+        {activeView === 'lab' ? (
+          <section className="workflow-stack" data-testid="view-lab">
             <ModelReadinessPanel feed={decisionFeed} universe={universe} />
             <ModelDecayMonitor />
             <BacktestPanel />
-          </section>
-        ) : null}
-
-        {activeView === 'scenario' && visibleRows.length > 0 ? (
-          <section className="main-grid" data-testid="view-scenario">
-            <ScenarioLab
-              activeScenario={activeScenario}
-              enrichedTickers={enrichedTickers}
-              mlPredictions={mlPredictions}
-              onOpen={openSignal}
-              onScenarioChange={setActiveScenario}
-              ownedTickers={ownedTickers}
-              rows={visibleRows}
-              sourceLabel={sourceLabel}
-              watchTickers={watchTickers}
-            />
-            <DetailPanel
-              conviction={selectedConviction}
-              holdings={holdings}
-              isDrawerOpen={detailDrawerOpen}
-              onClose={() => {
-                setSelectedTicker(null)
-                setDetailDrawerOpen(false)
-              }}
-              onReview={markReviewed}
-              onToggleOwned={toggleOwned}
-              onToggleWatch={toggleWatch}
-              owned={selectedOwned}
-              reviewed={reviewed}
-              signal={selectedSignal}
-              watched={selectedWatched}
-            />
           </section>
         ) : null}
       </section>
