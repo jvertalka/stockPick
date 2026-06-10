@@ -110,6 +110,14 @@ export function BacktestPanel() {
             hyperparameters: backtestResult.hyperparameters,
             p10Model: bundle20?.p10Model,
             p90Model: bundle20?.p90Model,
+            // Persist every horizon's median so the conviction stack can
+            // vote on cross-horizon sign agreement (5/20/60/120d).
+            horizonModels: backtestResult.horizonBundles?.map((bundle) => ({
+              horizon: bundle.horizon,
+              medianModel: bundle.medianModel,
+              meanIC: bundle.meanIC,
+              icCI: bundle.icCI,
+            })),
             // The worker trains on the pruned feature set; live predictions
             // must slice the same columns.
             featureNames: PRUNED_FEATURE_NAMES,

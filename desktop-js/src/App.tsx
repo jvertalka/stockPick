@@ -86,6 +86,8 @@ import {
   type RegimeGate,
   type StoredMlModel,
 } from './data/mlModelService'
+import { buildConvictionStacks, type ConvictionStack } from './data/convictionStack'
+import { ConvictionStackMeter } from './components/ConvictionStackMeter'
 import {
   actionTone,
   formatSignedPercent,
@@ -1191,6 +1193,7 @@ function WarmingUpState({
 
 function DetailPanel({
   signal,
+  conviction,
   reviewed,
   owned,
   watched,
@@ -1202,6 +1205,7 @@ function DetailPanel({
   onToggleWatch,
 }: {
   signal: DecisionSignal | null
+  conviction: ConvictionStack | null
   reviewed: boolean
   owned: boolean
   watched: boolean
@@ -1245,6 +1249,8 @@ function DetailPanel({
         <strong>{signal.positionPlan}</strong>
         <span>{signal.nextCheck}</span>
       </div>
+
+      <ConvictionStackMeter stack={conviction} />
 
       <section className={`detail-thesis ${actionTone(signal.action)}`} data-testid="detail-thesis">
         <p>One-line read</p>
@@ -1839,6 +1845,12 @@ function App() {
     }
     return withQuant
   }, [activeScenario, signalInputs, optionsSnapshots, quantAnalyses, decisionMode, mlPredictions, regimeGate])
+  // Conviction stacks: six independent evidence layers per name (rules,
+  // ML, Monte Carlo, options skew, regime, multi-horizon agreement).
+  const convictionStacks = useMemo(
+    () => buildConvictionStacks(universe, mlPredictions, regimeGate),
+    [universe, mlPredictions, regimeGate],
+  )
   const sectors = useMemo(() => ['All', ...Array.from(new Set(universe.map((row) => row.sector))).sort()], [universe])
   const activeMarketContext = useMemo(
     () => ({ ...marketContext, ...(decisionFeed?.marketContext ?? {}) }),
@@ -1911,6 +1923,9 @@ function App() {
   const reviewed = selectedSignal ? reviewedTickers.has(selectedSignal.ticker) : false
   const selectedOwned = selectedSignal ? ownedTickers.has(selectedSignal.ticker) : false
   const selectedWatched = selectedSignal ? watchTickers.has(selectedSignal.ticker) : false
+  const selectedConviction = selectedSignal
+    ? convictionStacks.get(selectedSignal.ticker) ?? null
+    : null
   const riskCount = universe.filter((row) => row.action === 'Sell' || row.action === 'Trim' || row.action === 'Avoid').length
   const ownedRiskCount = useMemo(
     () =>
@@ -2755,6 +2770,7 @@ function App() {
           <ExecutiveBrief
             activeScenario={activeScenario}
             asOf={lastRefresh.toISOString()}
+            convictionStacks={convictionStacks}
             holdings={holdings}
             marketContext={activeMarketContext as MarketContext}
             mlPredictions={mlPredictions}
@@ -2783,6 +2799,7 @@ function App() {
               watchTickers={watchTickers}
             />
             <DetailPanel
+              conviction={selectedConviction}
               holdings={holdings}
               isDrawerOpen={detailDrawerOpen}
               onClose={() => {
@@ -2804,6 +2821,7 @@ function App() {
           <section className="main-grid" data-testid="view-buy">
             <BuyBoard rows={visibleRows} onOpen={openSignal} />
             <DetailPanel
+              conviction={selectedConviction}
               holdings={holdings}
               isDrawerOpen={detailDrawerOpen}
               onClose={() => {
@@ -2825,6 +2843,7 @@ function App() {
           <section className="main-grid" data-testid="view-hold">
             <HoldBoard rows={visibleRows} onOpen={openSignal} />
             <DetailPanel
+              conviction={selectedConviction}
               holdings={holdings}
               isDrawerOpen={detailDrawerOpen}
               onClose={() => {
@@ -2846,6 +2865,7 @@ function App() {
           <section className="main-grid" data-testid="view-sell">
             <SellBoard rows={visibleRows} onOpen={openSignal} />
             <DetailPanel
+              conviction={selectedConviction}
               holdings={holdings}
               isDrawerOpen={detailDrawerOpen}
               onClose={() => {
@@ -2962,6 +2982,7 @@ function App() {
               watchTickers={watchTickers}
             />
             <DetailPanel
+              conviction={selectedConviction}
               holdings={holdings}
               isDrawerOpen={detailDrawerOpen}
               onClose={() => {

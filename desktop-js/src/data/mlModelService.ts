@@ -28,9 +28,20 @@ import { ML_REGIME_GATE } from './quantConfig'
  */
 
 // v2: adds p10/p90 quantile models for prediction intervals
+// (horizon ensemble added without a key bump — the field is optional, so
+// v2 blobs without it load fine and the horizons layer reports unavailable)
 const MODEL_KEY = 'ml-model:gbt:v2'
 const FEATURE_NORM_KEY = 'ml-model:feature-norm:v1'
 const PREDICTION_LOG_KEY = 'ml-model:prediction-log:v1'
+
+/** One persisted horizon: the median (q=0.5) GBT plus its measured
+ * out-of-sample IC so the UI can show how much each horizon is worth. */
+export type StoredHorizonModel = {
+  horizon: number
+  medianModel: GradientBoostingModel
+  meanIC: number
+  icCI: { lower: number; mean: number; upper: number }
+}
 
 export type StoredMlModel = {
   /** 20-day median GBT — backward compat */
@@ -39,6 +50,9 @@ export type StoredMlModel = {
   p10Model?: GradientBoostingModel
   /** Optional 20-day p90 model for prediction interval upper bound */
   p90Model?: GradientBoostingModel
+  /** Median models for every trained horizon (5/20/60/120d) — feeds the
+   * conviction stack's multi-horizon agreement layer. */
+  horizonModels?: StoredHorizonModel[]
   trainedAt: string
   featureCount: number
   featureNames: string[]
@@ -50,12 +64,21 @@ export type StoredMlModel = {
   hyperparameters: { numTrees: number; depth: number; learningRate: number }
 }
 
+export type HorizonReturn = {
+  horizon: number
+  predictedReturnPct: number
+  meanIC: number
+}
+
 export type LivePrediction = {
   ticker: string
   predictedReturn20d: number
   /** 80% prediction interval [p10, p90] when quantile models are loaded */
   p10Return20d?: number
   p90Return20d?: number
+  /** Median forecasts across all trained horizons, when the ensemble is
+   * persisted — used for the cross-horizon agreement vote. */
+  horizonReturns?: HorizonReturn[]
   asOf: string
   features: number[]
 }
@@ -83,6 +106,9 @@ export async function persistModel(
     hyperparameters: { numTrees: number; depth: number; learningRate: number }
     p10Model?: GradientBoostingModel
     p90Model?: GradientBoostingModel
+    /** Median models per horizon from the backtest's ensemble — persisting
+     * all of them enables the multi-horizon agreement conviction layer. */
+    horizonModels?: StoredHorizonModel[]
     /** Names of the features the model was trained on, in column order.
      * Defaults to the full set; pruned models MUST pass their subset so
      * live predictions slice the same columns. */
@@ -93,6 +119,7 @@ export async function persistModel(
     model,
     p10Model: meta.p10Model,
     p90Model: meta.p90Model,
+    horizonModels: meta.horizonModels,
     trainedAt: new Date().toISOString(),
     featureCount: model.numFeatures,
     featureNames: meta.featureNames ?? HISTORICAL_FEATURE_NAMES,
@@ -158,11 +185,21 @@ export async function predictForTicker(
   const prediction = predictGradientBoosting(model.model, normalized)
   const p10 = model.p10Model ? predictGradientBoosting(model.p10Model, normalized) : undefined
   const p90 = model.p90Model ? predictGradientBoosting(model.p90Model, normalized) : undefined
+  // Horizon ensemble: all horizons trained on the same feature matrix
+  // (labels differ), so the one normalized vector feeds every median.
+  const horizonReturns = model.horizonModels?.length
+    ? model.horizonModels.map((bundle) => ({
+        horizon: bundle.horizon,
+        predictedReturnPct: predictGradientBoosting(bundle.medianModel, normalized),
+        meanIC: bundle.meanIC,
+      }))
+    : undefined
   return {
     ticker,
     predictedReturn20d: prediction,
     p10Return20d: p10,
     p90Return20d: p90,
+    horizonReturns,
     asOf: bars[bars.length - 1].date,
     features: normalized,
   }

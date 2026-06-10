@@ -13,6 +13,7 @@ import {
 import type { DecisionSignal, MarketContext, ScenarioId } from '../data/decisionEngine'
 import type { LivePrediction } from '../data/mlModelService'
 import type { StoredHolding } from '../data/storage'
+import { compareByConviction, type ConvictionStack } from '../data/convictionStack'
 import {
   cachedRecommendStrategies,
   type StrategyRecommendation,
@@ -34,6 +35,7 @@ type Props = {
   watchTickers: Set<string>
   holdings: StoredHolding[]
   mlPredictions: Map<string, LivePrediction>
+  convictionStacks: Map<string, ConvictionStack>
   portfolioMetrics: {
     value: number
     cost: number
@@ -54,6 +56,7 @@ export function ExecutiveBrief(props: Props) {
     watchTickers,
     holdings,
     mlPredictions,
+    convictionStacks,
     portfolioMetrics,
     marketContext,
     asOf,
@@ -61,7 +64,9 @@ export function ExecutiveBrief(props: Props) {
     onOpenStock,
   } = props
 
-  // Top buys: top-ranked unowned names with Buy Now or Accumulate.
+  // Top buys: unowned Buy/Accumulate names ranked by HOW MANY independent
+  // methods corroborate them (conviction stack), not by universe order —
+  // a buy confirmed by 5 of 6 methods outranks one confirmed by 2.
   const topBuys = useMemo(
     () =>
       universe
@@ -70,8 +75,9 @@ export function ExecutiveBrief(props: Props) {
             !ownedTickers.has(signal.ticker) &&
             (signal.action === 'Buy Now' || signal.action === 'Accumulate'),
         )
+        .sort(compareByConviction(convictionStacks))
         .slice(0, TOP_N_PER_BUCKET),
-    [universe, ownedTickers],
+    [universe, ownedTickers, convictionStacks],
   )
 
   // Top sells: owned positions where the engine flags Sell / Trim / Avoid.
@@ -189,6 +195,7 @@ export function ExecutiveBrief(props: Props) {
           rows={topBuys}
           tone="positive"
           mlPredictions={mlPredictions}
+          convictionStacks={convictionStacks}
           empty="No unowned names clear the buy bar right now."
           onOpenStock={onOpenStock}
         />
@@ -342,6 +349,7 @@ function ActionBucket({
   rows,
   tone,
   mlPredictions,
+  convictionStacks,
   empty,
   onOpenStock,
 }: {
@@ -350,6 +358,9 @@ function ActionBucket({
   rows: DecisionSignal[]
   tone: 'positive' | 'neutral' | 'danger'
   mlPredictions: Map<string, LivePrediction>
+  /** Present only for the buys bucket — the stack measures bull-case
+   * corroboration, so showing it on sells would invert its meaning. */
+  convictionStacks?: Map<string, ConvictionStack>
   empty: string
   onOpenStock: (ticker: string) => void
 }) {
@@ -366,6 +377,7 @@ function ActionBucket({
         <ul className="exec-bucket-list">
           {rows.map((row) => {
             const prediction = mlPredictions.get(row.ticker)
+            const stack = convictionStacks?.get(row.ticker)
             return (
               <li className="exec-bucket-row" key={row.ticker}>
                 <div className="exec-bucket-top">
@@ -380,6 +392,16 @@ function ActionBucket({
                   </button>
                   <span className={`exec-action-pill ${tone}`}>{row.action}</span>
                 </div>
+                {stack ? (
+                  <span
+                    className={`exec-conviction-chip ${stack.tone}`}
+                    title={stack.layers
+                      .map((layer) => `${layer.status === 'pass' ? '✓' : layer.status === 'fail' ? '✗' : '—'} ${layer.label}`)
+                      .join('  ')}
+                  >
+                    {stack.label} · {stack.passed}/{stack.available} methods
+                  </span>
+                ) : null}
                 <p className="exec-bucket-reason">{row.evidence[0] ?? ''}</p>
                 <div className="exec-bucket-stats">
                   <span>
