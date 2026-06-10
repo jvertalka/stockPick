@@ -1409,6 +1409,40 @@ table.decision-table td.actions button {
   width: max-content;
 }
 
+.warming-up {
+  display: grid;
+  gap: 10px;
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.warming-up h2 {
+  font-size: var(--t-display);
+  color: var(--accent-strong);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.warming-up .pulse-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: pulse 1.4s ease-in-out infinite;
+}
+
+.warming-up p {
+  margin: 0;
+  color: var(--text);
+  line-height: 1.5;
+  font-size: var(--t-body);
+}
+
+.warming-up button {
+  width: max-content;
+}
+
 .first-time-callout {
   display: flex;
   align-items: center;

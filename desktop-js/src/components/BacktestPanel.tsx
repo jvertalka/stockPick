@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { Activity, Play } from 'lucide-react'
 import {
+  DEFAULT_BACKTEST_TICKERS,
   HISTORICAL_FEATURE_NAMES,
   type DatasetBuildResult,
   type FullBacktestResult,
@@ -17,16 +18,7 @@ import { persistModel } from '../data/mlModelService'
  * yes, we do, as long as we use historical bars correctly.
  */
 
-const BACKTEST_TICKERS = [
-  'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META', 'NVDA', 'TSLA', 'AVGO',
-  'ORCL', 'CRM', 'ADBE', 'CSCO', 'NFLX', 'AMD', 'INTC', 'QCOM',
-  'TXN', 'IBM', 'NOW', 'PANW',
-  'JPM', 'V', 'MA', 'BAC', 'WFC', 'GS', 'MS', 'BLK',
-  'UNH', 'JNJ', 'LLY', 'MRK', 'ABBV', 'PFE', 'TMO', 'ABT',
-  'WMT', 'PG', 'KO', 'PEP', 'COST', 'HD', 'NKE', 'MCD',
-  'XOM', 'CVX', 'COP', 'CAT', 'BA', 'DE', 'GE', 'HON',
-  'SPY', 'QQQ', 'IWM', 'DIA', 'XLK', 'XLF', 'XLE', 'XLV',
-]
+const BACKTEST_TICKERS = DEFAULT_BACKTEST_TICKERS
 
 // Cache key includes a schema version so stale entries from earlier
 // builds don't crash the panel when fields rename or get added.

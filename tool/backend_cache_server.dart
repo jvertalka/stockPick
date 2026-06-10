@@ -111,8 +111,45 @@ class BackendCacheServer {
     );
     stdout.writeln('Cache dir: ${config.cacheDirectory.absolute.path}');
     stdout.writeln('Web root: ${config.webRoot.absolute.path}');
+    unawaited(_warmUpUniverse());
     await for (final request in server) {
       unawaited(_handleRequest(request));
+    }
+  }
+
+  /// Warms the decision universe in the background so a freshly started
+  /// server is useful immediately instead of returning 0 scoreable names
+  /// until someone manually clicks "Sync prices". Each pass syncs up to
+  /// 96 symbols through the same code path the HTTP route uses; passes
+  /// continue until coverage stops improving.
+  Future<void> _warmUpUniverse() async {
+    try {
+      var previousReturned = -1;
+      // 24 passes × 96 symbols comfortably covers the full universe even
+      // with per-symbol failures; the no-progress break exits earlier.
+      for (var pass = 1; pass <= 24; pass++) {
+        final result = await DecisionUniverseService(
+          config.cacheDirectory,
+          cache: _cache,
+        ).build(
+          Uri.parse(
+            '/decision/universe?limit=0&historyLimit=0&sync=force&syncLimit=96',
+          ),
+        );
+        final returned = (result['returned'] as num?)?.toInt() ?? 0;
+        final universe = (result['universeSize'] as num?)?.toInt() ?? 0;
+        stdout.writeln(
+          'Universe warmup pass $pass: $returned/$universe symbols scoreable',
+        );
+        if (returned >= universe || returned == previousReturned) {
+          stdout.writeln('Universe warmup complete.');
+          break;
+        }
+        previousReturned = returned;
+      }
+    } catch (error) {
+      // Warmup is best-effort; the HTTP routes still work without it.
+      stdout.writeln('Universe warmup stopped: $error');
     }
   }
 

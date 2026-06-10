@@ -1155,6 +1155,38 @@ function BackendDownState({
   )
 }
 
+/**
+ * Shown when the backend is reachable but has zero scoreable names yet —
+ * i.e. a freshly started server that's still warming its price cache.
+ * Distinct from BackendDownState (which means unreachable) so users see
+ * "give it a minute" instead of "something is broken".
+ */
+function WarmingUpState({
+  universeSize,
+  onRefresh,
+}: {
+  universeSize: number
+  onRefresh: () => void
+}) {
+  return (
+    <section className="panel warming-up" data-testid="warming-up">
+      <h2>
+        <span className="pulse-dot" /> Warming up market data
+      </h2>
+      <p>
+        The backend just started and is syncing price history for{' '}
+        {universeSize > 0 ? universeSize.toLocaleString() : 'the'} symbols in the
+        background. Names appear here automatically as their data lands —
+        the first batch usually shows within a minute.
+      </p>
+      <button onClick={onRefresh} type="button">
+        <RefreshCcw size={16} />
+        Check now
+      </button>
+    </section>
+  )
+}
+
 function DetailPanel({
   signal,
   reviewed,
@@ -2069,6 +2101,17 @@ function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
+  // Warmup polling: backend reachable but zero scoreable names means a
+  // freshly started server is still syncing its price cache (it warms
+  // itself in the background). Poll every 15s so the UI fills in without
+  // the user having to click anything.
+  useEffect(() => {
+    if (feedStatus !== 'backend') return
+    if ((decisionFeed?.returned ?? 0) > 0) return
+    const handle = window.setTimeout(() => setRefreshCount((count) => count + 1), 15000)
+    return () => window.clearTimeout(handle)
+  }, [feedStatus, decisionFeed])
+
   // Auto-reconnect: when the backend goes down, retry with exponential
   // backoff. The countdown is surfaced as a small "Reconnecting in Xs"
   // pill in the topbar so the user knows the app is trying.
@@ -2608,6 +2651,11 @@ function App() {
 
         {feedStatus === 'fallback' && universe.length === 0 ? (
           <BackendDownState errorMessage={dataError} onRetry={refreshData} />
+        ) : feedStatus === 'backend' && universe.length === 0 ? (
+          <WarmingUpState
+            universeSize={decisionFeed?.universeSize ?? 0}
+            onRefresh={refreshData}
+          />
         ) : (
           <>
             <StatusStrip feed={decisionFeed} rows={universe} status={feedStatus} />

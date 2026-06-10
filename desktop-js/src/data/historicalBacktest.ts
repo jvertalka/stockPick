@@ -44,6 +44,22 @@ export type { DailyBar }
  *      contribute and which are noise (Breiman 2001).
  */
 
+/**
+ * Default liquid-universe ticker set for backtests. Shared by the
+ * BacktestPanel UI and the Node CLI (tools/backtest-cli.ts) so both
+ * train on the same names.
+ */
+export const DEFAULT_BACKTEST_TICKERS = [
+  'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META', 'NVDA', 'TSLA', 'AVGO',
+  'ORCL', 'CRM', 'ADBE', 'CSCO', 'NFLX', 'AMD', 'INTC', 'QCOM',
+  'TXN', 'IBM', 'NOW', 'PANW',
+  'JPM', 'V', 'MA', 'BAC', 'WFC', 'GS', 'MS', 'BLK',
+  'UNH', 'JNJ', 'LLY', 'MRK', 'ABBV', 'PFE', 'TMO', 'ABT',
+  'WMT', 'PG', 'KO', 'PEP', 'COST', 'HD', 'NKE', 'MCD',
+  'XOM', 'CVX', 'COP', 'CAT', 'BA', 'DE', 'GE', 'HON',
+  'SPY', 'QQQ', 'IWM', 'DIA', 'XLK', 'XLF', 'XLE', 'XLV',
+]
+
 export type HorizonKey = 5 | 20 | 60 | 120
 
 export type HistoricalSample = {
