@@ -1,6 +1,8 @@
 import { cachedFetchDailyBars, type DailyBar } from './marketData'
 import {
   fitGradientBoosting,
+  fitMarkovRegime,
+  logReturns,
   predictGradientBoosting,
   pearsonCorrelation,
   type GradientBoostingModel,
@@ -951,5 +953,136 @@ export function runWalkForwardBacktest(
       depth: chosenParams.depth ?? 3,
       learningRate: chosenParams.learningRate ?? 0.1,
     },
+  }
+}
+
+/* =========================================================================
+   Feature pruning
+   -------------------------------------------------------------------------
+   Permutation importance from a full run identifies dead-weight features
+   (zero or negative IC contribution). Pruning them reduces the model's
+   variance without losing signal (Breiman 2001; Gu-Kelly-Xiu 2020 report
+   the same effect for equity-return models). The pipeline itself is
+   feature-count agnostic, so pruning is a sample transformation.
+   ========================================================================= */
+
+/**
+ * Survivors of the 2026-05-12 full-feature run (5,340 samples, 35 steps):
+ * every feature whose mean permutation importance was >= +0.001 IC.
+ * Volatility features dominated; momentum beyond 60d, skew, and most
+ * trend-extension features measured as noise or actively harmful.
+ */
+export const PRUNED_FEATURE_NAMES: string[] = [
+  'volatility_20d',
+  'volatility_252d',
+  'kurt_252d',
+  'range_compression_20d',
+  'momentum_60d',
+  'vol_change_60_20',
+  'price_to_low_60d',
+  'momentum_252d',
+  'amihud_illiquidity_20d',
+  'sma_50_distance',
+  'momentum_20d',
+  'price_velocity_acceleration',
+]
+
+/**
+ * Returns new samples whose feature vectors contain only the named
+ * features (in the given order). Names must exist in
+ * HISTORICAL_FEATURE_NAMES; unknown names throw so a typo can't silently
+ * train on the wrong columns.
+ */
+export function pruneSampleFeatures(
+  samples: HistoricalSample[],
+  keepNames: string[] = PRUNED_FEATURE_NAMES,
+): { samples: HistoricalSample[]; featureNames: string[] } {
+  const indices = keepNames.map((name) => {
+    const idx = HISTORICAL_FEATURE_NAMES.indexOf(name)
+    if (idx < 0) throw new Error(`Unknown feature name: ${name}`)
+    return idx
+  })
+  const pruned = samples.map((sample) => ({
+    ...sample,
+    features: indices.map((idx) => sample.features[idx]),
+    rawFeatures: indices.map((idx) => sample.rawFeatures[idx]),
+  }))
+  return { samples: pruned, featureNames: [...keepNames] }
+}
+
+/* =========================================================================
+   Regime labeling (Hamilton 1989 two-state Markov switching)
+   -------------------------------------------------------------------------
+   Labels each walk-forward step with the market's volatility regime at
+   the step's start, using ONLY market data up to that date (the Markov
+   model is refit per step on the trailing window, and the filtered
+   posterior P(high-vol) at the final observation is causal). This lets
+   us measure whether the model's predictive power is regime-dependent —
+   and, if it is, gate live ML usage on the current regime.
+   ========================================================================= */
+
+export type RegimeLabel = 'low-vol' | 'high-vol'
+
+export type RegimeStepLabel = {
+  testStartDate: string
+  regime: RegimeLabel
+  highProb: number
+}
+
+export function labelStepsByRegime(
+  steps: WalkForwardResult[],
+  marketBars: DailyBar[],
+): RegimeStepLabel[] {
+  return steps.map((step) => {
+    // Bars strictly before the test window start — point-in-time.
+    const history = marketBars.filter((bar) => bar.date < step.testStartDate)
+    const closes = history.map((bar) => bar.close)
+    const returns = logReturns(closes)
+    if (returns.length < 60) {
+      return { testStartDate: step.testStartDate, regime: 'low-vol', highProb: 0 }
+    }
+    // Trailing 2y window keeps the two states responsive to current
+    // conditions instead of averaging over a decade.
+    const trailing = returns.slice(-504)
+    const state = fitMarkovRegime(trailing)
+    const regime: RegimeLabel = state.currentHighProb > 0.5 ? 'high-vol' : 'low-vol'
+    return { testStartDate: step.testStartDate, regime, highProb: state.currentHighProb }
+  })
+}
+
+export type RegimeBreakdown = Record<
+  RegimeLabel,
+  {
+    steps: number
+    meanIC: number
+    meanHitRate: number
+    meanLongShortReturnNet: number
+  }
+>
+
+export function summarizeStepsByRegime(
+  steps: WalkForwardResult[],
+  labels: RegimeStepLabel[],
+): RegimeBreakdown {
+  const byDate = new Map(labels.map((label) => [label.testStartDate, label.regime]))
+  const buckets: Record<RegimeLabel, WalkForwardResult[]> = {
+    'low-vol': [],
+    'high-vol': [],
+  }
+  for (const step of steps) {
+    const regime = byDate.get(step.testStartDate) ?? 'low-vol'
+    buckets[regime].push(step)
+  }
+  const summarize = (group: WalkForwardResult[]) => ({
+    steps: group.length,
+    meanIC:
+      group.reduce((sum, step) => sum + step.informationCoefficient, 0) / Math.max(1, group.length),
+    meanHitRate: group.reduce((sum, step) => sum + step.hitRate, 0) / Math.max(1, group.length),
+    meanLongShortReturnNet:
+      group.reduce((sum, step) => sum + step.longShortReturnNet, 0) / Math.max(1, group.length),
+  })
+  return {
+    'low-vol': summarize(buckets['low-vol']),
+    'high-vol': summarize(buckets['high-vol']),
   }
 }

@@ -19,8 +19,19 @@
 ;(globalThis as Record<string, unknown> & { window?: unknown }).window = globalThis
 
 async function main() {
-  const { DEFAULT_BACKTEST_TICKERS, HISTORICAL_FEATURE_NAMES, buildHistoricalDataset, runWalkForwardBacktest } =
-    await import('../src/data/historicalBacktest')
+  const {
+    DEFAULT_BACKTEST_TICKERS,
+    HISTORICAL_FEATURE_NAMES,
+    PRUNED_FEATURE_NAMES,
+    buildHistoricalDataset,
+    labelStepsByRegime,
+    pruneSampleFeatures,
+    runWalkForwardBacktest,
+    summarizeStepsByRegime,
+  } = await import('../src/data/historicalBacktest')
+  const { cachedFetchDailyBars } = await import('../src/data/marketData')
+
+  const usePruned = process.argv.includes('--pruned')
 
   console.log(`Building dataset for ${DEFAULT_BACKTEST_TICKERS.length} tickers (5y bars via proxy)…`)
   const started = Date.now()
@@ -46,9 +57,21 @@ async function main() {
     process.exit(1)
   }
 
+  // Optional pruning to the importance-survivor feature set
+  let samples = built.samples
+  let featureNames: string[] = [...HISTORICAL_FEATURE_NAMES]
+  if (usePruned) {
+    const pruned = pruneSampleFeatures(built.samples, PRUNED_FEATURE_NAMES)
+    samples = pruned.samples
+    featureNames = pruned.featureNames
+    console.log(
+      `Pruned to ${featureNames.length}/${HISTORICAL_FEATURE_NAMES.length} importance-positive features.`,
+    )
+  }
+
   console.log('Running purged+embargoed walk-forward (nested-CV hyperparameters)…')
-  const result = runWalkForwardBacktest(built.samples, {
-    initialTrainSize: Math.floor(built.samples.length * 0.6),
+  const result = runWalkForwardBacktest(samples, {
+    initialTrainSize: Math.floor(samples.length * 0.6),
     testSize: 60,
     stepSize: 60,
   })
@@ -57,11 +80,17 @@ async function main() {
     process.exit(1)
   }
 
+  // Regime labeling: point-in-time Markov regime on SPY at each step start
+  console.log('Labeling walk-forward steps by SPY Markov regime…')
+  const spyBars = await cachedFetchDailyBars('SPY', '5y')
+  const regimeLabels = labelStepsByRegime(result.steps, spyBars)
+  const regimeBreakdown = summarizeStepsByRegime(result.steps, regimeLabels)
+
   const elapsed = ((Date.now() - started) / 1000).toFixed(0)
   const f = (value: number, digits = 3) => value.toFixed(digits)
 
   console.log('')
-  console.log('=== WALK-FORWARD RESULTS (out-of-sample) ===')
+  console.log(`=== WALK-FORWARD RESULTS (out-of-sample, ${usePruned ? 'PRUNED' : 'FULL'} feature set: ${featureNames.length}) ===`)
   console.log(`samples=${result.totalSamples} steps=${result.steps.length} elapsed=${elapsed}s`)
   console.log(
     `hyperparameters: trees=${result.hyperparameters.numTrees} depth=${result.hyperparameters.depth} lr=${result.hyperparameters.learningRate}`,
@@ -89,18 +118,29 @@ async function main() {
     console.log(`  ${String(bundle.horizon).padStart(3)}d: IC ${f(bundle.meanIC)} hit ${f(bundle.meanHitRate * 100, 1)}%`)
   }
   console.log('')
+  console.log('--- Regime breakdown (Hamilton Markov on SPY, point-in-time) ---')
+  for (const regime of ['low-vol', 'high-vol'] as const) {
+    const bucket = regimeBreakdown[regime]
+    console.log(
+      `  ${regime.padEnd(9)} steps=${bucket.steps}  IC ${f(bucket.meanIC)}  hit ${f(bucket.meanHitRate * 100, 1)}%  L/S net ${f(bucket.meanLongShortReturnNet, 2)}%`,
+    )
+  }
+  console.log('')
   console.log('--- Permutation feature importance (mean IC drop) ---')
   const ranked = result.meanFeatureImportance
-    .map((value, idx) => ({ name: HISTORICAL_FEATURE_NAMES[idx] ?? `f${idx}`, value }))
+    .map((value, idx) => ({ name: featureNames[idx] ?? `f${idx}`, value }))
     .sort((left, right) => right.value - left.value)
   for (const entry of ranked) {
     console.log(`  ${entry.name.padEnd(18)} ${entry.value >= 0 ? '+' : ''}${f(entry.value)}`)
   }
   console.log('')
   console.log('--- Per-step history ---')
+  const regimeByDate = new Map(regimeLabels.map((label) => [label.testStartDate, label]))
   for (const step of result.steps) {
+    const label = regimeByDate.get(step.testStartDate)
+    const regimeTag = label ? `${label.regime === 'high-vol' ? 'HIGH' : 'low '} p=${f(label.highProb, 2)}` : ''
     console.log(
-      `  ${step.testStartDate} → ${step.testEndDate}  IC ${f(step.informationCoefficient)}  hit ${f(step.hitRate * 100, 0)}%  L/S net ${f(step.longShortReturnNet, 2)}%  (train ${step.trainSize})`,
+      `  ${step.testStartDate} → ${step.testEndDate}  IC ${f(step.informationCoefficient)}  hit ${f(step.hitRate * 100, 0)}%  L/S net ${f(step.longShortReturnNet, 2)}%  [${regimeTag}]`,
     )
   }
 }

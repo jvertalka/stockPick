@@ -2,9 +2,16 @@ import { cachedFetchDailyBars } from './marketData'
 import {
   computeFeaturesAtDate,
   HISTORICAL_FEATURE_NAMES,
+  type RegimeLabel,
 } from './historicalBacktest'
 import { kvGet, kvSet, type DecisionLogEntry } from './storage'
-import { predictGradientBoosting, type GradientBoostingModel } from './quantMath'
+import {
+  fitMarkovRegime,
+  logReturns,
+  predictGradientBoosting,
+  type GradientBoostingModel,
+} from './quantMath'
+import { ML_REGIME_GATE } from './quantConfig'
 
 /**
  * Live ML model service — bridges the historical backtest's trained
@@ -76,6 +83,10 @@ export async function persistModel(
     hyperparameters: { numTrees: number; depth: number; learningRate: number }
     p10Model?: GradientBoostingModel
     p90Model?: GradientBoostingModel
+    /** Names of the features the model was trained on, in column order.
+     * Defaults to the full set; pruned models MUST pass their subset so
+     * live predictions slice the same columns. */
+    featureNames?: string[]
   },
 ): Promise<void> {
   const stored: StoredMlModel = {
@@ -84,7 +95,7 @@ export async function persistModel(
     p90Model: meta.p90Model,
     trainedAt: new Date().toISOString(),
     featureCount: model.numFeatures,
-    featureNames: HISTORICAL_FEATURE_NAMES,
+    featureNames: meta.featureNames ?? HISTORICAL_FEATURE_NAMES,
     featureMeans: meta.featureMeans,
     featureStds: meta.featureStds,
     meanIC: meta.meanIC,
@@ -125,8 +136,18 @@ export async function predictForTicker(
 ): Promise<LivePrediction | null> {
   const bars = await cachedFetchDailyBars(ticker, '5y')
   if (bars.length < 280) return null
-  const features = computeFeaturesAtDate(bars, bars.length - 1)
-  if (!features) return null
+  const fullFeatures = computeFeaturesAtDate(bars, bars.length - 1)
+  if (!fullFeatures) return null
+  // Respect the model's feature subset: a model trained on pruned
+  // features stores its featureNames, and live features must be sliced
+  // to the same columns in the same order before prediction.
+  const features =
+    model.featureNames.length > 0 && model.featureNames.length !== HISTORICAL_FEATURE_NAMES.length
+      ? model.featureNames.map((name) => {
+          const idx = HISTORICAL_FEATURE_NAMES.indexOf(name)
+          return idx >= 0 ? fullFeatures[idx] : 0
+        })
+      : fullFeatures
   // Normalize using training-set statistics (Z-scoring against historical
   // distribution, not against the current cross-section)
   const normalized = features.map((value, i) => {
@@ -293,5 +314,63 @@ export function predictionToLogEntry(
     riskScore: 50,
     confidence: 50 + Math.abs(modelMeanIc) * 200,
     reason: `ML model 20d forecast: ${prediction.predictedReturn20d >= 0 ? '+' : ''}${prediction.predictedReturn20d.toFixed(2)}%`,
+  }
+}
+
+/* =========================================================================
+   Regime gate (Hamilton 1989 Markov switching on SPY)
+   -------------------------------------------------------------------------
+   The walk-forward backtest measures the model's IC separately per market
+   regime. When one regime shows no (or negative) out-of-sample IC, acting
+   on ML predictions in that regime is uncompensated risk — so the app
+   suppresses ML-driven action overrides there and falls back to rules.
+   Gate direction + thresholds live in quantConfig.ML_REGIME_GATE with the
+   measurement that justified them.
+   ========================================================================= */
+
+export type RegimeGate = {
+  regime: RegimeLabel
+  highProb: number
+  /** True when ML action overrides should be suppressed in this regime */
+  gated: boolean
+  detail: string
+}
+
+let regimeGateCache: { expires: number; value: Promise<RegimeGate> } | null = null
+
+export function getRegimeGate(): Promise<RegimeGate> {
+  const now = Date.now()
+  if (regimeGateCache && regimeGateCache.expires > now) return regimeGateCache.value
+  const value = computeRegimeGate()
+  regimeGateCache = { expires: now + 60 * 60 * 1000, value }
+  return value
+}
+
+async function computeRegimeGate(): Promise<RegimeGate> {
+  const fallback: RegimeGate = {
+    regime: 'low-vol',
+    highProb: 0,
+    gated: false,
+    detail: 'Regime undetermined (no SPY history) — ML ungated by default.',
+  }
+  try {
+    const bars = await cachedFetchDailyBars('SPY', '5y')
+    const closes = bars.map((bar) => bar.close)
+    const returns = logReturns(closes)
+    if (returns.length < 120) return fallback
+    // Same trailing window the backtest's regime labeling uses.
+    const state = fitMarkovRegime(returns.slice(-504))
+    const regime: RegimeLabel = state.currentHighProb > 0.5 ? 'high-vol' : 'low-vol'
+    const gated = ML_REGIME_GATE.gatedRegime != null && regime === ML_REGIME_GATE.gatedRegime
+    return {
+      regime,
+      highProb: state.currentHighProb,
+      gated,
+      detail: gated
+        ? `SPY is in the ${regime} state (P=${(state.currentHighProb * 100).toFixed(0)}%). ${ML_REGIME_GATE.rationale}`
+        : `SPY is in the ${regime} state (P=${(state.currentHighProb * 100).toFixed(0)}%) — ML predictions active.`,
+    }
+  } catch {
+    return fallback
   }
 }

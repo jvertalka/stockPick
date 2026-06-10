@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react'
 import { Activity, Play } from 'lucide-react'
 import {
   DEFAULT_BACKTEST_TICKERS,
-  HISTORICAL_FEATURE_NAMES,
+  PRUNED_FEATURE_NAMES,
   type DatasetBuildResult,
   type FullBacktestResult,
 } from '../data/historicalBacktest'
@@ -22,8 +22,9 @@ const BACKTEST_TICKERS = DEFAULT_BACKTEST_TICKERS
 
 // Cache key includes a schema version so stale entries from earlier
 // builds don't crash the panel when fields rename or get added.
-// Schema bump for multi-horizon ensemble + prediction intervals
-const CACHE_KEY = 'backtest:last-result:v4'
+// Schema bump: v5 trains on the pruned 12-feature set (importance study
+// 2026-05-12); cached v4 results carry 30-feature importance vectors.
+const CACHE_KEY = 'backtest:last-result:v5'
 
 export function BacktestPanel() {
   const [running, setRunning] = useState(false)
@@ -109,6 +110,9 @@ export function BacktestPanel() {
             hyperparameters: backtestResult.hyperparameters,
             p10Model: bundle20?.p10Model,
             p90Model: bundle20?.p90Model,
+            // The worker trains on the pruned feature set; live predictions
+            // must slice the same columns.
+            featureNames: PRUNED_FEATURE_NAMES,
           })
           setRunning(false)
           setProgress(null)
@@ -338,7 +342,7 @@ export function BacktestPanel() {
             signal. Near-zero or negative = the feature is noise (or
             actively hurting the model).
           </p>
-          <FeatureImportancePlot importance={result.meanFeatureImportance} names={HISTORICAL_FEATURE_NAMES} />
+          <FeatureImportancePlot importance={result.meanFeatureImportance} names={PRUNED_FEATURE_NAMES} />
 
           <h3 className="backtest-section-title">Decile-portfolio analysis (last test window)</h3>
           <p className="backtest-section-note">

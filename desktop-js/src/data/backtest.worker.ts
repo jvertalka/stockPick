@@ -1,7 +1,9 @@
 /// <reference lib="webworker" />
 
 import {
+  PRUNED_FEATURE_NAMES,
   buildHistoricalDataset,
+  pruneSampleFeatures,
   runWalkForwardBacktest,
   type DatasetBuildResult,
   type FullBacktestResult,
@@ -70,8 +72,14 @@ ctx.onmessage = async (event: MessageEvent<RunMessage>) => {
       return
     }
 
-    const result = runWalkForwardBacktest(built.samples, {
-      initialTrainSize: Math.floor(built.samples.length * 0.6),
+    // Train on the importance-survivor feature subset. The 2026-05-12
+    // pruning study (see PRUNED_FEATURE_NAMES) doubled out-of-sample IC
+    // (0.040 → 0.076) and halved max drawdown by dropping the 18 features
+    // with zero/negative permutation importance.
+    const pruned = pruneSampleFeatures(built.samples, PRUNED_FEATURE_NAMES)
+
+    const result = runWalkForwardBacktest(pruned.samples, {
+      initialTrainSize: Math.floor(pruned.samples.length * 0.6),
       testSize: 60,
       stepSize: 60,
       modelOptions,

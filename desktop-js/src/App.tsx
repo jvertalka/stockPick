@@ -77,11 +77,13 @@ import {
 } from './data/optionsEnhancer'
 import { cachedComputeQuantAnalysis, type QuantAnalysis } from './data/quantAnalysis'
 import {
+  getRegimeGate,
   loadModel,
   logLivePrediction,
   predictForUniverse,
   reconcilePredictions,
   type LivePrediction,
+  type RegimeGate,
   type StoredMlModel,
 } from './data/mlModelService'
 import {
@@ -1763,6 +1765,7 @@ function App() {
   // ML model state: persisted GBT loaded from IndexedDB + live predictions
   // for the visible universe + A/B decision mode toggle.
   const [mlModel, setMlModel] = useState<StoredMlModel | null>(null)
+  const [regimeGate, setRegimeGate] = useState<RegimeGate | null>(null)
   const [mlPredictions, setMlPredictions] = useState<Map<string, LivePrediction>>(
     () => new Map(),
   )
@@ -1806,8 +1809,12 @@ function App() {
         })
       })
     }
-    // A/B decision mode: override action with ML prediction (or blend) when configured.
-    if (decisionMode !== 'rules' && mlPredictions.size > 0) {
+    // A/B decision mode: override action with ML prediction (or blend) when
+    // configured — UNLESS the regime gate is closed. The 2026-05-12 backtest
+    // measured IC 0.021 / 50.2% hit rate (coin flip) for the model in
+    // high-vol Markov regimes, so ML overrides are suppressed there and the
+    // engine falls back to rules (see quantConfig.ML_REGIME_GATE).
+    if (decisionMode !== 'rules' && mlPredictions.size > 0 && !regimeGate?.gated) {
       withQuant = withQuant.map((signal) => {
         const prediction = mlPredictions.get(signal.ticker)
         if (!prediction) return signal
@@ -1831,7 +1838,7 @@ function App() {
       })
     }
     return withQuant
-  }, [activeScenario, signalInputs, optionsSnapshots, quantAnalyses, decisionMode, mlPredictions])
+  }, [activeScenario, signalInputs, optionsSnapshots, quantAnalyses, decisionMode, mlPredictions, regimeGate])
   const sectors = useMemo(() => ['All', ...Array.from(new Set(universe.map((row) => row.sector))).sort()], [universe])
   const activeMarketContext = useMemo(
     () => ({ ...marketContext, ...(decisionFeed?.marketContext ?? {}) }),
@@ -2195,6 +2202,10 @@ function App() {
     void loadModel().then((stored) => {
       if (cancelled) return
       setMlModel(stored)
+    })
+    void getRegimeGate().then((gate) => {
+      if (cancelled) return
+      setRegimeGate(gate)
     })
     void reconcilePredictions()
     return () => {
@@ -2631,6 +2642,11 @@ function App() {
                   <option value="ensemble">Ensemble</option>
                 </select>
               </label>
+            ) : null}
+            {mlModel && regimeGate?.gated && decisionMode !== 'rules' ? (
+              <span className="regime-gate-chip" title={regimeGate.detail}>
+                ML regime-gated
+              </span>
             ) : null}
           </div>
         </header>
