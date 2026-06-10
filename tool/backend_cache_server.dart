@@ -147,6 +147,14 @@ class BackendCacheServer {
         }
         previousReturned = returned;
       }
+      // Each pass above queued EDGAR fundamentals for its scoreable stocks;
+      // wait for that queue to drain so boot ends with fundamentals ready.
+      final fundamentals = SecFundamentalsService.instance(_cache);
+      await fundamentals.ensureWarm(const []);
+      stdout.writeln(
+        'EDGAR fundamentals ready: ${fundamentals.coveredCount}/'
+        '${fundamentals.attemptedCount} stocks with computed metrics.',
+      );
     } catch (error) {
       // Warmup is best-effort; the HTTP routes still work without it.
       stdout.writeln('Universe warmup stopped: $error');
@@ -190,6 +198,27 @@ class BackendCacheServer {
             cache: _cache,
           ).build(request.uri),
         );
+        return;
+      }
+      if (path == '/fundamentals/history') {
+        final symbol =
+            request.uri.queryParameters['symbol']?.trim().toUpperCase() ?? '';
+        final payload = symbol.isEmpty
+            ? null
+            : await SecFundamentalsService.instance(
+                _cache,
+              ).historyFor(symbol);
+        if (payload == null) {
+          request.response.statusCode = HttpStatus.notFound;
+          await _writeJson(request.response, {
+            'error': 'fundamentals_not_available',
+            'detail':
+                'No SEC companyfacts for "$symbol" — ETFs and non-SEC '
+                'filers have no XBRL filings.',
+          });
+        } else {
+          await _writeJson(request.response, payload);
+        }
         return;
       }
       if (path == '/proxy') {
@@ -465,7 +494,13 @@ class MarketDataCache {
     );
     request.headers.set(
       HttpHeaders.userAgentHeader,
-      'FinanceOracleLocalCache/1.0 (${Platform.operatingSystem})',
+      // SEC fair-access policy requires the User-Agent to identify the
+      // requester with a contact address (https://www.sec.gov/os/accessing-
+      // edgar-data); generic UAs get 403 "Request Rate Threshold Exceeded".
+      uri.host.toLowerCase().endsWith('sec.gov')
+          ? 'FinanceOracleWorkstation/1.0 (personal research; '
+                'joshua.j.vertalka@gmail.com)'
+          : 'FinanceOracleLocalCache/1.0 (${Platform.operatingSystem})',
     );
     if (authHeader != null && authHeader.isNotEmpty) {
       request.headers.set(HttpHeaders.authorizationHeader, authHeader);
@@ -529,6 +564,16 @@ class _CachePolicy {
         return const _CachePolicy(
           ttl: Duration(hours: 24),
           timeout: Duration(seconds: 10),
+        );
+      }
+      if (path.contains('/api/xbrl/companyfacts/')) {
+        // Fundamentals change on filing cadence (10-Q every ~90 days), and
+        // these payloads are megabytes each across hundreds of tickers; a
+        // 7-day TTL keeps us at most a week behind a new filing without
+        // re-pulling gigabytes from SEC daily.
+        return const _CachePolicy(
+          ttl: Duration(days: 7),
+          timeout: Duration(seconds: 20),
         );
       }
       return const _CachePolicy(
@@ -689,6 +734,22 @@ class DecisionUniverseService {
       }
     }
 
+    // SEC EDGAR fundamentals: fill quality/value/growth fields with
+    // cross-sectionally ranked XBRL metrics for whatever stocks have been
+    // computed so far, and queue a background warm for stale/missing ones.
+    // Uncovered names keep neutral values — never simulated (CLAUDE.md).
+    final fundamentalsService = SecFundamentalsService.instance(_cache);
+    unawaited(
+      fundamentalsService.ensureWarm([
+        for (final signal in signals)
+          if (signal['assetType'] != 'ETF') signal['ticker'] as String,
+      ]),
+    );
+    final fundamentalsCoverage = fundamentalsService.overlayOnSignals(
+      signals,
+      isFullUniverse: limit <= 0,
+    );
+
     final summaries = signals.map(_summaryForRawSignal).toList();
     final topBuy = summaries
         .where((row) => row.action == 'Buy Now' || row.action == 'Accumulate')
@@ -732,11 +793,12 @@ class DecisionUniverseService {
       'asOf': asOf.toIso8601String(),
       'source': 'finance-oracle-backend-cache',
       'detail': signals.isNotEmpty
-          ? 'Decision signals use cached OHLCV for trend, volatility, liquidity, breadth, drawdown, and relative strength. Fundamentals, estimate revisions, and listed-options feeds are not connected yet, so those fields are held neutral instead of simulated.'
+          ? 'Decision signals use cached OHLCV for trend, volatility, liquidity, breadth, drawdown, and relative strength. SEC EDGAR XBRL fundamentals cover $fundamentalsCoverage of ${signals.length} names (quality, margin trend, free cash flow, revenue acceleration, valuation — ranked cross-sectionally with sector adjustment). Estimate revisions and listed-options feeds are not connected, so those fields stay neutral/proxied instead of simulated.'
           : 'Recommendations paused: no symbols have enough fresh cached OHLCV to support Buy/Hold/Sell decisions. Run Sync prices and wait for usable price coverage.',
       'universeSize': fullUniverse.length,
       'returned': signals.length,
       'excludedForInsufficientData': fullUniverse.length - signals.length,
+      'fundamentalsCoverage': fundamentalsCoverage,
       'scenario': scenario,
       'marketContext': _marketContextFor(summaries, analytics),
       'rawSignals': signals,
@@ -2080,4 +2142,853 @@ double _breakoutQuality(List<DecisionPriceBar> bars, int lookback) {
   }
   final distanceFromHigh = (bars.last.close / high - 1) * 100;
   return _bounded(82 + distanceFromHigh * 3.4);
+}
+
+/// SEC EDGAR XBRL fundamentals.
+///
+/// Pulls point-in-time facts from the official companyfacts API, reduces
+/// them to trailing-twelve-month metrics, and fills the decision universe's
+/// fundamental fields with cross-sectional percentile ranks. Symbols without
+/// computed fundamentals (ETFs, non-SEC filers, not-yet-warmed names) keep
+/// their neutral values — never simulated.
+///
+/// Sources (both already on the proxy allowlist):
+///   - https://www.sec.gov/files/company_tickers.json          ticker -> CIK
+///   - https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json  all facts
+///
+/// Metric direction follows the published factor literature:
+///   - profitability/quality: Novy-Marx (2013, JFE); Asness-Frazzini-
+///     Pedersen "Quality Minus Junk" (2019, RAS) — and like QMJ, ranks are
+///     industry-adjusted (averaged with within-sector ranks when the sector
+///     has enough names).
+///   - value as earnings yield: Basu (1977, JF).
+///   - leverage penalty: Fama-French (1992, JF) leverage/distress loadings.
+///   - net share issuance penalty: Pontiff-Woodgate (2008, JF).
+class SecFundamentalsService {
+  SecFundamentalsService._(this._cache);
+
+  static SecFundamentalsService? _singleton;
+
+  /// Process-wide instance so computed metrics survive across requests
+  /// (DecisionUniverseService is constructed per request).
+  factory SecFundamentalsService.instance(MarketDataCache cache) =>
+      _singleton ??= SecFundamentalsService._(cache);
+
+  final MarketDataCache _cache;
+  final Map<String, _SymbolFundamentals?> _bySymbol = {};
+  final Map<String, DateTime> _computedAt = {};
+  final Set<String> _queue = {};
+  Future<void>? _drain;
+  Map<String, String>? _cikByTicker;
+  bool _lastFetchTouchedNetwork = false;
+
+  /// Companyfacts changes only when a company files (10-Q cadence is ~90
+  /// days), so re-parsing daily is plenty; the network TTL is governed by
+  /// _CachePolicy (7 days for companyfacts).
+  static const Duration _recomputeAfter = Duration(hours: 24);
+
+  /// SEC fair-access guidance caps clients at 10 req/s; pause only after
+  /// real network fetches so cache-hit re-warms stay fast.
+  static const Duration _politePause = Duration(milliseconds: 150);
+
+  static const List<String> _revenueConcepts = [
+    'RevenueFromContractWithCustomerExcludingAssessedTax',
+    'Revenues',
+    'SalesRevenueNet',
+    'RevenueFromContractWithCustomerIncludingAssessedTax',
+  ];
+  static const List<String> _netIncomeConcepts = [
+    'NetIncomeLoss',
+    'ProfitLoss',
+  ];
+  static const List<String> _operatingCashFlowConcepts = [
+    'NetCashProvidedByUsedInOperatingActivities',
+    'NetCashProvidedByUsedInOperatingActivitiesContinuingOperations',
+  ];
+  static const List<String> _capexConcepts = [
+    'PaymentsToAcquirePropertyPlantAndEquipment',
+    'PaymentsToAcquireProductiveAssets',
+  ];
+  static const List<String> _equityConcepts = [
+    'StockholdersEquity',
+    'StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest',
+  ];
+  static const List<String> _shareFallbackConcepts = [
+    'CommonStockSharesOutstanding',
+    'WeightedAverageNumberOfDilutedSharesOutstanding',
+  ];
+
+  int get coveredCount => _bySymbol.values.where((f) => f != null).length;
+  int get attemptedCount => _computedAt.length;
+
+  /// Queue stale/missing symbols and return a future that completes when
+  /// the queue is drained. Safe to call repeatedly: symbols queued while a
+  /// drain is running are handled by that same drain.
+  Future<void> ensureWarm(Iterable<String> symbols) {
+    final now = DateTime.now().toUtc();
+    for (final symbol in symbols) {
+      final at = _computedAt[symbol];
+      if (at == null || now.difference(at) > _recomputeAfter) {
+        _queue.add(symbol);
+      }
+    }
+    if (_queue.isEmpty) {
+      return _drain ?? Future<void>.value();
+    }
+    return _drain ??= _drainQueue().whenComplete(() => _drain = null);
+  }
+
+  Future<void> _drainQueue() async {
+    var attempted = 0;
+    var computed = 0;
+    while (_queue.isNotEmpty) {
+      final symbol = _queue.first;
+      _queue.remove(symbol);
+      attempted++;
+      try {
+        final fundamentals = await _compute(symbol);
+        _bySymbol[symbol] = fundamentals;
+        if (fundamentals != null) {
+          computed++;
+        }
+      } catch (_) {
+        // Best-effort: leave the symbol uncovered (fields stay neutral);
+        // it is retried after _recomputeAfter.
+      }
+      _computedAt[symbol] = DateTime.now().toUtc();
+      if (_lastFetchTouchedNetwork) {
+        await Future<void>.delayed(_politePause);
+      }
+    }
+    if (attempted > 0) {
+      stdout.writeln(
+        'EDGAR fundamentals: computed $computed/$attempted symbols this pass '
+        '($coveredCount covered total)',
+      );
+    }
+  }
+
+  /// Ranks from the most recent full-universe build, reused for limited
+  /// builds so a symbol's percentile never depends on the request's
+  /// `limit` parameter.
+  Map<String, Map<String, double>> _lastFullRanks = {};
+
+  /// Fill fundamental fields of stock raw-signals in place; returns how
+  /// many symbols got at least one field. Must run BEFORE the signals are
+  /// scored so the filled values flow into composites. [isFullUniverse]
+  /// marks builds whose cross-section spans the whole scored universe;
+  /// those refresh the stored ranks that limited builds reuse.
+  int overlayOnSignals(
+    List<Map<String, Object?>> signals, {
+    required bool isFullUniverse,
+  }) {
+    final eligible = [
+      for (final signal in signals)
+        if (signal['assetType'] != 'ETF') signal,
+    ];
+    if (eligible.isEmpty) {
+      return 0;
+    }
+    final sectorBySymbol = <String, String>{
+      for (final signal in eligible)
+        signal['ticker'] as String: (signal['sector'] as String?) ?? 'Unknown',
+    };
+
+    // Gather raw metric vectors across the covered cross-section.
+    final values = <String, Map<String, double>>{};
+    for (final signal in eligible) {
+      final symbol = signal['ticker'] as String;
+      final fund = _bySymbol[symbol];
+      if (fund == null) {
+        continue;
+      }
+      void put(String metric, double? value) {
+        if (value != null && value.isFinite) {
+          (values[metric] ??= {})[symbol] = value;
+        }
+      }
+
+      put('revGrowth', fund.revenueGrowthYoYPct);
+      put('revAccel', fund.revenueAccelPp);
+      put('margin', fund.netMarginPct);
+      put('marginTrend', fund.marginTrendPp);
+      put('fcfMargin', fund.fcfMarginPct);
+      put('leverage', fund.leveragePct);
+      put('roe', fund.roePct);
+      put('shareChange', fund.shareChangeYoYPct);
+      final lastPrice = (signal['lastPrice'] as num?)?.toDouble();
+      final shares = fund.sharesOutstanding;
+      final ttmNetIncome = fund.ttmNetIncomeUsd;
+      if (lastPrice != null &&
+          lastPrice > 0 &&
+          shares != null &&
+          shares > 0 &&
+          ttmNetIncome != null) {
+        // Basu (1977): earnings yield E/P, computed against live price.
+        put('earningsYield', ttmNetIncome / (lastPrice * shares) * 100);
+      }
+    }
+
+    // Cross-sectional ranks need breadth to mean anything; below this the
+    // fields stay neutral until the warm pass covers more names.
+    const minBreadth = 20;
+    var ranks = <String, Map<String, double>>{};
+    values.forEach((metric, bySymbol) {
+      if (bySymbol.length >= minBreadth) {
+        ranks[metric] = _sectorAdjustedRanks(bySymbol, sectorBySymbol);
+      }
+    });
+    if (isFullUniverse && ranks.isNotEmpty) {
+      _lastFullRanks = ranks;
+    } else if (!isFullUniverse && _lastFullRanks.isNotEmpty) {
+      // Limited build: reuse the full-universe percentiles so the same
+      // symbol scores identically regardless of the request's limit.
+      ranks = _lastFullRanks;
+    }
+    if (ranks.isEmpty) {
+      return 0;
+    }
+
+    var covered = 0;
+    for (final signal in eligible) {
+      final symbol = signal['ticker'] as String;
+      final fund = _bySymbol[symbol];
+      if (fund == null) {
+        continue;
+      }
+      double? rank(String metric) => ranks[metric]?[symbol];
+
+      var fieldsFilled = 0;
+      void fill(String field, double? value) {
+        if (value == null || !value.isFinite) {
+          return;
+        }
+        signal[field] = _bounded(value);
+        fieldsFilled++;
+      }
+
+      // Growth: level + change. Weighting the level higher reflects that
+      // YoY growth is the better-attested predictor; acceleration is a
+      // second-order refinement (Jegadeesh-Livnat 2006 revenue surprises).
+      final growthRank = rank('revGrowth');
+      final accelRank = rank('revAccel');
+      fill(
+        'revenueAcceleration',
+        growthRank == null
+            ? null
+            : (accelRank == null
+                  ? growthRank
+                  : growthRank * 0.6 + accelRank * 0.4),
+      );
+
+      // Margin: level and trend equally weighted (level = profitability per
+      // Novy-Marx 2013; trend = improving fundamentals).
+      final marginRank = rank('margin');
+      final marginTrendRank = rank('marginTrend');
+      fill(
+        'marginTrend',
+        marginRank == null && marginTrendRank == null
+            ? null
+            : ((marginRank ?? marginTrendRank)! * 0.5 +
+                  (marginTrendRank ?? marginRank)! * 0.5),
+      );
+
+      fill('freeCashFlowTrend', rank('fcfMargin'));
+
+      // Quality composite: profitability + ROE + low leverage + low net
+      // issuance, equal-weighted across whichever parts exist (QMJ-style).
+      final qualityParts = <double>[
+        if (rank('margin') != null) rank('margin')!,
+        if (rank('roe') != null) rank('roe')!,
+        if (rank('leverage') != null) 100 - rank('leverage')!,
+        if (rank('shareChange') != null) 100 - rank('shareChange')!,
+      ];
+      fill(
+        'quality',
+        qualityParts.length >= 2
+            ? qualityParts.reduce((a, b) => a + b) / qualityParts.length
+            : null,
+      );
+
+      fill('valuationSupport', rank('earningsYield'));
+
+      if (fieldsFilled == 0) {
+        continue;
+      }
+      covered++;
+      final filedThrough = fund.filedThrough?.toIso8601String().split('T')[0];
+      signal['fundamentalsAsOf'] = filedThrough;
+      signal['fundamentalsSource'] = 'sec-edgar-xbrl';
+      signal['dataSource'] = '${signal['dataSource']}+edgar';
+      final confidence = (signal['dataConfidence'] as num?)?.toDouble() ?? 50;
+      signal['dataConfidence'] = math.min(confidence + 10, 88);
+      final warnings =
+          (signal['dataWarnings'] as List?)?.cast<String>() ?? <String>[];
+      signal['dataWarnings'] = [
+        for (final warning in warnings)
+          if (!warning.startsWith('Fundamental and estimate-revision'))
+            warning,
+        'Fundamentals from SEC EDGAR XBRL filings (filed through '
+            '${filedThrough ?? 'n/a'}). Estimate-revision fields remain '
+            'neutral: no analyst feed is connected.',
+      ];
+    }
+    return covered;
+  }
+
+  /// Percentile ranks averaged with within-sector ranks when the sector has
+  /// enough names (industry adjustment per Novy-Marx 2013 / QMJ 2019; the
+  /// equal blend is a neutral shrinkage prior pending a measured backtest).
+  Map<String, double> _sectorAdjustedRanks(
+    Map<String, double> bySymbol,
+    Map<String, String> sectorBySymbol,
+  ) {
+    const minSectorBreadth = 8;
+    final global = _percentileRanks(bySymbol);
+    final bySector = <String, Map<String, double>>{};
+    bySymbol.forEach((symbol, value) {
+      final sector = sectorBySymbol[symbol] ?? 'Unknown';
+      (bySector[sector] ??= {})[symbol] = value;
+    });
+    final out = <String, double>{};
+    bySector.forEach((sector, group) {
+      if (group.length >= minSectorBreadth) {
+        final local = _percentileRanks(group);
+        group.forEach((symbol, _) {
+          out[symbol] = (local[symbol]! + global[symbol]!) / 2;
+        });
+      } else {
+        group.forEach((symbol, _) {
+          out[symbol] = global[symbol]!;
+        });
+      }
+    });
+    return out;
+  }
+
+  /// Mid-rank percentiles on [0, 100] with proper tie handling.
+  Map<String, double> _percentileRanks(Map<String, double> bySymbol) {
+    final entries = bySymbol.entries.toList()
+      ..sort((a, b) => a.value.compareTo(b.value));
+    final n = entries.length;
+    final out = <String, double>{};
+    var index = 0;
+    while (index < n) {
+      var j = index;
+      while (j + 1 < n && entries[j + 1].value == entries[index].value) {
+        j++;
+      }
+      final midRank = (index + j) / 2;
+      final pct = n == 1 ? 50.0 : midRank / (n - 1) * 100;
+      for (var k = index; k <= j; k++) {
+        out[entries[k].key] = pct;
+      }
+      index = j + 1;
+    }
+    return out;
+  }
+
+  /// Raw filing series + computed metrics for one symbol — feeds the
+  /// /fundamentals/history endpoint and (later) point-in-time ML features.
+  /// Every row carries both the period `end` and the `filed` date; ML must
+  /// key features by `filed` to stay look-ahead safe.
+  Future<Map<String, Object?>?> historyFor(String symbol) async {
+    final cik = (await _loadCikMap())[_normalizeTicker(symbol)];
+    if (cik == null) {
+      return null;
+    }
+    final json = await _fetchJson(
+      Uri.parse('https://data.sec.gov/api/xbrl/companyfacts/CIK$cik.json'),
+    );
+    final facts = json?['facts'];
+    if (facts is! Map) {
+      return null;
+    }
+
+    List<Map<String, Object?>> rows(List<_FactRow> series) => [
+      for (final row in series)
+        {
+          'end': row.end.toIso8601String().split('T')[0],
+          if (row.start != null)
+            'start': row.start!.toIso8601String().split('T')[0],
+          'filed': row.filed.toIso8601String().split('T')[0],
+          'value': row.value,
+          'form': row.form,
+          'span': row.start == null
+              ? 'instant'
+              : row.isQuarterFlow
+              ? 'quarter'
+              : row.isAnnualFlow
+              ? 'annual'
+              : 'other',
+        },
+    ];
+
+    var shares = _series(facts, 'dei', const [
+      'EntityCommonStockSharesOutstanding',
+    ], 'shares');
+    if (shares.isEmpty) {
+      shares = _series(facts, 'us-gaap', _shareFallbackConcepts, 'shares');
+    }
+
+    return {
+      'symbol': symbol,
+      'cik': cik,
+      'source': 'sec-edgar-xbrl',
+      'note':
+          'Rows carry period end AND filed dates. Use filed for '
+          'look-ahead-safe (point-in-time) features.',
+      'series': {
+        'revenue': rows(_series(facts, 'us-gaap', _revenueConcepts, 'USD')),
+        'netIncome': rows(
+          _series(facts, 'us-gaap', _netIncomeConcepts, 'USD'),
+        ),
+        'operatingCashFlow': rows(
+          _series(facts, 'us-gaap', _operatingCashFlowConcepts, 'USD'),
+        ),
+        'capex': rows(_series(facts, 'us-gaap', _capexConcepts, 'USD')),
+        'assets': rows(_series(facts, 'us-gaap', const ['Assets'], 'USD')),
+        'liabilities': rows(
+          _series(facts, 'us-gaap', const ['Liabilities'], 'USD'),
+        ),
+        'equity': rows(_series(facts, 'us-gaap', _equityConcepts, 'USD')),
+        'shares': rows(shares),
+      },
+      'metrics': _bySymbol[symbol]?.toJson(),
+    };
+  }
+
+  Future<_SymbolFundamentals?> _compute(String symbol) async {
+    final cik = (await _loadCikMap())[_normalizeTicker(symbol)];
+    if (cik == null) {
+      return null;
+    }
+    final json = await _fetchJson(
+      Uri.parse('https://data.sec.gov/api/xbrl/companyfacts/CIK$cik.json'),
+    );
+    final facts = json?['facts'];
+    if (facts is! Map) {
+      return null;
+    }
+
+    final revenue = _series(facts, 'us-gaap', _revenueConcepts, 'USD');
+    final netIncome = _series(facts, 'us-gaap', _netIncomeConcepts, 'USD');
+    final cashFlow = _series(
+      facts,
+      'us-gaap',
+      _operatingCashFlowConcepts,
+      'USD',
+    );
+    final capex = _series(facts, 'us-gaap', _capexConcepts, 'USD');
+    final assets = _series(facts, 'us-gaap', const ['Assets'], 'USD');
+    final liabilities = _series(facts, 'us-gaap', const [
+      'Liabilities',
+    ], 'USD');
+    final equity = _series(facts, 'us-gaap', _equityConcepts, 'USD');
+    var shares = _series(facts, 'dei', const [
+      'EntityCommonStockSharesOutstanding',
+    ], 'shares');
+    if (shares.isEmpty) {
+      shares = _series(facts, 'us-gaap', _shareFallbackConcepts, 'shares');
+    }
+
+    final ttmRevenue = _ttm(revenue);
+    final ttmNetIncome = _ttm(netIncome);
+    final latestEnd = revenue.isEmpty ? null : revenue.last.end;
+
+    double? revenueGrowthYoY;
+    double? revenueAccelPp;
+    if (ttmRevenue != null && latestEnd != null) {
+      final priorEnd = DateTime(
+        latestEnd.year - 1,
+        latestEnd.month,
+        latestEnd.day,
+      );
+      final priorTtm = _ttm(revenue, asOf: priorEnd);
+      if (priorTtm != null && priorTtm > 0) {
+        revenueGrowthYoY = (ttmRevenue / priorTtm - 1) * 100;
+        // Growth one quarter earlier, for acceleration.
+        final lagEnd = DateTime(
+          latestEnd.year,
+          latestEnd.month - 3,
+          latestEnd.day,
+        );
+        final lagTtm = _ttm(revenue, asOf: lagEnd);
+        final lagPriorTtm = _ttm(
+          revenue,
+          asOf: DateTime(lagEnd.year - 1, lagEnd.month, lagEnd.day),
+        );
+        if (lagTtm != null && lagPriorTtm != null && lagPriorTtm > 0) {
+          revenueAccelPp =
+              revenueGrowthYoY - (lagTtm / lagPriorTtm - 1) * 100;
+        }
+      }
+    }
+
+    double? netMarginPct;
+    double? marginTrendPp;
+    if (ttmRevenue != null && ttmRevenue > 0 && ttmNetIncome != null) {
+      netMarginPct = ttmNetIncome / ttmRevenue * 100;
+      if (latestEnd != null) {
+        final priorEnd = DateTime(
+          latestEnd.year - 1,
+          latestEnd.month,
+          latestEnd.day,
+        );
+        final priorNetIncome = _ttm(netIncome, asOf: priorEnd);
+        final priorRevenue = _ttm(revenue, asOf: priorEnd);
+        if (priorNetIncome != null &&
+            priorRevenue != null &&
+            priorRevenue > 0) {
+          marginTrendPp = netMarginPct - priorNetIncome / priorRevenue * 100;
+        }
+      }
+    }
+
+    double? fcfMarginPct;
+    final ttmCashFlow = _ttm(cashFlow);
+    if (ttmCashFlow != null && ttmRevenue != null && ttmRevenue > 0) {
+      final ttmCapex = _ttm(capex) ?? 0;
+      fcfMarginPct = (ttmCashFlow - ttmCapex.abs()) / ttmRevenue * 100;
+    }
+
+    double? leveragePct;
+    if (assets.isNotEmpty &&
+        liabilities.isNotEmpty &&
+        assets.last.value > 0) {
+      leveragePct = liabilities.last.value / assets.last.value * 100;
+    }
+
+    double? roePct;
+    if (ttmNetIncome != null && equity.isNotEmpty && equity.last.value > 0) {
+      roePct = ttmNetIncome / equity.last.value * 100;
+    }
+
+    final sharesOutstanding = shares.isEmpty ? null : shares.last.value;
+    double? shareChangeYoYPct;
+    if (shares.length >= 2 && shares.last.value > 0) {
+      final latest = shares.last;
+      final prior = _closestByEnd(
+        shares,
+        DateTime(latest.end.year - 1, latest.end.month, latest.end.day),
+        toleranceDays: 100,
+      );
+      if (prior != null && prior.value > 0 && !identical(prior, latest)) {
+        shareChangeYoYPct = (latest.value / prior.value - 1) * 100;
+      }
+    }
+
+    DateTime? filedThrough;
+    for (final series in [revenue, netIncome, cashFlow, assets, shares]) {
+      if (series.isNotEmpty &&
+          (filedThrough == null || series.last.filed.isAfter(filedThrough))) {
+        filedThrough = series.last.filed;
+      }
+    }
+
+    final hasAnything =
+        revenueGrowthYoY != null ||
+        netMarginPct != null ||
+        fcfMarginPct != null ||
+        leveragePct != null ||
+        roePct != null;
+    if (!hasAnything) {
+      return null;
+    }
+
+    return _SymbolFundamentals(
+      revenueGrowthYoYPct: revenueGrowthYoY,
+      revenueAccelPp: revenueAccelPp,
+      netMarginPct: netMarginPct,
+      marginTrendPp: marginTrendPp,
+      fcfMarginPct: fcfMarginPct,
+      leveragePct: leveragePct,
+      roePct: roePct,
+      shareChangeYoYPct: shareChangeYoYPct,
+      ttmRevenueUsd: ttmRevenue,
+      ttmNetIncomeUsd: ttmNetIncome,
+      sharesOutstanding: sharesOutstanding,
+      filedThrough: filedThrough,
+      quarterlyRevenuePoints: revenue.where((r) => r.isQuarterFlow).length,
+    );
+  }
+
+  /// Trailing-twelve-month total of a flow series as of [asOf] (default:
+  /// latest available). Prefers latest-FY + post-FY quarters − matching
+  /// prior-year quarters, which handles US filers' implicit Q4 (annual
+  /// 10-K flows are full-year, Q4 is never filed separately); falls back
+  /// to the sum of four contiguous quarters, then to the latest annual.
+  double? _ttm(List<_FactRow> rows, {DateTime? asOf}) {
+    final eligible = asOf == null
+        ? rows
+        : [
+            for (final row in rows)
+              if (!row.end.isAfter(asOf)) row,
+          ];
+    if (eligible.isEmpty) {
+      return null;
+    }
+    final annuals = [
+      for (final row in eligible)
+        if (row.isAnnualFlow) row,
+    ];
+    final quarters = [
+      for (final row in eligible)
+        if (row.isQuarterFlow) row,
+    ];
+    if (annuals.isNotEmpty) {
+      final fiscalYear = annuals.last;
+      final after = [
+        for (final quarter in quarters)
+          if (quarter.end.isAfter(fiscalYear.end)) quarter,
+      ];
+      if (after.isEmpty) {
+        return fiscalYear.value;
+      }
+      var sumAfter = 0.0;
+      var sumPrior = 0.0;
+      var matched = true;
+      for (final quarter in after) {
+        sumAfter += quarter.value;
+        final prior = _closestByEnd(
+          quarters,
+          DateTime(quarter.end.year - 1, quarter.end.month, quarter.end.day),
+          toleranceDays: 21,
+        );
+        if (prior == null) {
+          matched = false;
+          break;
+        }
+        sumPrior += prior.value;
+      }
+      if (matched) {
+        return fiscalYear.value + sumAfter - sumPrior;
+      }
+    }
+    if (quarters.length >= 4) {
+      final last4 = quarters.sublist(quarters.length - 4);
+      // Four quarter-ends spanning ~3 quarters of calendar = contiguous.
+      final spanDays = last4.last.end.difference(last4.first.end).inDays;
+      if (spanDays >= 240 && spanDays <= 320) {
+        return last4.fold<double>(0, (sum, row) => sum + row.value);
+      }
+    }
+    return annuals.isNotEmpty ? annuals.last.value : null;
+  }
+
+  _FactRow? _closestByEnd(
+    List<_FactRow> rows,
+    DateTime target, {
+    required int toleranceDays,
+  }) {
+    _FactRow? best;
+    var bestDelta = toleranceDays + 1;
+    for (final row in rows) {
+      final delta = row.end.difference(target).inDays.abs();
+      if (delta < bestDelta) {
+        best = row;
+        bestDelta = delta;
+      }
+    }
+    return best;
+  }
+
+  /// Extract one concept's filing series: statement forms only, deduped by
+  /// period (keeping the latest-filed restatement), sorted by period end.
+  /// Concepts are tried in order; the first with data wins.
+  List<_FactRow> _series(
+    Map facts,
+    String taxonomy,
+    List<String> concepts,
+    String unitKey,
+  ) {
+    final tax = facts[taxonomy];
+    if (tax is! Map) {
+      return const [];
+    }
+    for (final concept in concepts) {
+      final node = tax[concept];
+      if (node is! Map) {
+        continue;
+      }
+      final units = node['units'];
+      if (units is! Map) {
+        continue;
+      }
+      final rows = units[unitKey];
+      if (rows is! List) {
+        continue;
+      }
+      final deduped = <String, _FactRow>{};
+      for (final raw in rows) {
+        if (raw is! Map) {
+          continue;
+        }
+        final form = (raw['form'] as String?) ?? '';
+        if (!_isStatementForm(form)) {
+          continue;
+        }
+        final end = DateTime.tryParse((raw['end'] as String?) ?? '');
+        final filed = DateTime.tryParse((raw['filed'] as String?) ?? '');
+        final value = (raw['val'] as num?)?.toDouble();
+        if (end == null || filed == null || value == null) {
+          continue;
+        }
+        final start = DateTime.tryParse((raw['start'] as String?) ?? '');
+        final key =
+            '${start?.toIso8601String() ?? 'instant'}:${end.toIso8601String()}';
+        final row = _FactRow(
+          end: end,
+          start: start,
+          filed: filed,
+          value: value,
+          form: form,
+        );
+        final existing = deduped[key];
+        if (existing == null || row.filed.isAfter(existing.filed)) {
+          deduped[key] = row;
+        }
+      }
+      if (deduped.isEmpty) {
+        continue;
+      }
+      return deduped.values.toList()..sort((a, b) => a.end.compareTo(b.end));
+    }
+    return const [];
+  }
+
+  static bool _isStatementForm(String form) =>
+      form == '10-Q' ||
+      form == '10-K' ||
+      form == '20-F' ||
+      form == '40-F' ||
+      form == '10-Q/A' ||
+      form == '10-K/A';
+
+  Future<Map<String, String>> _loadCikMap() async {
+    final cached = _cikByTicker;
+    if (cached != null) {
+      return cached;
+    }
+    final json = await _fetchJson(
+      Uri.parse('https://www.sec.gov/files/company_tickers.json'),
+    );
+    final map = <String, String>{};
+    if (json != null) {
+      for (final row in json.values) {
+        if (row is! Map) {
+          continue;
+        }
+        final ticker = row['ticker'] as String?;
+        final cik = row['cik_str'];
+        if (ticker == null || cik is! num) {
+          continue;
+        }
+        map[_normalizeTicker(ticker)] = cik
+            .toInt()
+            .toString()
+            .padLeft(10, '0');
+      }
+    }
+    // Keep even an empty map only for this call; retry next time on failure.
+    if (map.isNotEmpty) {
+      _cikByTicker = map;
+    }
+    return map;
+  }
+
+  /// SEC tickers use dashes for share classes (BRK-B); the universe uses
+  /// dots (BRK.B).
+  static String _normalizeTicker(String symbol) =>
+      symbol.trim().toUpperCase().replaceAll('.', '-').replaceAll('/', '-');
+
+  Future<Map?> _fetchJson(Uri uri) async {
+    try {
+      final entry = await _cache.fetch(uri);
+      _lastFetchTouchedNetwork = entry.cacheState != 'HIT';
+      if (entry.statusCode != 200) {
+        return null;
+      }
+      final decoded = jsonDecode(utf8.decode(entry.body));
+      return decoded is Map ? decoded : null;
+    } catch (_) {
+      _lastFetchTouchedNetwork = true;
+      return null;
+    }
+  }
+}
+
+/// One XBRL fact occurrence: value for a period (start..end for flows,
+/// instant for balances) from a specific filing (filed date + form).
+class _FactRow {
+  const _FactRow({
+    required this.end,
+    required this.start,
+    required this.filed,
+    required this.value,
+    required this.form,
+  });
+
+  final DateTime end;
+  final DateTime? start;
+  final DateTime filed;
+  final double value;
+  final String form;
+
+  int get spanDays => start == null ? 0 : end.difference(start!).inDays;
+  bool get isQuarterFlow =>
+      start != null && spanDays >= 70 && spanDays <= 110;
+  bool get isAnnualFlow =>
+      start != null && spanDays >= 330 && spanDays <= 400;
+}
+
+/// Computed trailing metrics for one symbol; all fields nullable because
+/// XBRL coverage varies by filer (banks lack Revenues, young filers lack
+/// history, foreign filers report annually).
+class _SymbolFundamentals {
+  const _SymbolFundamentals({
+    required this.revenueGrowthYoYPct,
+    required this.revenueAccelPp,
+    required this.netMarginPct,
+    required this.marginTrendPp,
+    required this.fcfMarginPct,
+    required this.leveragePct,
+    required this.roePct,
+    required this.shareChangeYoYPct,
+    required this.ttmRevenueUsd,
+    required this.ttmNetIncomeUsd,
+    required this.sharesOutstanding,
+    required this.filedThrough,
+    required this.quarterlyRevenuePoints,
+  });
+
+  final double? revenueGrowthYoYPct;
+  final double? revenueAccelPp;
+  final double? netMarginPct;
+  final double? marginTrendPp;
+  final double? fcfMarginPct;
+  final double? leveragePct;
+  final double? roePct;
+  final double? shareChangeYoYPct;
+  final double? ttmRevenueUsd;
+  final double? ttmNetIncomeUsd;
+  final double? sharesOutstanding;
+  final DateTime? filedThrough;
+  final int quarterlyRevenuePoints;
+
+  Map<String, Object?> toJson() => {
+    'revenueGrowthYoYPct': revenueGrowthYoYPct,
+    'revenueAccelPp': revenueAccelPp,
+    'netMarginPct': netMarginPct,
+    'marginTrendPp': marginTrendPp,
+    'fcfMarginPct': fcfMarginPct,
+    'leveragePct': leveragePct,
+    'roePct': roePct,
+    'shareChangeYoYPct': shareChangeYoYPct,
+    'ttmRevenueUsd': ttmRevenueUsd,
+    'ttmNetIncomeUsd': ttmNetIncomeUsd,
+    'sharesOutstanding': sharesOutstanding,
+    'filedThrough': filedThrough?.toIso8601String(),
+    'quarterlyRevenuePoints': quarterlyRevenuePoints,
+  };
 }

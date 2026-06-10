@@ -63,6 +63,10 @@ export type RawSignal = {
   downsideVolumePressure?: number
   volatilityExpansion?: number
   optionsProxySource?: string
+  /** ISO date of the latest SEC filing behind the fundamental fields;
+   * absent when this symbol has no EDGAR coverage (ETF / non-filer). */
+  fundamentalsAsOf?: string | null
+  fundamentalsSource?: string
 }
 
 export type DecisionSignal = RawSignal & {

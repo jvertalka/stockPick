@@ -69,7 +69,11 @@ adding decision speed, it belongs behind a click, not on the main path.
 
 - `desktop-js/` — the product (React + Vite; Tauri shell available).
 - `tool/backend_cache_server.dart` — local data backend: CORS proxy,
-  cache, decision universe, boot warmup.
+  cache, decision universe, boot warmup. Fundamentals come from SEC EDGAR
+  XBRL companyfacts (TTM metrics, cross-sectionally ranked with sector
+  adjustment per Novy-Marx/QMJ); `/fundamentals/history?symbol=X` exposes
+  raw filing series with point-in-time `filed` dates for look-ahead-safe
+  ML features.
 - `desktop-js/src/data/quantMath.ts` — all pricing/statistical methods
   (citation-commented) + `quantMath.tests.ts` startup self-tests.
 - `desktop-js/src/data/quantConfig.ts` — every research-backed constant.
