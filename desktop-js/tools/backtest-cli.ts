@@ -23,6 +23,7 @@ async function main() {
     DEFAULT_BACKTEST_TICKERS,
     HISTORICAL_FEATURE_NAMES,
     PRUNED_FEATURE_NAMES,
+    analyzeSurvivorship,
     buildHistoricalDataset,
     computeFeatureStats,
     labelStepsByRegime,
@@ -36,12 +37,20 @@ async function main() {
   // --persist: PUT the trained bundle to the backend's /ml/model store so
   // every app instance adopts it on next boot (newest trainedAt wins).
   const persist = process.argv.includes('--persist')
+  const rangeArgIndex = process.argv.indexOf('--range')
+  const range = (rangeArgIndex >= 0 ? process.argv[rangeArgIndex + 1] : '15y') as
+    | '5y'
+    | '10y'
+    | '15y'
+    | 'max'
 
-  console.log(`Building dataset for ${DEFAULT_BACKTEST_TICKERS.length} tickers (5y bars via proxy)…`)
+  console.log(
+    `Building dataset for ${DEFAULT_BACKTEST_TICKERS.length} tickers (${range} bars via proxy)…`,
+  )
   const started = Date.now()
   const built = await buildHistoricalDataset(DEFAULT_BACKTEST_TICKERS, {
     cadenceDays: 10,
-    range: '5y',
+    range,
     onProgress: (current, total, ticker) => {
       if (current % 10 === 0) console.log(`  ${current}/${total} ${ticker}`)
     },
@@ -75,23 +84,32 @@ async function main() {
   }
 
   console.log('Running purged+embargoed walk-forward (nested-CV hyperparameters)…')
-  // Test window ≈ one cross-sectional date: quintile portfolios form
-  // within a date and the step count stays stable as the universe widens.
-  const testSize = Math.max(60, d.tickersWithUsableBars)
+  // Test windows: at least one cross-sectional date each, sized so the
+  // out-of-sample period yields ~70 windows (CI width scales with the
+  // number of independent windows, not with samples).
+  const targetWindows = 70
+  const testSize = Math.max(
+    d.tickersWithUsableBars,
+    Math.floor((samples.length * 0.4) / targetWindows),
+  )
   const result = runWalkForwardBacktest(samples, {
     initialTrainSize: Math.floor(samples.length * 0.6),
     testSize,
     stepSize: testSize,
     baselineMomentumFeatureIndex: Math.max(0, featureNames.indexOf('momentum_252d')),
+    captureTestDetails: true,
   })
   if (!result) {
     console.error('Walk-forward produced no usable steps.')
     process.exit(1)
   }
 
-  // Regime labeling: point-in-time Markov regime on SPY at each step start
+  // Regime labeling: point-in-time Markov regime on SPY at each step
+  // start. 'max', not the dataset range: every step needs 60+ prior SPY
+  // returns or labelStepsByRegime silently defaults it to 'low-vol' —
+  // which would misfile the 2020 crash on long-range runs.
   console.log('Labeling walk-forward steps by SPY Markov regime…')
-  const spyBars = await cachedFetchDailyBars('SPY', '5y')
+  const spyBars = await cachedFetchDailyBars('SPY', 'max')
   const regimeLabels = labelStepsByRegime(result.steps, spyBars)
   const regimeBreakdown = summarizeStepsByRegime(result.steps, regimeLabels)
 
@@ -145,6 +163,57 @@ async function main() {
     const bucket = regimeBreakdown[regime]
     console.log(
       `  ${regime.padEnd(9)} steps=${bucket.steps}  IC ${f(bucket.meanIC)}  hit ${f(bucket.meanHitRate * 100, 1)}%  L/S net ${f(bucket.meanLongShortReturnNet, 2)}%`,
+    )
+  }
+
+  // ALWAYS the unpruned samples: the diagnostics index raw features in
+  // full 45-column space; pruned arrays would silently misread.
+  const survivorship = analyzeSurvivorship(built.samples, result.steps)
+  if (survivorship) {
+    console.log('')
+    console.log('--- Survivorship diagnostics ---')
+    const core = survivorship.cohorts.core
+    const priv = survivorship.cohorts.survivorPrivileged
+    console.log(
+      `cohorts at formation (HXZ 2020 size screen + FF 2004 age screen):`,
+    )
+    console.log(
+      `  established-then    windows=${core.windows}  IC ${f(core.meanIC)}  L/S ${f(core.meanLongShortPct, 2)}%  (n=${core.samples})`,
+    )
+    console.log(
+      `  survivor-privileged windows=${priv.windows}  IC ${f(priv.meanIC)}  L/S ${f(priv.meanLongShortPct, 2)}%  (n=${priv.samples}, young-or-small-then)`,
+    )
+    console.log(
+      `  edge concentrated in the privileged cohort = partly survivorship artifact`,
+    )
+    console.log(`era ICs (Linnainmaa-Roberts 2018 subperiods; deeper-past outperformance = bias fingerprint):`)
+    for (const era of survivorship.eras) {
+      console.log(
+        `  ${era.label}  steps=${String(era.steps).padStart(2)}  IC ${f(era.meanIC)}  L/S net ${f(era.meanLongShortNetPct, 2)}%`,
+      )
+    }
+    const dd = survivorship.canary.naiveDdToReturnIc
+    const az = survivorship.canary.altmanZToReturnIc
+    console.log(
+      `distress canary (CHS 2008 expects NEGATIVE distress->return relation; financials excluded per BS/CHS practice; imputed values skipped):`,
+    )
+    console.log(
+      `  IC(distress via naive-DD -> fwd 20d) = ${dd != null ? f(dd) : 'n/a'}   IC(distress via Altman Z'' -> fwd 20d) = ${az != null ? f(az) : 'n/a'}`,
+    )
+    if (dd == null && az == null) {
+      console.log(`  canary NOT COMPUTED (too few observed distress values out of sample) — no verdict either way.`)
+    } else if (survivorship.canary.survivorshipSignature) {
+      console.log(
+        `  WARNING: distress predicts HIGH returns here — the survivorship signature. Treat absolute returns as inflated.`,
+      )
+    } else {
+      console.log(`  sign consistent with CHS 2008 — no overt survivorship signature in the distress dimension.`)
+    }
+    console.log(
+      `delisting haircut bound (Shumway 1997 -30% NYSE/AMEX; Shumway-Warther 1999 ~-55% Nasdaq makes this the conservative end; FF2004 ~7%/yr attrition applied to YOUNG lists only):`,
+    )
+    console.log(
+      `  long quintile: ${f(survivorship.delistingBound.privilegedShareOfLongQuintile * 100, 1)}% privileged, ${f(survivorship.delistingBound.youngShareOfLongQuintile * 100, 1)}% young -> long-side haircut ~${f(survivorship.delistingBound.haircutPpPerWindow, 3)}pp/window; L/S net ${f(result.meanLongShortReturnNet, 2)}% -> ~${f(result.meanLongShortReturnNet - survivorship.delistingBound.haircutPpPerWindow, 2)}% adjusted`,
     )
   }
   console.log('')

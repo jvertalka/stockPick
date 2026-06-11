@@ -33,7 +33,7 @@ import {
 type RunMessage = {
   type: 'run'
   tickers: string[]
-  range: '5y' | '10y' | 'max'
+  range: '5y' | '10y' | '15y' | 'max'
   cadenceDays: number
   modelOptions?: { numTrees: number; depth: number; learningRate: number }
 }

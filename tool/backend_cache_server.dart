@@ -2258,6 +2258,29 @@ class SecFundamentalsService {
     'StockholdersEquity',
     'StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest',
   ];
+  // Distress-model inputs (Altman 1983 Z''; Bharath-Shumway 2008 naive DD)
+  static const List<String> _currentAssetConcepts = ['AssetsCurrent'];
+  static const List<String> _currentLiabilityConcepts = [
+    'LiabilitiesCurrent',
+  ];
+  static const List<String> _retainedEarningsConcepts = [
+    'RetainedEarningsAccumulatedDeficit',
+  ];
+  static const List<String> _operatingIncomeConcepts = [
+    'OperatingIncomeLoss',
+  ];
+  // Bharath-Shumway's F is DEBT (Compustat DLC + 0.5·DLTT), NOT total
+  // liabilities — accounts payable, deposits, and policy reserves don't
+  // belong in the default barrier.
+  static const List<String> _shortTermDebtConcepts = [
+    'DebtCurrent',
+    'LongTermDebtCurrent',
+    'ShortTermBorrowings',
+  ];
+  static const List<String> _longTermDebtConcepts = [
+    'LongTermDebtNoncurrent',
+    'LongTermDebt',
+  ];
   static const List<String> _shareFallbackConcepts = [
     'CommonStockSharesOutstanding',
     'WeightedAverageNumberOfDilutedSharesOutstanding',
@@ -2627,6 +2650,33 @@ class SecFundamentalsService {
         ),
         'equity': rows(
           _series(facts, 'us-gaap', _equityConcepts, 'USD', dedup: false),
+        ),
+        // Distress-model inputs: Altman (1983) Z'' needs working capital,
+        // retained earnings, and operating income; Bharath-Shumway (2008)
+        // naive distance-to-default needs the liability split.
+        'currentAssets': rows(
+          _series(facts, 'us-gaap', _currentAssetConcepts, 'USD',
+              dedup: false),
+        ),
+        'currentLiabilities': rows(
+          _series(facts, 'us-gaap', _currentLiabilityConcepts, 'USD',
+              dedup: false),
+        ),
+        'retainedEarnings': rows(
+          _series(facts, 'us-gaap', _retainedEarningsConcepts, 'USD',
+              dedup: false),
+        ),
+        'operatingIncome': rows(
+          _series(facts, 'us-gaap', _operatingIncomeConcepts, 'USD',
+              dedup: false),
+        ),
+        'shortTermDebt': rows(
+          _series(facts, 'us-gaap', _shortTermDebtConcepts, 'USD',
+              dedup: false),
+        ),
+        'longTermDebt': rows(
+          _series(facts, 'us-gaap', _longTermDebtConcepts, 'USD',
+              dedup: false),
         ),
         'shares': rows(shares),
       },

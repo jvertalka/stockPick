@@ -217,7 +217,9 @@ export async function predictForTicker(
   ticker: string,
   model: StoredMlModel,
 ): Promise<LivePrediction | null> {
-  const bars = await cachedFetchDailyBars(ticker, '5y')
+  // 'max' so listing_age_years sees the TRUE first bar — a 5y fetch would
+  // cap every mature company's age at 5 and shift the feature vs training.
+  const bars = await cachedFetchDailyBars(ticker, 'max')
   if (bars.length < 280) return null
   // Same inputs as training: price features + point-in-time fundamentals
   // (null for ETFs/non-filers — those columns use the neutral encoding).
@@ -235,11 +237,15 @@ export async function predictForTicker(
         })
       : fullFeatures
   // Normalize using training-set statistics (Z-scoring against historical
-  // distribution, not against the current cross-section)
+  // distribution, not against the current cross-section). Missing
+  // fundamentals arrive as NaN; impute the training mean — the live
+  // counterpart of the per-date median imputation used in training —
+  // which lands exactly on Z = 0.
   const normalized = features.map((value, i) => {
     const mean = model.featureMeans[i] ?? 0
     const std = model.featureStds[i] ?? 1
-    return (value - mean) / Math.max(1e-12, std)
+    const filled = Number.isNaN(value) ? mean : value
+    return (filled - mean) / Math.max(1e-12, std)
   })
   const prediction = predictGradientBoosting(model.model, normalized)
   // Conformal widening (Romano et al. 2019): the stored offset is what the

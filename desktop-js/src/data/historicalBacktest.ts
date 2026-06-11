@@ -109,6 +109,31 @@ export type HistoricalSample = {
   forwardReturn20d: number
   forwardReturn60d: number
   forwardReturn120d: number
+  /** ISO dates when each horizon's label window CLOSES (bars[i+h].date).
+   * Purging must compare in LABEL space: 20 trading days ≈ 28 calendar
+   * days, so "asOf + horizon·86400s" calendar arithmetic under-purges and
+   * leaks the first test-window days into training labels. */
+  labelEnd5d: string
+  labelEnd20d: string
+  labelEnd60d: string
+  labelEnd120d: string
+  /** Index-aligned with rawFeatures; true where the value was imputed
+   * (cross-sectional median) rather than observed. Diagnostics that read
+   * raw feature values (the distress canary, size-quintile cuts) must
+   * skip imputed entries or they dilute toward the median. Absent when
+   * nothing was imputed. */
+  imputedMask?: boolean[]
+  /** Listed under 3 years at formation — the Fama-French (2004) new-list
+   * failure window; drives the delisting-haircut bound separately from
+   * the size screen. */
+  youngAtFormation?: boolean
+  /** Survivorship cohort AT FORMATION (assigned per cross-section date):
+   *  'survivorPrivileged' = listed < 3y (Fama-French 2004 new-list
+   *  failure window) OR bottom size-quintile of that date's cross-section
+   *  (Hou-Xue-Zhang 2020 microcap screen) — where survivor bias lives.
+   *  'core' = established-then. 'noFundamentals' = ETFs/non-filers,
+   *  excluded from cohort diagnostics. */
+  cohort?: 'core' | 'survivorPrivileged' | 'noFundamentals'
 }
 
 export const ENSEMBLE_HORIZONS: HorizonKey[] = [5, 20, 60, 120]
@@ -166,12 +191,23 @@ export const HISTORICAL_FEATURE_NAMES: FeatureNames = [
   // Range/extension (2)
   'range_compression_20d',    // (high-low)/close, last 20d
   'price_velocity_acceleration',  // 20d vel - 60d vel (momentum of momentum)
-  // Fundamentals (10) — point-in-time from SEC EDGAR filings, keyed by
+  // Survivorship-visibility price features (2):
+  //   listing_age_years — years since the first available bar. Fama-French
+  //   (2004, "New lists") show ~half of new lists fail within 10 years;
+  //   a survivors-only sample keeps just the winners, so young-at-sample
+  //   names are where the bias concentrates.
+  //   log_price_level — CHS (2008) PRICE variable; penny/microstructure flag.
+  'listing_age_years',
+  'log_price_level',
+  // Fundamentals (13) — point-in-time from SEC EDGAR filings, keyed by
   // FILED date so a sample at date t only sees statements filed <= t.
   // Directions per the factor literature: profitability (Novy-Marx 2013),
   // value as earnings yield (Basu 1977), issuance (Pontiff-Woodgate 2008),
-  // leverage (Fama-French 1992). Values are winsorized at fixed economic
-  // bounds (Gu-Kelly-Xiu 2020 winsorize characteristics the same way).
+  // leverage (Fama-French 1992), size (Banz 1981), distress (Altman 1983
+  // Z''; Bharath-Shumway 2008 naive distance-to-default — also the
+  // survivorship "canary": CHS 2008 establish distress → LOW returns, so
+  // a measured distress → HIGH returns relation flags survivor bias).
+  // Values winsorized at fixed economic bounds (Gu-Kelly-Xiu 2020).
   ...[
     'fund_revenue_growth_yoy',
     'fund_revenue_accel',
@@ -183,10 +219,13 @@ export const HISTORICAL_FEATURE_NAMES: FeatureNames = [
     'fund_share_change_yoy',
     'fund_earnings_yield',
     'fund_filing_age',
+    'fund_log_market_cap',
+    'fund_altman_z',
+    'fund_naive_dd',
   ],
 ]
 
-export const FUNDAMENTAL_FEATURE_COUNT = 10
+export const FUNDAMENTAL_FEATURE_COUNT = 13
 /** Sentinel for fund_filing_age when a name has no usable filing at the
  * sample date (ETF, non-filer, or pre-coverage history). */
 export const FUNDAMENTAL_MISSING_AGE_DAYS = 400
@@ -195,6 +234,11 @@ export function computeFeaturesAtDate(
   bars: DailyBar[],
   dateIndex: number,
   fundamentals?: FundamentalsTimeline | null,
+  options?: {
+    /** First bar of the FULL (untrimmed) history, for listing age when
+     * `bars` was trimmed to a backtest window. Defaults to bars[0]. */
+    firstBarDateMs?: number
+  },
 ): number[] | null {
   if (dateIndex < 252) return null  // need 252 bars for the 1-year features
   const window = bars.slice(0, dateIndex)
@@ -357,9 +401,26 @@ export function computeFeaturesAtDate(
     // Range/extension (2)
     rangeCompression,
     velocityAccel,
-    // Fundamentals (10) — point-in-time as of this bar's date
-    ...fundamentalFeaturesAt(fundamentals ?? null, bars[dateIndex].date, lastClose),
+    // Survivorship-visibility (2)
+    listingAgeYears(
+      options?.firstBarDateMs ?? Date.parse(bars[0].date),
+      bars[dateIndex].date,
+    ),
+    Math.log(Math.max(0.01, lastClose)),
+    // Fundamentals (13) — point-in-time as of this bar's date
+    ...fundamentalFeaturesAt(fundamentals ?? null, bars[dateIndex].date, lastClose, {
+      vol252Annualized: vol252,
+      return252Pct: ret(252),
+    }),
   ]
+}
+
+function listingAgeYears(firstBarDateMs: number, isoDate: string): number {
+  const dateMs = Date.parse(isoDate)
+  if (!Number.isFinite(firstBarDateMs) || !Number.isFinite(dateMs)) return 0
+  // Cap at 25y — beyond that age is not a differentiator (FF2004's
+  // new-list failure risk is front-loaded in the first decade).
+  return Math.min(25, Math.max(0, (dateMs - firstBarDateMs) / (365.25 * 86_400_000)))
 }
 
 /* =========================================================================
@@ -395,6 +456,16 @@ type FundamentalSnapshot = {
   shareChangeYoY: number | null
   ttmNetIncome: number | null
   shares: number | null
+  // Distress-model inputs (Altman 1983 Z''; Bharath-Shumway 2008)
+  totalAssets: number | null
+  totalLiabilities: number | null
+  bookEquity: number | null
+  currentAssets: number | null
+  currentLiabilities: number | null
+  retainedEarnings: number | null
+  ttmOperatingIncome: number | null
+  shortTermDebt: number | null
+  longTermDebt: number | null
 }
 
 export class FundamentalsTimeline {
@@ -404,14 +475,18 @@ export class FundamentalsTimeline {
     this.snapshots = snapshots
   }
 
-  /** Latest snapshot whose filing date is on or before `dateMs`. */
+  /** Latest snapshot whose filing date is STRICTLY before `dateMs`.
+   * Strict, not <=: most 10-K/10-Qs hit EDGAR after the 16:00 close, and
+   * our forward returns are measured from that day's close — a same-day
+   * filing would let features see statement contents the market first
+   * traded the NEXT day. Standard practice is a one-day fundamentals lag. */
   at(dateMs: number): FundamentalSnapshot | null {
     let lo = 0
     let hi = this.snapshots.length - 1
     let best = -1
     while (lo <= hi) {
       const mid = (lo + hi) >> 1
-      if (this.snapshots[mid].filed <= dateMs) {
+      if (this.snapshots[mid].filed < dateMs) {
         best = mid
         lo = mid + 1
       } else {
@@ -450,6 +525,12 @@ export class FundamentalsTimeline {
     const liabilities = parse('liabilities')
     const equity = parse('equity')
     const shares = parse('shares')
+    const currentAssets = parse('currentAssets')
+    const currentLiabilities = parse('currentLiabilities')
+    const retainedEarnings = parse('retainedEarnings')
+    const operatingIncome = parse('operatingIncome')
+    const shortTermDebt = parse('shortTermDebt')
+    const longTermDebt = parse('longTermDebt')
 
     const filedDates = new Set<number>()
     for (const rows of [revenue, netIncome, cashFlow, assets, equity, shares]) {
@@ -467,6 +548,12 @@ export class FundamentalsTimeline {
       const lia = visibleAt(liabilities, filed)
       const eq = visibleAt(equity, filed)
       const sh = visibleAt(shares, filed)
+      const curAst = visibleAt(currentAssets, filed)
+      const curLia = visibleAt(currentLiabilities, filed)
+      const retEarn = visibleAt(retainedEarnings, filed)
+      const opInc = visibleAt(operatingIncome, filed)
+      const stDebt = visibleAt(shortTermDebt, filed)
+      const ltDebt = visibleAt(longTermDebt, filed)
 
       const ttmRev = ttmOf(rev)
       const ttmNi = ttmOf(ni)
@@ -541,6 +628,15 @@ export class FundamentalsTimeline {
         shareChangeYoY,
         ttmNetIncome: ttmNi,
         shares: lastShares,
+        totalAssets: lastInstant(ast),
+        totalLiabilities: lastInstant(lia),
+        bookEquity: lastInstant(eq),
+        currentAssets: lastInstant(curAst),
+        currentLiabilities: lastInstant(curLia),
+        retainedEarnings: lastInstant(retEarn),
+        ttmOperatingIncome: ttmOf(opInc),
+        shortTermDebt: lastInstant(stDebt),
+        longTermDebt: lastInstant(ltDebt),
       })
     }
     return new FundamentalsTimeline(snapshots)
@@ -625,31 +721,93 @@ function shiftMonths(ms: number, months: number): number {
   return Date.UTC(date.getUTCFullYear(), date.getUTCMonth() + months, date.getUTCDate())
 }
 
+/** Winsorize, mapping missing to NaN. NaN survives until the per-date
+ * median imputation pass (training) or the feature-mean imputation
+ * (live single-name prediction) — a 0 here would masquerade as data. */
 const clampTo = (value: number | null, lo: number, hi: number): number =>
-  value == null || !Number.isFinite(value) ? 0 : Math.max(lo, Math.min(hi, value))
+  value == null || !Number.isFinite(value) ? Number.NaN : Math.max(lo, Math.min(hi, value))
 
-/** The 10 fundamental feature values at a sample date. Missing data maps
- * to 0 (≈ cross-sectional neutral after Z-scoring) with fund_filing_age
- * pinned at the missing sentinel so the model can tell "no data" apart
- * from "average company". */
+/** The 13 fundamental feature values at a sample date. Missing values are
+ * NaN (imputed downstream); fund_filing_age uses its cap sentinel so the
+ * model can tell "no data" apart from "average company". */
 function fundamentalFeaturesAt(
   fundamentals: FundamentalsTimeline | null,
   isoDate: string,
   lastClose: number,
+  market: { vol252Annualized: number; return252Pct: number },
 ): number[] {
   const dateMs = Date.parse(isoDate)
   const snap = fundamentals && Number.isFinite(dateMs) ? fundamentals.at(dateMs) : null
   if (!snap) {
-    return [0, 0, 0, 0, 0, 0, 0, 0, 0, FUNDAMENTAL_MISSING_AGE_DAYS]
+    return [
+      Number.NaN, Number.NaN, Number.NaN, Number.NaN, Number.NaN,
+      Number.NaN, Number.NaN, Number.NaN, Number.NaN,
+      FUNDAMENTAL_MISSING_AGE_DAYS,
+      Number.NaN, Number.NaN, Number.NaN,
+    ]
   }
+  const marketCap =
+    snap.shares != null && snap.shares > 0 && lastClose > 0
+      ? snap.shares * lastClose
+      : null
   const earningsYield =
-    snap.ttmNetIncome != null && snap.shares != null && snap.shares > 0 && lastClose > 0
-      ? (snap.ttmNetIncome / (snap.shares * lastClose)) * 100
+    snap.ttmNetIncome != null && marketCap != null
+      ? (snap.ttmNetIncome / marketCap) * 100
       : null
   const ageDays = Math.min(
     FUNDAMENTAL_MISSING_AGE_DAYS,
     Math.max(0, (dateMs - snap.filed) / 86_400_000),
   )
+
+  // Altman (1983) Z'' — the four-ratio variant, comparable across
+  // sectors because it drops Sales/Assets:
+  //   Z'' = 6.56·WC/TA + 3.26·RE/TA + 6.72·EBIT/TA + 1.05·BookE/TL
+  // Computed only when every PIT input exists; partial Z is meaningless.
+  let altmanZ: number | null = null
+  if (
+    snap.totalAssets != null && snap.totalAssets > 0 &&
+    snap.totalLiabilities != null && snap.totalLiabilities > 0 &&
+    snap.currentAssets != null && snap.currentLiabilities != null &&
+    snap.retainedEarnings != null && snap.ttmOperatingIncome != null &&
+    snap.bookEquity != null
+  ) {
+    altmanZ =
+      6.56 * ((snap.currentAssets - snap.currentLiabilities) / snap.totalAssets) +
+      3.26 * (snap.retainedEarnings / snap.totalAssets) +
+      6.72 * (snap.ttmOperatingIncome / snap.totalAssets) +
+      1.05 * (snap.bookEquity / snap.totalLiabilities)
+  }
+
+  // Bharath-Shumway (2008, RFS) "naive" distance-to-default — the
+  // closed-form Merton (1974) proxy they show performs as well as the
+  // iterated model. Their default barrier is DEBT, not liabilities:
+  // F = debt in current liabilities + ½·long-term debt (Compustat
+  // DLC + 0.5·DLTT). Using total liabilities would overstate F several-
+  // fold for high-payables retailers and collapse ln((E+F)/F) for banks
+  // (deposits), turning the measure into a sector dummy. When a filer
+  // reports no debt tags at all (true zero-debt companies do exist) we
+  // require at least one debt series to have EVER existed; otherwise DD
+  // is null rather than computed off a wrong barrier.
+  // naive σ_D = 0.05 + 0.25·σ_E; σ_V is the value-weighted blend;
+  // DD = [ln((E+F)/F) + (μ − ½σ_V²)] / σ_V at T = 1y, with μ = the
+  // trailing 1-year equity return (their r_{it−1}).
+  let naiveDd: number | null = null
+  const hasDebtData = snap.shortTermDebt != null || snap.longTermDebt != null
+  if (marketCap != null && hasDebtData) {
+    const F = (snap.shortTermDebt ?? 0) + 0.5 * (snap.longTermDebt ?? 0)
+    if (F > 0) {
+      const E = marketCap
+      const sigmaE = Math.max(0.05, market.vol252Annualized)
+      const naiveSigmaD = 0.05 + 0.25 * sigmaE
+      const sigmaV = (E / (E + F)) * sigmaE + (F / (E + F)) * naiveSigmaD
+      const mu = market.return252Pct / 100
+      naiveDd = (Math.log((E + F) / F) + (mu - 0.5 * sigmaV * sigmaV)) / sigmaV
+    } else {
+      // Debt tags exist but read zero — effectively default-remote.
+      naiveDd = 15
+    }
+  }
+
   return [
     clampTo(snap.revenueGrowthYoY, -100, 300),
     clampTo(snap.revenueAccel, -100, 100),
@@ -661,6 +819,9 @@ function fundamentalFeaturesAt(
     clampTo(snap.shareChangeYoY, -50, 50),
     clampTo(earningsYield, -25, 25),
     ageDays,
+    clampTo(marketCap != null ? Math.log(marketCap) : null, 10, 32),
+    clampTo(altmanZ, -15, 15),
+    clampTo(naiveDd, -5, 15),
   ]
 }
 
@@ -721,6 +882,116 @@ export type DatasetBuildResult = {
 }
 
 /**
+ * Replace NaN fundamental values with the cross-sectional MEDIAN of the
+ * same feature on the same date (so after Z-scoring a missing value sits
+ * at ≈0, neutral). Median, not zero: for log-scale features like market
+ * cap a hard zero would read as "a one-dollar company". Sparse dates
+ * (off-grid tickers) fall back to the GLOBAL median of the feature, never
+ * to a literal 0 that may sit outside the winsorization bounds. Each
+ * imputed cell is recorded on sample.imputedMask so raw-value diagnostics
+ * (distress canary, size-quintile cuts) can skip synthetic values.
+ */
+function imputeMissingWithDateMedians(samples: HistoricalSample[]): void {
+  if (samples.length === 0) return
+  const byDate = new Map<string, number[]>()
+  samples.forEach((sample, idx) => {
+    const arr = byDate.get(sample.asOf) ?? []
+    arr.push(idx)
+    byDate.set(sample.asOf, arr)
+  })
+  const featureCount = samples[0].rawFeatures.length
+  // Global per-feature medians over observed values (fallback for dates
+  // whose whole cross-section is missing a feature).
+  const globalMedians = new Array(featureCount).fill(0)
+  for (let f = 0; f < featureCount; f++) {
+    const observed = samples
+      .map((sample) => sample.rawFeatures[f])
+      .filter((value) => !Number.isNaN(value))
+      .sort((a, b) => a - b)
+    globalMedians[f] = observed.length > 0 ? observed[Math.floor(observed.length / 2)] : 0
+  }
+  for (const indices of byDate.values()) {
+    for (let f = 0; f < featureCount; f++) {
+      const present: number[] = []
+      for (const idx of indices) {
+        const value = samples[idx].rawFeatures[f]
+        if (!Number.isNaN(value)) present.push(value)
+      }
+      if (present.length === indices.length) continue  // nothing missing
+      present.sort((a, b) => a - b)
+      const median =
+        present.length > 0 ? present[Math.floor(present.length / 2)] : globalMedians[f]
+      for (const idx of indices) {
+        if (Number.isNaN(samples[idx].rawFeatures[f])) {
+          const sample = samples[idx]
+          sample.rawFeatures[f] = median
+          sample.features[f] = median
+          sample.imputedMask ??= new Array(featureCount).fill(false)
+          sample.imputedMask[f] = true
+        }
+      }
+    }
+  }
+}
+
+/** Index helpers for survivorship cohort assignment. */
+const LISTING_AGE_FEATURE_INDEX = HISTORICAL_FEATURE_NAMES.indexOf('listing_age_years')
+const LOG_MKTCAP_FEATURE_INDEX = HISTORICAL_FEATURE_NAMES.indexOf('fund_log_market_cap')
+
+/**
+ * Tag each sample's survivorship cohort AT ITS FORMATION DATE:
+ * 'survivorPrivileged' = listed under 3 years (Fama-French 2004: new-list
+ * failure risk is front-loaded) OR in the bottom size quintile of that
+ * date's cross-section (Hou-Xue-Zhang 2020: microcaps drive most anomaly
+ * returns and are exactly what a survivors-only sample misrepresents).
+ * Runs AFTER imputation (which never touches fund_filing_age), so
+ * "no fundamentals at this date" is detected via the filing-age sentinel:
+ * it equals FUNDAMENTAL_MISSING_AGE_DAYS exactly when no filing existed.
+ * Those samples (ETFs/non-filers) are 'noFundamentals' and sit outside
+ * the cohort diagnostics.
+ */
+function assignSurvivorshipCohorts(samples: HistoricalSample[]): void {
+  if (samples.length === 0) return
+  if (LISTING_AGE_FEATURE_INDEX < 0 || LOG_MKTCAP_FEATURE_INDEX < 0) return
+  const ageIdx = HISTORICAL_FEATURE_NAMES.indexOf('fund_filing_age')
+  const byDate = new Map<string, number[]>()
+  samples.forEach((sample, idx) => {
+    const arr = byDate.get(sample.asOf) ?? []
+    arr.push(idx)
+    byDate.set(sample.asOf, arr)
+  })
+  for (const indices of byDate.values()) {
+    // Bottom size quintile threshold for this date — OBSERVED market caps
+    // only; an imputed (median) cap is by construction never "small".
+    const caps: number[] = []
+    for (const idx of indices) {
+      const sample = samples[idx]
+      const hasFundamentals = sample.rawFeatures[ageIdx] < FUNDAMENTAL_MISSING_AGE_DAYS
+      const capImputed = sample.imputedMask?.[LOG_MKTCAP_FEATURE_INDEX] === true
+      if (hasFundamentals && !capImputed) {
+        caps.push(sample.rawFeatures[LOG_MKTCAP_FEATURE_INDEX])
+      }
+    }
+    caps.sort((a, b) => a - b)
+    const quintileCut = caps.length >= 10 ? caps[Math.floor(caps.length * 0.2)] : -Infinity
+    for (const idx of indices) {
+      const sample = samples[idx]
+      const hasFundamentals = sample.rawFeatures[ageIdx] < FUNDAMENTAL_MISSING_AGE_DAYS
+      if (!hasFundamentals) {
+        sample.cohort = 'noFundamentals'
+        continue
+      }
+      const young = sample.rawFeatures[LISTING_AGE_FEATURE_INDEX] < 3
+      const capImputed = sample.imputedMask?.[LOG_MKTCAP_FEATURE_INDEX] === true
+      const smallThen =
+        !capImputed && sample.rawFeatures[LOG_MKTCAP_FEATURE_INDEX] <= quintileCut
+      sample.youngAtFormation = young
+      sample.cohort = young || smallThen ? 'survivorPrivileged' : 'core'
+    }
+  }
+}
+
+/**
  * Apply cross-sectional Z-score normalization to features WITHIN each
  * as-of date. After this, every feature has mean 0 and stddev 1 across
  * stocks at any given date — the model learns relative ranking rather
@@ -777,13 +1048,22 @@ export async function buildHistoricalDataset(
   options: {
     cadenceDays?: number
     minBars?: number
-    range?: '1y' | '2y' | '5y' | '10y' | 'max'
+    range?: '1y' | '2y' | '5y' | '10y' | '15y' | 'max'
     onProgress?: (current: number, total: number, ticker: string) => void
   } = {},
 ): Promise<DatasetBuildResult> {
   const cadence = options.cadenceDays ?? 10
   const minBars = options.minBars ?? 400  // 252 history + 120 forward + buffer
   const range = options.range ?? '5y'
+  // ALWAYS fetch max and trim client-side: (a) Yahoo has no 15y range,
+  // and (b) listing_age_years must come from the true first bar for every
+  // range, or a 5y-trained model caps mature names' age at 5 while live
+  // prediction (which fetches max) reports the true age — train/serve skew.
+  const trimByRange: Record<string, number | null> = {
+    '1y': 252, '2y': 504, '5y': 1260, '10y': 2520, '15y': 3780, max: null,
+  }
+  const fetchRange = 'max'
+  const trimBars = trimByRange[range] ?? null
   const samples: HistoricalSample[] = []
   const perTickerSummary: DatasetBuildResult['diagnostics']['perTickerSummary'] = []
   let tickersWithUsableBars = 0
@@ -796,9 +1076,15 @@ export async function buildHistoricalDataset(
     options.onProgress?.(t, tickers.length, ticker)
     let bars: DailyBar[]
     try {
-      bars = await cachedFetchDailyBars(ticker, range)
+      bars = await cachedFetchDailyBars(ticker, fetchRange)
     } catch {
       bars = []
+    }
+    // Listing age must come from the FULL history even when the backtest
+    // window is trimmed — a 1998 listing trimmed to 15y is still old.
+    const firstBarDateMs = bars.length > 0 ? Date.parse(bars[0].date) : Number.NaN
+    if (trimBars != null && bars.length > trimBars) {
+      bars = bars.slice(-trimBars)
     }
     if (bars.length === 0) {
       tickersWithZeroBars++
@@ -823,7 +1109,7 @@ export async function buildHistoricalDataset(
     // Need 252 bars history (for 252d momentum, vol, moments) + 120 future
     // (longest horizon in the ensemble)
     for (let i = 252; i < bars.length - 120; i += cadence) {
-      const features = computeFeaturesAtDate(bars, i, fundamentals)
+      const features = computeFeaturesAtDate(bars, i, fundamentals, { firstBarDateMs })
       if (!features) continue
       const fwd5 = computeForwardReturn(bars, i, 5)
       const fwd20 = computeForwardReturn(bars, i, 20)
@@ -840,6 +1126,10 @@ export async function buildHistoricalDataset(
         forwardReturn20d: fwd20,
         forwardReturn60d: fwd60,
         forwardReturn120d: fwd120,
+        labelEnd5d: bars[i + 5].date,
+        labelEnd20d: bars[i + 20].date,
+        labelEnd60d: bars[i + 60].date,
+        labelEnd120d: bars[i + 120].date,
       })
       generated++
     }
@@ -847,7 +1137,11 @@ export async function buildHistoricalDataset(
     perTickerSummary.push({ ticker, bars: bars.length, samplesGenerated: generated })
   }
 
-  // Apply cross-sectional normalization in place
+  // Impute missing fundamentals with per-date cross-sectional medians
+  // (must run BEFORE normalization so NaNs never reach the Z-scores),
+  // then tag survivorship cohorts, then normalize.
+  imputeMissingWithDateMedians(samples)
+  assignSurvivorshipCohorts(samples)
   applyCrossSectionalNormalization(samples)
 
   return {
@@ -920,6 +1214,20 @@ export type WalkForwardResult = {
   intervalCoverage80?: number
   intervalMeanWidthPct?: number
   conformalOffsetPct?: number
+  /** Per-test-sample detail for survivorship diagnostics (cohort splits,
+   * era analysis, distress canary). Captured only when the caller sets
+   * captureTestDetails — the CLI does, the in-app worker doesn't. */
+  testDetails?: Array<{
+    ticker: string
+    asOf: string
+    cohort: HistoricalSample['cohort']
+    /** Listed < 3y at formation — the subset the FF2004 attrition rate
+     * actually describes (the size-only privileged members delist far
+     * less often). */
+    young: boolean
+    prediction: number
+    actual: number
+  }>
 }
 
 /**
@@ -959,6 +1267,9 @@ export function walkForwardStep(
      * index (featureNames.indexOf('momentum_252d')) or the "edge over
      * momentum" metric silently compares against the wrong feature. */
     baselineMomentumFeatureIndex?: number
+    /** Keep per-test-sample (cohort, prediction, actual) for survivorship
+     * diagnostics. Off by default (memory). */
+    captureTestDetails?: boolean
   } = {},
 ): WalkForwardResult | null {
   if (splitIndex <= 0 || splitIndex + testSize > samples.length) return null
@@ -971,17 +1282,18 @@ export function walkForwardStep(
   const testStartDate = testSamples[0].asOf
   const testStartTime = new Date(testStartDate).getTime()
 
-  // PURGE: drop train samples whose forward-return window overlaps the
-  // earliest test date. EMBARGO: drop train samples within embargoDays
-  // of the test start.
+  // PURGE in LABEL space: drop train samples whose 20-trading-day label
+  // window (labelEnd20d, an actual bar date) reaches the test start —
+  // calendar arithmetic on horizonDays under-purges because 20 trading
+  // days span ~28 calendar days. EMBARGO: additionally drop samples
+  // formed within embargoDays of the test start (López de Prado 2018).
   const candidateTrain = samples.slice(0, splitIndex)
-  const trainSamples = candidateTrain.filter((sample) => {
-    const sampleTime = new Date(sample.asOf).getTime()
-    const sampleEndTime = sampleTime + horizonDays * 24 * 3600 * 1000
-    const embargoCutoff = testStartTime - embargoDays * 24 * 3600 * 1000
-    // Drop if forward-return window overlaps test, OR within embargo
-    return sampleEndTime <= embargoCutoff
-  })
+  const embargoCutoff = testStartTime - embargoDays * 24 * 3600 * 1000
+  const trainSamples = candidateTrain.filter(
+    (sample) =>
+      sample.labelEnd20d < testStartDate &&
+      new Date(sample.asOf).getTime() <= embargoCutoff,
+  )
   if (trainSamples.length < 50) return null
 
   const trainFeatures = trainSamples.map((sample) => sample.features)
@@ -1004,38 +1316,49 @@ export function walkForwardStep(
   let conformalOffsetPct: number | undefined
   if (options.computeIntervals !== false && trainSamples.length >= 200) {
     const calibrationSize = Math.max(50, Math.floor(trainSamples.length * 0.25))
-    const properTrain = trainSamples.slice(0, trainSamples.length - calibrationSize)
     const calibration = trainSamples.slice(trainSamples.length - calibrationSize)
-    const properFeatures = properTrain.map((sample) => sample.features)
-    const properTargets = properTrain.map((sample) => sample.forwardReturn20d)
-    const q10Model = fitGradientBoosting(properFeatures, properTargets, {
-      ...options.modelOptions,
-      quantile: 0.1,
-    })
-    const q90Model = fitGradientBoosting(properFeatures, properTargets, {
-      ...options.modelOptions,
-      quantile: 0.9,
-    })
-    const scores = calibration.map((sample) => {
-      const lo = predictGradientBoosting(q10Model, sample.features)
-      const hi = predictGradientBoosting(q90Model, sample.features)
-      return Math.max(lo - sample.forwardReturn20d, sample.forwardReturn20d - hi)
-    })
-    scores.sort((a, b) => a - b)
-    const n = scores.length
-    const rank = Math.min(n - 1, Math.ceil((n + 1) * 0.8) - 1)
-    const offset = scores[rank]
-    let covered = 0
-    let widthSum = 0
-    for (const sample of testSamples) {
-      const lo = predictGradientBoosting(q10Model, sample.features) - offset
-      const hi = predictGradientBoosting(q90Model, sample.features) + offset
-      if (sample.forwardReturn20d >= lo && sample.forwardReturn20d <= hi) covered++
-      widthSum += hi - lo
+    // Purge the quantile-training tail whose label windows reach into the
+    // calibration slice — conformity scores must come from outcomes the
+    // quantile models never trained against (exchangeability, Romano et
+    // al. 2019), and that purge too must happen in label space.
+    const calibrationStartDate = calibration[0].asOf
+    const properTrain = trainSamples
+      .slice(0, trainSamples.length - calibrationSize)
+      .filter((sample) => sample.labelEnd20d < calibrationStartDate)
+    // Skip intervals when the purge leaves too little quantile-training
+    // data — weak quantile heads would just report meaningless coverage.
+    if (properTrain.length >= 100) {
+      const properFeatures = properTrain.map((sample) => sample.features)
+      const properTargets = properTrain.map((sample) => sample.forwardReturn20d)
+      const q10Model = fitGradientBoosting(properFeatures, properTargets, {
+        ...options.modelOptions,
+        quantile: 0.1,
+      })
+      const q90Model = fitGradientBoosting(properFeatures, properTargets, {
+        ...options.modelOptions,
+        quantile: 0.9,
+      })
+      const scores = calibration.map((sample) => {
+        const lo = predictGradientBoosting(q10Model, sample.features)
+        const hi = predictGradientBoosting(q90Model, sample.features)
+        return Math.max(lo - sample.forwardReturn20d, sample.forwardReturn20d - hi)
+      })
+      scores.sort((a, b) => a - b)
+      const n = scores.length
+      const rank = Math.min(n - 1, Math.ceil((n + 1) * 0.8) - 1)
+      const offset = scores[rank]
+      let covered = 0
+      let widthSum = 0
+      for (const sample of testSamples) {
+        const lo = predictGradientBoosting(q10Model, sample.features) - offset
+        const hi = predictGradientBoosting(q90Model, sample.features) + offset
+        if (sample.forwardReturn20d >= lo && sample.forwardReturn20d <= hi) covered++
+        widthSum += hi - lo
+      }
+      intervalCoverage80 = covered / testSamples.length
+      intervalMeanWidthPct = widthSum / testSamples.length
+      conformalOffsetPct = offset
     }
-    intervalCoverage80 = covered / testSamples.length
-    intervalMeanWidthPct = widthSum / testSamples.length
-    conformalOffsetPct = offset
   }
 
   const ic = pearsonCorrelation(predictions, actuals)
@@ -1143,6 +1466,16 @@ export function walkForwardStep(
     intervalCoverage80,
     intervalMeanWidthPct,
     conformalOffsetPct,
+    testDetails: options.captureTestDetails
+      ? testSamples.map((sample, idx) => ({
+          ticker: sample.ticker,
+          asOf: sample.asOf,
+          cohort: sample.cohort,
+          young: sample.youngAtFormation === true,
+          prediction: predictions[idx],
+          actual: actuals[idx],
+        }))
+      : undefined,
   }
 }
 
@@ -1318,6 +1651,8 @@ export function runWalkForwardBacktest(
     nestedHyperparameterSearch?: boolean
     /** See walkForwardStep — pass featureNames.indexOf('momentum_252d'). */
     baselineMomentumFeatureIndex?: number
+    /** See walkForwardStep.captureTestDetails. */
+    captureTestDetails?: boolean
   } = {},
 ): FullBacktestResult | null {
   const sorted = indexSamples(samples)
@@ -1351,6 +1686,7 @@ export function runWalkForwardBacktest(
       txCostBps,
       modelOptions: chosenParams,
       baselineMomentumFeatureIndex: options.baselineMomentumFeatureIndex,
+      captureTestDetails: options.captureTestDetails,
     })
     if (result) steps.push(result)
     splitIndex += stepSize
@@ -1379,16 +1715,22 @@ export function runWalkForwardBacktest(
 
     const calibrationSize = Math.max(100, Math.floor(sorted.length * 0.15))
     const calibrationStart = sorted.length - calibrationSize
-    // Purge: quantile-train samples whose forward window reaches into the
-    // calibration slice would leak label information into the models the
-    // slice is supposed to test.
-    const calibrationStartTime = new Date(sorted[calibrationStart].asOf).getTime()
+    // Purge in LABEL space: quantile-train samples whose forward window
+    // (an actual bar date — 120 trading days span ~174 calendar days)
+    // reaches into the calibration slice would leak label information
+    // into the models the slice is supposed to test.
+    const calibrationStartDate = sorted[calibrationStart].asOf
+    const labelEndFor = (sample: HistoricalSample): string =>
+      horizon === 5
+        ? sample.labelEnd5d
+        : horizon === 20
+          ? sample.labelEnd20d
+          : horizon === 60
+            ? sample.labelEnd60d
+            : sample.labelEnd120d
     const quantileTrain = sorted
       .slice(0, calibrationStart)
-      .filter(
-        (sample) =>
-          new Date(sample.asOf).getTime() + horizon * 86_400_000 <= calibrationStartTime,
-      )
+      .filter((sample) => labelEndFor(sample) < calibrationStartDate)
     const quantileFeatures = quantileTrain.map((sample) => sample.features)
     const quantileTargets = quantileTrain.map((sample) => targetForHorizon(sample, horizon))
     const p10Model = fitGradientBoosting(quantileFeatures, quantileTargets, {
@@ -1646,5 +1988,216 @@ export function summarizeStepsByRegime(
   return {
     'low-vol': summarize(buckets['low-vol']),
     'high-vol': summarize(buckets['high-vol']),
+  }
+}
+
+/* =========================================================================
+   Survivorship diagnostics
+   -------------------------------------------------------------------------
+   A backtest on TODAY'S universe quietly assumes you'd have known in 2012
+   which firms would survive (Brown-Goetzmann-Ibbotson-Ross 1992). Without
+   point-in-time constituents (CRSP), the bias can't be removed — but it
+   can be made VISIBLE:
+
+   1. Cohorts at formation (Hou-Xue-Zhang 2020): compare the model inside
+      'core' (established-then) vs 'survivorPrivileged' (young or
+      bottom-size-quintile then). Edge concentrated in the privileged
+      cohort is partly an artifact.
+   2. Era stratification (Linnainmaa-Roberts 2018): bias grows with depth,
+      so performance that improves monotonically going back in time is the
+      survivorship fingerprint.
+   3. Distress canary (Campbell-Hilscher-Szilagyi 2008): real data shows
+      distressed firms earn LOW subsequent returns. In a survivors-only
+      sample the failures are missing, so distress spuriously predicts
+      HIGH returns — a positive distress→return relation is the bias
+      talking.
+   4. Delisting haircut bound (Shumway 1997: ~-30% mean delisting return;
+      Fama-French 2004: ~7%/yr attrition among young lists): how much the
+      long quintile's return would shrink if its privileged members had
+      failed at literature rates.
+   ========================================================================= */
+
+export type CohortMetrics = {
+  windows: number
+  meanIC: number
+  meanLongShortPct: number
+  samples: number
+}
+
+export type SurvivorshipReport = {
+  cohorts: {
+    core: CohortMetrics
+    survivorPrivileged: CohortMetrics
+    noFundamentalsSamples: number
+  }
+  eras: Array<{ label: string; steps: number; meanIC: number; meanLongShortNetPct: number }>
+  canary: {
+    naiveDdToReturnIc: number | null
+    altmanZToReturnIc: number | null
+    /** True when distress (LOW DD / LOW Z) predicts HIGH returns — the
+     * opposite of CHS 2008 — i.e., the survivorship signature. */
+    survivorshipSignature: boolean
+  }
+  delistingBound: {
+    privilegedShareOfLongQuintile: number
+    /** Share of the long quintile listed <3y at formation — the subset
+     * the FF2004 attrition estimate actually describes. */
+    youngShareOfLongQuintile: number
+    haircutPpPerWindow: number
+  }
+}
+
+/** Deposit/policy-reserve-heavy financials in the default universe.
+ * Bharath-Shumway (2008) and CHS (2008) both EXCLUDE financials from
+ * their samples: liability structure makes leverage-based distress
+ * measures a sector dummy there, not a default signal. The distress
+ * canary follows suit. (Payments networks, exchanges, and asset-light
+ * managers — V, MA, SPGI, ICE, CME, KKR, BX, APO, COIN — stay in.) */
+const CANARY_EXCLUDED_FINANCIALS = new Set([
+  'JPM', 'BAC', 'WFC', 'C', 'GS', 'MS', 'USB', 'PNC', 'TFC', 'COF',
+  'BK', 'SCHW', 'AXP', 'MET', 'PRU', 'AIG', 'PGR', 'TRV', 'ALL', 'MCO',
+  'AON', 'MMC', 'BLK',
+])
+
+export function analyzeSurvivorship(
+  samples: HistoricalSample[],
+  steps: WalkForwardResult[],
+): SurvivorshipReport | null {
+  // Raw-feature lookups below index into FULL feature space — pruned
+  // sample arrays would silently misread, so refuse them outright.
+  if (
+    samples.length > 0 &&
+    samples[0].rawFeatures.length !== HISTORICAL_FEATURE_NAMES.length
+  ) {
+    return null
+  }
+  const details = steps.flatMap((step) => step.testDetails ?? [])
+  if (details.length === 0) return null
+
+  // --- 1. Cohort metrics, per window then averaged -----------------------
+  const cohortMetrics = (cohort: 'core' | 'survivorPrivileged'): CohortMetrics => {
+    const ics: number[] = []
+    const longShorts: number[] = []
+    let total = 0
+    for (const step of steps) {
+      const rows = (step.testDetails ?? []).filter((row) => row.cohort === cohort)
+      total += rows.length
+      if (rows.length < 15) continue
+      const ic = pearsonCorrelation(
+        rows.map((row) => row.prediction),
+        rows.map((row) => row.actual),
+      )
+      ics.push(ic)
+      const sorted = [...rows].sort((a, b) => b.prediction - a.prediction)
+      const q = Math.max(1, Math.floor(sorted.length / 5))
+      const top = sorted.slice(0, q)
+      const bottom = sorted.slice(-q)
+      longShorts.push(
+        top.reduce((s, r) => s + r.actual, 0) / top.length -
+          bottom.reduce((s, r) => s + r.actual, 0) / bottom.length,
+      )
+    }
+    const mean = (arr: number[]) =>
+      arr.length > 0 ? arr.reduce((s, v) => s + v, 0) / arr.length : 0
+    return {
+      windows: ics.length,
+      meanIC: mean(ics),
+      meanLongShortPct: mean(longShorts),
+      samples: total,
+    }
+  }
+
+  // --- 2. Era stratification (3-calendar-year buckets) -------------------
+  const eraBuckets = new Map<string, WalkForwardResult[]>()
+  for (const step of steps) {
+    const year = Number(step.testStartDate.slice(0, 4))
+    const eraStart = Math.floor(year / 3) * 3
+    const label = `${eraStart}-${eraStart + 2}`
+    const bucket = eraBuckets.get(label) ?? []
+    bucket.push(step)
+    eraBuckets.set(label, bucket)
+  }
+  const eras = [...eraBuckets.entries()]
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([label, bucket]) => ({
+      label,
+      steps: bucket.length,
+      meanIC:
+        bucket.reduce((s, b) => s + b.informationCoefficient, 0) / bucket.length,
+      meanLongShortNetPct:
+        bucket.reduce((s, b) => s + b.longShortReturnNet, 0) / bucket.length,
+    }))
+
+  // --- 3. Distress canary over out-of-sample samples ---------------------
+  const firstTestDate = steps[0]?.testStartDate ?? ''
+  const ddIdx = HISTORICAL_FEATURE_NAMES.indexOf('fund_naive_dd')
+  const zIdx = HISTORICAL_FEATURE_NAMES.indexOf('fund_altman_z')
+  const ageIdx = HISTORICAL_FEATURE_NAMES.indexOf('fund_filing_age')
+  const oos = samples.filter(
+    (sample) =>
+      sample.asOf >= firstTestDate &&
+      sample.cohort !== 'noFundamentals' &&
+      sample.rawFeatures[ageIdx] < FUNDAMENTAL_MISSING_AGE_DAYS &&
+      // Financials excluded per BS/CHS practice — see set above.
+      !CANARY_EXCLUDED_FINANCIALS.has(sample.ticker),
+  )
+  const canaryIc = (featureIdx: number): number | null => {
+    if (featureIdx < 0) return null
+    // Only OBSERVED distress values: imputed medians would dilute the
+    // correlation toward zero and fake a "no signature" verdict.
+    const observed = oos.filter((sample) => sample.imputedMask?.[featureIdx] !== true)
+    if (observed.length < 200) return null
+    // Negate the safety measure so the correlation reads as
+    // "distress → forward return"; CHS 2008 says it should be NEGATIVE.
+    return pearsonCorrelation(
+      observed.map((sample) => -sample.rawFeatures[featureIdx]),
+      observed.map((sample) => sample.forwardReturn20d),
+    )
+  }
+  const naiveDdToReturnIc = canaryIc(ddIdx)
+  const altmanZToReturnIc = canaryIc(zIdx)
+  const survivorshipSignature =
+    (naiveDdToReturnIc != null && naiveDdToReturnIc > 0.02) ||
+    (altmanZToReturnIc != null && altmanZToReturnIc > 0.02)
+
+  // --- 4. Delisting haircut bound ----------------------------------------
+  let longQuintileCount = 0
+  let longQuintilePrivileged = 0
+  let longQuintileYoung = 0
+  for (const step of steps) {
+    const rows = step.testDetails ?? []
+    if (rows.length < 15) continue
+    const sorted = [...rows].sort((a, b) => b.prediction - a.prediction)
+    const q = Math.max(1, Math.floor(sorted.length / 5))
+    for (const row of sorted.slice(0, q)) {
+      longQuintileCount++
+      if (row.cohort === 'survivorPrivileged') longQuintilePrivileged++
+      if (row.young) longQuintileYoung++
+    }
+  }
+  const privilegedShare =
+    longQuintileCount > 0 ? longQuintilePrivileged / longQuintileCount : 0
+  const youngShare = longQuintileCount > 0 ? longQuintileYoung / longQuintileCount : 0
+  // Per-window expected haircut on the long side. The FF2004 ~7%/yr
+  // attrition rate describes YOUNG lists specifically, so it applies to
+  // the young share only (size-flagged mid-caps delist far less). The
+  // -30% delisting return is Shumway (1997)'s NYSE/AMEX estimate;
+  // Shumway-Warther (1999) find ~-55% on Nasdaq, so this is the
+  // conservative end of the bound.
+  const haircutPpPerWindow = youngShare * (0.07 * (20 / 252)) * 30
+
+  return {
+    cohorts: {
+      core: cohortMetrics('core'),
+      survivorPrivileged: cohortMetrics('survivorPrivileged'),
+      noFundamentalsSamples: details.filter((row) => row.cohort === 'noFundamentals').length,
+    },
+    eras,
+    canary: { naiveDdToReturnIc, altmanZToReturnIc, survivorshipSignature },
+    delistingBound: {
+      privilegedShareOfLongQuintile: privilegedShare,
+      youngShareOfLongQuintile: youngShare,
+      haircutPpPerWindow,
+    },
   }
 }

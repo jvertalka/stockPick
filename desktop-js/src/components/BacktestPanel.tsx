@@ -22,9 +22,9 @@ const BACKTEST_TICKERS = DEFAULT_BACKTEST_TICKERS
 
 // Cache key includes a schema version so stale entries from earlier
 // builds don't crash the panel when fields rename or get added.
-// Schema bump: v5 trains on the pruned 12-feature set (importance study
-// 2026-05-12); cached v4 results carry 30-feature importance vectors.
-const CACHE_KEY = 'backtest:last-result:v5'
+// Schema bump: v6 trains on the 15y range with the 2026-06-10 pruned
+// feature set (incl. fundamentals); v5 carried 12-feature vectors.
+const CACHE_KEY = 'backtest:last-result:v6'
 
 export function BacktestPanel() {
   const [running, setRunning] = useState(false)
@@ -145,7 +145,7 @@ export function BacktestPanel() {
       worker.postMessage({
         type: 'run',
         tickers: BACKTEST_TICKERS,
-        range: '5y',
+        range: '15y',
         cadenceDays: 10,
       })
     })
@@ -170,8 +170,9 @@ export function BacktestPanel() {
       </header>
 
       <p className="backtest-lede">
-        Trains a Gradient Boosted Trees model on 30 cross-sectionally Z-scored features
-        → 20-day forward returns across {BACKTEST_TICKERS.length} liquid names. Hyperparameters
+        Trains a Gradient Boosted Trees model on the importance-pruned feature set
+        ({PRUNED_FEATURE_NAMES.length} of 45 features incl. point-in-time EDGAR fundamentals,
+        15 years of bars) → 20-day forward returns across {BACKTEST_TICKERS.length} liquid names. Hyperparameters
         chosen by <strong>nested walk-forward CV</strong>{' '}
         {result ? `(picked: ${result.hyperparameters.numTrees} trees, depth ${result.hyperparameters.depth}, lr ${result.hyperparameters.learningRate})` : ''}.{' '}
         <strong>Purged + embargoed walk-forward</strong> (López de Prado 2018),{' '}
