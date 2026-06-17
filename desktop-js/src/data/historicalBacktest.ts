@@ -1401,10 +1401,19 @@ export function walkForwardStep(
   const randomPredictions = predictions.map(() => Math.random())
   const baselineRandomIc = pearsonCorrelation(randomPredictions, actuals)
 
-  // BASELINE: long-horizon momentum ranking (Jegadeesh-Titman)
+  // BASELINE: long-horizon momentum ranking (Jegadeesh-Titman). NaN when
+  // the momentum feature isn't in the (possibly pruned) set — better an
+  // honest "n/a" than silently scoring whatever sits in column 0, which
+  // would mislabel an unrelated feature's IC as the momentum baseline.
   const momentumIndex = options.baselineMomentumFeatureIndex ?? 2
-  const momentumPredictions = testSamples.map((sample) => sample.features[momentumIndex])
-  const baselineMomentumIc = pearsonCorrelation(momentumPredictions, actuals)
+  const featureWidth = testSamples[0]?.features.length ?? 0
+  const baselineMomentumIc =
+    momentumIndex >= 0 && momentumIndex < featureWidth
+      ? pearsonCorrelation(
+          testSamples.map((sample) => sample.features[momentumIndex]),
+          actuals,
+        )
+      : Number.NaN
 
   // DRAWDOWN: cumulative L/S return path through the test window
   // (approximate — assumes equal weighting at each test point)

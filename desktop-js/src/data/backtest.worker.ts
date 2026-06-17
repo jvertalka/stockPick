@@ -95,7 +95,7 @@ ctx.onmessage = async (event: MessageEvent<RunMessage>) => {
       testSize,
       stepSize: testSize,
       modelOptions,
-      baselineMomentumFeatureIndex: Math.max(0, pruned.featureNames.indexOf('momentum_252d')),
+      baselineMomentumFeatureIndex: pruned.featureNames.indexOf('momentum_252d'),
     })
     if (!result) {
       const err: WorkerOutbound = { type: 'error', message: 'Walk-forward validation produced no usable steps.' }

@@ -96,7 +96,7 @@ async function main() {
     initialTrainSize: Math.floor(samples.length * 0.6),
     testSize,
     stepSize: testSize,
-    baselineMomentumFeatureIndex: Math.max(0, featureNames.indexOf('momentum_252d')),
+    baselineMomentumFeatureIndex: featureNames.indexOf('momentum_252d'),
     captureTestDetails: true,
   })
   if (!result) {
@@ -140,8 +140,13 @@ async function main() {
   console.log('--- Baselines (mean IC) ---')
   console.log(`GBT model:          ${f(result.meanIC)}`)
   console.log(`Random:             ${f(result.meanBaselineRandomIc)}`)
-  console.log(`12-month momentum:  ${f(result.meanBaselineMomentumIc)}`)
-  console.log(`Edge over momentum: ${f(result.meanIC - result.meanBaselineMomentumIc)}`)
+  const momInSet = featureNames.includes('momentum_252d')
+  console.log(
+    `12-month momentum:  ${momInSet ? f(result.meanBaselineMomentumIc) : 'n/a (momentum_252d not in this feature set)'}`,
+  )
+  if (momInSet) {
+    console.log(`Edge over momentum: ${f(result.meanIC - result.meanBaselineMomentumIc)}`)
+  }
   console.log('')
   console.log('--- Long-short quintile (20d horizon) ---')
   console.log(`Gross return: ${f(result.meanLongShortReturnGross, 2)}%`)
