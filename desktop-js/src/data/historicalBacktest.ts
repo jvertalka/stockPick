@@ -1859,36 +1859,33 @@ export function runWalkForwardBacktest(
    ========================================================================= */
 
 /**
- * Survivors of the 2026-06-10 full-feature run (40 features incl. 10
- * point-in-time EDGAR fundamentals; 19,658 samples, 221 tickers, 35
- * out-of-sample steps): every feature whose mean permutation importance
- * was >= +0.001 IC. Volatility + long momentum still dominate; five
- * fundamental features earned their place — revenue acceleration and
- * revenue growth ranked 6th-7th overall (Jegadeesh-Livnat 2006 revenue
- * momentum), then leverage, net margin, and earnings yield. Notably
- * fund_margin_trend measured most harmful of all 40 (-0.011) and
- * momentum_20d/60d + Amihud, survivors of the smaller 2026-05-12 study
- * (5,340 samples, 60 names), measured negative on the wider universe.
+ * Survivors of the 2026-06-10 DEEP run (45 features incl. 13 point-in-
+ * time EDGAR fundamentals + survivorship-visibility features; 71,604
+ * samples, 221 tickers, 15 years, 70 out-of-sample windows): every
+ * feature whose mean permutation importance was >= +0.001 IC.
+ *
+ * The 15-year/full-daily-depth run reshuffled the ranking materially vs
+ * the 5y study: fund_log_market_cap jumped to #2 (+0.016) — the Banz
+ * (1981) size effect is the strongest fundamental signal by far over a
+ * long horizon — and log_price_level (CHS 2008) entered at #3. Revenue
+ * acceleration (Jegadeesh-Livnat 2006) and margin trend survived; most
+ * other fundamentals (net margin, leverage, earnings yield, ROE, the two
+ * distress features) measured as noise FOR PREDICTION even though the
+ * distress canary uses them as a survivorship diagnostic. Long momentum,
+ * a 5y survivor, went negative on the deeper sample.
  */
 export const PRUNED_FEATURE_NAMES: string[] = [
-  'volatility_252d',
-  'volatility_20d',
-  'momentum_252d',
-  'volatility_60d',
-  'price_to_low_60d',
-  'fund_revenue_accel',
-  'fund_revenue_growth_yoy',
-  'momentum_5d',
-  'fund_leverage',
-  'momentum_120d',
-  'fund_net_margin',
-  'price_to_high_252d',
-  'range_compression_20d',
-  'sma_200_distance',
-  'sma_50_distance',
-  'price_to_high_60d',
-  'vol_change_60_20',
-  'fund_earnings_yield',
+  'volatility_252d',          // +0.019
+  'fund_log_market_cap',      // +0.016  Banz 1981 size
+  'log_price_level',          // +0.009  CHS 2008 PRICE
+  'price_to_high_60d',        // +0.008
+  'range_compression_20d',    // +0.005
+  'amihud_illiquidity_20d',   // +0.003  Amihud 2002
+  'fund_revenue_accel',       // +0.003  Jegadeesh-Livnat 2006
+  'kurt_252d',                // +0.003
+  'sma_50_distance',          // +0.002
+  'fund_margin_trend',        // +0.002
+  'vol_change_60_20',         // +0.001
 ]
 
 /**
@@ -1926,10 +1923,16 @@ export function pruneSampleFeatures(
    ========================================================================= */
 
 export type RegimeLabel = 'low-vol' | 'high-vol'
+/** 'unknown' is NOT a regime — it means the SPY history was too short
+ * (or failed to load) to label this step. It is reported separately and
+ * excluded from the low/high breakdown so a fetch failure can never
+ * masquerade as a wall of genuine calm (the bug that collapsed all 70
+ * windows to low-vol when the SPY fetch transiently returned []). */
+export type RegimeLabelOrUnknown = RegimeLabel | 'unknown'
 
 export type RegimeStepLabel = {
   testStartDate: string
-  regime: RegimeLabel
+  regime: RegimeLabelOrUnknown
   highProb: number
 }
 
@@ -1943,7 +1946,7 @@ export function labelStepsByRegime(
     const closes = history.map((bar) => bar.close)
     const returns = logReturns(closes)
     if (returns.length < 60) {
-      return { testStartDate: step.testStartDate, regime: 'low-vol', highProb: 0 }
+      return { testStartDate: step.testStartDate, regime: 'unknown', highProb: 0 }
     }
     // Trailing 2y window keeps the two states responsive to current
     // conditions instead of averaging over a decade.
@@ -1955,7 +1958,7 @@ export function labelStepsByRegime(
 }
 
 export type RegimeBreakdown = Record<
-  RegimeLabel,
+  RegimeLabelOrUnknown,
   {
     steps: number
     meanIC: number
@@ -1969,12 +1972,13 @@ export function summarizeStepsByRegime(
   labels: RegimeStepLabel[],
 ): RegimeBreakdown {
   const byDate = new Map(labels.map((label) => [label.testStartDate, label.regime]))
-  const buckets: Record<RegimeLabel, WalkForwardResult[]> = {
+  const buckets: Record<RegimeLabelOrUnknown, WalkForwardResult[]> = {
     'low-vol': [],
     'high-vol': [],
+    unknown: [],
   }
   for (const step of steps) {
-    const regime = byDate.get(step.testStartDate) ?? 'low-vol'
+    const regime = byDate.get(step.testStartDate) ?? 'unknown'
     buckets[regime].push(step)
   }
   const summarize = (group: WalkForwardResult[]) => ({
@@ -1988,6 +1992,7 @@ export function summarizeStepsByRegime(
   return {
     'low-vol': summarize(buckets['low-vol']),
     'high-vol': summarize(buckets['high-vol']),
+    unknown: summarize(buckets.unknown),
   }
 }
 

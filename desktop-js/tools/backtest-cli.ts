@@ -106,10 +106,19 @@ async function main() {
 
   // Regime labeling: point-in-time Markov regime on SPY at each step
   // start. 'max', not the dataset range: every step needs 60+ prior SPY
-  // returns or labelStepsByRegime silently defaults it to 'low-vol' —
-  // which would misfile the 2020 crash on long-range runs.
+  // returns. Retry on empty — a single transient Yahoo failure here would
+  // mark every window 'unknown' and erase the whole regime breakdown.
   console.log('Labeling walk-forward steps by SPY Markov regime…')
-  const spyBars = await cachedFetchDailyBars('SPY', 'max')
+  let spyBars = await cachedFetchDailyBars('SPY', 'max')
+  for (let attempt = 0; spyBars.length === 0 && attempt < 4; attempt++) {
+    await new Promise((r) => setTimeout(r, 1500))
+    spyBars = await cachedFetchDailyBars('SPY', 'max')
+  }
+  if (spyBars.length === 0) {
+    console.warn('  WARNING: SPY history unavailable — every step labeled "unknown".')
+  } else {
+    console.log(`  SPY history: ${spyBars.length} bars (${spyBars[0].date} → ${spyBars[spyBars.length - 1].date})`)
+  }
   const regimeLabels = labelStepsByRegime(result.steps, spyBars)
   const regimeBreakdown = summarizeStepsByRegime(result.steps, regimeLabels)
 
@@ -159,8 +168,9 @@ async function main() {
   }
   console.log('')
   console.log('--- Regime breakdown (Hamilton Markov on SPY, point-in-time) ---')
-  for (const regime of ['low-vol', 'high-vol'] as const) {
+  for (const regime of ['low-vol', 'high-vol', 'unknown'] as const) {
     const bucket = regimeBreakdown[regime]
+    if (regime === 'unknown' && bucket.steps === 0) continue
     console.log(
       `  ${regime.padEnd(9)} steps=${bucket.steps}  IC ${f(bucket.meanIC)}  hit ${f(bucket.meanHitRate * 100, 1)}%  L/S net ${f(bucket.meanLongShortReturnNet, 2)}%`,
     )
@@ -229,7 +239,9 @@ async function main() {
   const regimeByDate = new Map(regimeLabels.map((label) => [label.testStartDate, label]))
   for (const step of result.steps) {
     const label = regimeByDate.get(step.testStartDate)
-    const regimeTag = label ? `${label.regime === 'high-vol' ? 'HIGH' : 'low '} p=${f(label.highProb, 2)}` : ''
+    const regimeTag = label
+      ? `${label.regime === 'high-vol' ? 'HIGH' : label.regime === 'unknown' ? '??? ' : 'low '} p=${f(label.highProb, 2)}`
+      : ''
     console.log(
       `  ${step.testStartDate} → ${step.testEndDate}  IC ${f(step.informationCoefficient)}  hit ${f(step.hitRate * 100, 0)}%  L/S net ${f(step.longShortReturnNet, 2)}%  [${regimeTag}]`,
     )

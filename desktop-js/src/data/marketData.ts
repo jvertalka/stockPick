@@ -67,13 +67,34 @@ type YahooChartResponse = {
   }
 }
 
+/** Years of history per range token. Yahoo SILENTLY DOWNGRADES the
+ * interval for long named ranges (range=max&interval=1d returns ~monthly
+ * bars), so all fetches use explicit period1/period2 epochs instead —
+ * those keep true daily granularity back decades. */
+const RANGE_YEARS: Record<string, number> = {
+  '1mo': 1 / 12,
+  '3mo': 0.25,
+  '6mo': 0.5,
+  '1y': 1,
+  '2y': 2,
+  '5y': 5,
+  '10y': 10,
+  max: 40,
+}
+
 export async function fetchDailyBars(
   ticker: string,
   range: '1mo' | '3mo' | '6mo' | '1y' | '2y' | '5y' | '10y' | 'max' = '3mo',
 ): Promise<DailyBar[]> {
+  const years = RANGE_YEARS[range] ?? 0.25
+  // Anchor period2 to the next UTC midnight so the URL — and therefore
+  // the proxy cache key — is stable within a day while still including
+  // today's bar.
+  const period2 = Math.ceil(Date.now() / 86_400_000) * 86_400
+  const period1 = period2 - Math.round(years * 365.25 * 86_400)
   const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(
     ticker,
-  )}?range=${range}&interval=1d&includePrePost=false&events=div,splits`
+  )}?period1=${period1}&period2=${period2}&interval=1d&includePrePost=false&events=div,splits`
   const payload = await safeJson<YahooChartResponse>(proxied(url))
   const result = payload?.chart?.result?.[0]
   const timestamps = result?.timestamp
@@ -233,7 +254,15 @@ function memoize<T>(key: string, ttlMs: number, factory: () => Promise<T>): Prom
     return Promise.resolve(existing.value as T)
   }
   return factory().then((value) => {
-    cache.set(key, { ttl: ttlMs, expires: now + ttlMs, value })
+    // Never cache an empty/failed result: a single transient Yahoo failure
+    // (common during the 224-ticker burst of a backtest build) would
+    // otherwise poison the key for the full TTL — which is exactly how the
+    // SPY regime fetch silently returned [] and collapsed every window to
+    // low-vol. Empty bar arrays are retried on the next call.
+    const isEmptyBars = Array.isArray(value) && value.length === 0
+    if (!isEmptyBars) {
+      cache.set(key, { ttl: ttlMs, expires: now + ttlMs, value })
+    }
     return value
   })
 }
