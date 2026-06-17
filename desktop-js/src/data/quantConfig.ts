@@ -216,25 +216,28 @@ export const MARKET_EQUITY_RISK_PREMIUM = 0.055
      low-vol  (28 steps): IC 0.089, hit 59.4%, L/S net +2.81%/20d
      high-vol  (7 steps): IC 0.021, hit 50.2% (coin flip)
 
-   2026-06-10 DEEP (11 pruned features incl. EDGAR fundamentals, 71,624
-   samples, 221 names, 15 years, 70 windows — first run with enough
-   high-vol windows to mean anything):
-     low-vol  (57 steps): IC 0.041, hit 56.8%, L/S net +0.86%/20d
-     high-vol (13 steps): IC 0.077, hit 50.2%, L/S net +1.71%/20d
+   2026-06-17 DEEP 15y (11 pruned features incl. EDGAR fundamentals,
+   ~71,600 samples, 221 names, 70 windows — first runs with a double-
+   digit high-vol window count). Across three re-runs (data drifts daily
+   as Yahoo adds bars, shifting which windows fall in each regime):
+     low-vol  (~59 steps): IC 0.048, hit 55.5%, L/S net +0.91%/20d
+     high-vol (11-13 steps): IC 0.077-0.080, hit 50.2% / 55.9% / 55.9%
 
-   The deep run splits the difference revealingly: in high-vol the model
-   RANK-ORDERS well (IC 0.077, even above low-vol) but its DIRECTIONAL
-   accuracy is a coin flip (hit 50.2%). ML "action overrides" flip a
-   Hold to a Buy on the SIGN of the prediction — which is exactly the
-   coin-flip part — so the directional gate stays justified even though
-   the ranking has value. (Earlier small-sample vintages: 2026-05-12 IC
-   0.021/7 windows; 2026-06-10 shallow IC 0.135/4 windows — both too few
-   to trust.) Revisit if a future run shows high-vol hit rate clearing
-   ~55% with a real window count.
+   HONEST READ: the deep data did NOT replicate the coin flip that
+   originally justified this gate. High-vol IC (~0.08) is now AS GOOD AS
+   or better than low-vol, and the hit rate is 50-56% — one run landed at
+   50.2% but two others at 55.9%, so "coin flip" was a noisy single draw,
+   not a stable fact. With only 11-13 high-vol windows none of this
+   PROVES skill either way. The gate therefore stays as a CONSERVATIVE
+   DEFAULT (don't act on ML where we can't verify it), NOT because we
+   measured a coin flip — its empirical basis is now weak. Candidate to
+   lift once more high-vol windows accumulate, or sooner by owner call.
+   (Vintages that motivated it originally, both too few to trust:
+   2026-05-12 IC 0.021/7 windows; 2026-06-10 shallow IC 0.135/4 windows.)
    ========================================================================= */
 export const ML_REGIME_GATE = {
   /** Regime in which ML action overrides are suppressed; null disables gating. */
   gatedRegime: 'high-vol' as 'high-vol' | 'low-vol' | null,
   rationale:
-    'In high-vol regimes the model ranks names well (IC 0.077, 13 windows, 2026-06-10 15y run) but its directional hit rate is a coin flip (50.2%). Action overrides depend on the prediction SIGN — the coin-flip part — so ML overrides pause in high-vol and the engine falls back to rules. The ranking still informs the conviction stack.',
+    'High-vol ML skill is unproven on the deep 15y data: across re-runs the model scored IC ~0.08 and hit 50-56% in high-vol (11-13 windows) — as good as low-vol, NOT the coin flip earlier small studies suggested. Too few windows to prove skill either way, so ML action overrides pause in high-vol as a conservative default while the ranking still informs the conviction stack. Empirical basis is weak; candidate to lift.',
 } as const
