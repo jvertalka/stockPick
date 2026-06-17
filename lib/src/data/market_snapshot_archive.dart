@@ -10,13 +10,20 @@ abstract class MarketSnapshotArchive {
     required String source,
   });
 
+  Future<ArchiveSummary> saveSnapshots(
+    Iterable<RawMarketState> marketStates, {
+    required String source,
+  });
+
   Future<ArchiveSummary> loadSummary();
+
+  Future<List<ArchivedMarketSnapshot>> loadSnapshots();
 }
 
 class SharedPreferencesMarketSnapshotArchive implements MarketSnapshotArchive {
   SharedPreferencesMarketSnapshotArchive({
     this.preferencesKey = 'market_snapshot_archive_v1',
-    this.maxSnapshots = 48,
+    this.maxSnapshots = 240,
   });
 
   final String preferencesKey;
@@ -27,22 +34,33 @@ class SharedPreferencesMarketSnapshotArchive implements MarketSnapshotArchive {
     RawMarketState marketState, {
     required String source,
   }) async {
+    return saveSnapshots([marketState], source: source);
+  }
+
+  @override
+  Future<ArchiveSummary> saveSnapshots(
+    Iterable<RawMarketState> marketStates, {
+    required String source,
+  }) async {
     final preferences = await SharedPreferences.getInstance();
     final records = _readRecords(preferences);
-    final snapshotId = '$source:${marketState.asOf.toIso8601String()}';
-    final record = ArchivedMarketSnapshot(
-      snapshotId: snapshotId,
-      source: source,
-      capturedAt: DateTime.now(),
-      marketState: marketState,
-    );
-    final existingIndex = records.indexWhere(
-      (entry) => entry.snapshotId == record.snapshotId,
-    );
-    if (existingIndex == -1) {
-      records.add(record);
-    } else {
-      records[existingIndex] = record;
+    final capturedAt = DateTime.now();
+    for (final marketState in marketStates) {
+      final snapshotId = '$source:${marketState.asOf.toIso8601String()}';
+      final record = ArchivedMarketSnapshot(
+        snapshotId: snapshotId,
+        source: source,
+        capturedAt: capturedAt,
+        marketState: marketState,
+      );
+      final existingIndex = records.indexWhere(
+        (entry) => entry.snapshotId == record.snapshotId,
+      );
+      if (existingIndex == -1) {
+        records.add(record);
+      } else {
+        records[existingIndex] = record;
+      }
     }
     records.sort(
       (left, right) => left.marketState.asOf.compareTo(right.marketState.asOf),
@@ -50,11 +68,8 @@ class SharedPreferencesMarketSnapshotArchive implements MarketSnapshotArchive {
     final trimmed = records.length > maxSnapshots
         ? records.sublist(records.length - maxSnapshots)
         : records;
-    await preferences.setString(
-      preferencesKey,
-      jsonEncode(trimmed.map((entry) => entry.toJson()).toList()),
-    );
-    return ArchiveSummary.fromSnapshots(trimmed);
+    final savedRecords = await _persistNewestRecords(preferences, trimmed);
+    return ArchiveSummary.fromSnapshots(savedRecords);
   }
 
   @override
@@ -64,19 +79,56 @@ class SharedPreferencesMarketSnapshotArchive implements MarketSnapshotArchive {
     return ArchiveSummary.fromSnapshots(records);
   }
 
+  @override
+  Future<List<ArchivedMarketSnapshot>> loadSnapshots() async {
+    final preferences = await SharedPreferences.getInstance();
+    return _readRecords(preferences);
+  }
+
   List<ArchivedMarketSnapshot> _readRecords(SharedPreferences preferences) {
     final raw = preferences.getString(preferencesKey);
     if (raw == null || raw.isEmpty) {
       return <ArchivedMarketSnapshot>[];
     }
 
-    final decoded = jsonDecode(raw) as List<dynamic>;
-    return decoded
-        .map(
-          (entry) =>
-              ArchivedMarketSnapshot.fromJson(entry as Map<String, dynamic>),
-        )
-        .toList();
+    try {
+      final decoded = jsonDecode(raw) as List<dynamic>;
+      return decoded
+          .map(
+            (entry) =>
+                ArchivedMarketSnapshot.fromJson(entry as Map<String, dynamic>),
+          )
+          .toList();
+    } catch (_) {
+      return <ArchivedMarketSnapshot>[];
+    }
+  }
+
+  Future<List<ArchivedMarketSnapshot>> _persistNewestRecords(
+    SharedPreferences preferences,
+    List<ArchivedMarketSnapshot> records,
+  ) async {
+    var candidates = records;
+    while (candidates.isNotEmpty) {
+      try {
+        final saved = await preferences.setString(
+          preferencesKey,
+          jsonEncode(candidates.map((entry) => entry.toJson()).toList()),
+        );
+        if (saved) {
+          return candidates;
+        }
+      } catch (_) {
+        // Browsers can reject large localStorage writes. Keep the app usable by
+        // preserving the newest slice that fits instead of failing startup.
+      }
+
+      final midpoint = candidates.length ~/ 2;
+      candidates = candidates.sublist(midpoint == 0 ? 1 : midpoint);
+    }
+
+    await preferences.remove(preferencesKey);
+    return <ArchivedMarketSnapshot>[];
   }
 }
 

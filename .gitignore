@@ -43,3 +43,9 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
+
+# Local secrets — API keys, private config. NEVER commit these files.
+lib/src/data/local_secrets.dart
+.finance_app_secrets.json
+.env
+.env.local

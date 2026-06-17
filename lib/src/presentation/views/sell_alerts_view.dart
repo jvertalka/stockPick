@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import '../../models/market_intelligence.dart';
 import '../../theme/app_theme.dart';
 import '../widgets/insight_widgets.dart';
+import '../widgets/oracle_widgets.dart';
 
 class SellAlertsView extends StatelessWidget {
   const SellAlertsView({super.key, required this.alerts});
@@ -11,8 +12,45 @@ class SellAlertsView extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    if (alerts.isEmpty) {
+      return SingleChildScrollView(
+        padding: const EdgeInsets.fromLTRB(24, 18, 24, 28),
+        child: const Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            ViewHeader(
+              eyebrow: 'Sell Alerts',
+              title:
+                  'Clusters of deterioration matter more than one indicator.',
+              subtitle:
+                  'This board stays quiet until enough evidence accumulates to justify trimming, de-risking, or exiting.',
+              trailing: TonePill(
+                label: '0 active alerts',
+                tone: SignalTone.neutral,
+              ),
+            ),
+            PlainEnglishGuideCard(
+              summary:
+                  'This screen is about protecting discipline. It waits for several warning signs to agree before telling you to trim, de-risk, or leave.',
+              entries: _sellAlertsGuideEntries,
+            ),
+            SizedBox(height: 18),
+            EmptyStateCard(
+              icon: Icons.warning_amber_rounded,
+              title: 'No sell alerts yet.',
+              message:
+                  'That usually means the current snapshot has not produced a strong enough deterioration cluster to escalate.',
+            ),
+          ],
+        ),
+      );
+    }
+
     final trimCount = alerts
         .where((alert) => alert.action == RecommendationAction.trim)
+        .length;
+    final deRiskCount = alerts
+        .where((alert) => alert.action == RecommendationAction.deRisk)
         .length;
     final exitCount = alerts
         .where((alert) => alert.action == RecommendationAction.exit)
@@ -27,7 +65,7 @@ class SellAlertsView extends StatelessWidget {
         builder: (context, constraints) {
           final statWidth = adaptivePanelWidth(
             constraints.maxWidth,
-            maxColumns: 3,
+            maxColumns: 4,
             minWidth: 220,
           );
 
@@ -45,6 +83,12 @@ class SellAlertsView extends StatelessWidget {
                   tone: SignalTone.caution,
                 ),
               ),
+              const PlainEnglishGuideCard(
+                summary:
+                    'This screen is about protecting discipline. It waits for several warning signs to agree before telling you to trim, de-risk, or leave.',
+                entries: _sellAlertsGuideEntries,
+              ),
+              const SizedBox(height: 18),
               InsightCard(
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
@@ -74,6 +118,22 @@ class SellAlertsView extends StatelessWidget {
                       detail:
                           'Stories that still work, but with less upside than before.',
                       tone: SignalTone.caution,
+                      definition:
+                          'Ideas where the thesis is not fully broken, but the reward has shrunk enough that smaller size makes more sense.',
+                    ),
+                  ),
+                  SizedBox(
+                    width: statWidth,
+                    child: MetricTile(
+                      label: 'De-risk alerts',
+                      value: '$deRiskCount',
+                      detail:
+                          'Stories where the evidence has weakened enough to cut exposure more meaningfully.',
+                      tone: deRiskCount > 0
+                          ? SignalTone.caution
+                          : SignalTone.neutral,
+                      definition:
+                          'De-risk means the thesis still has pieces working, but the cluster of warnings is now strong enough to reduce exposure aggressively.',
                     ),
                   ),
                   SizedBox(
@@ -83,6 +143,8 @@ class SellAlertsView extends StatelessWidget {
                       value: '$exitCount',
                       detail: 'Theses that now look broken or unrewarding.',
                       tone: SignalTone.negative,
+                      definition:
+                          'Ideas where enough evidence has gone wrong that the app no longer sees a good reason to stay in the trade.',
                     ),
                   ),
                   SizedBox(
@@ -93,6 +155,8 @@ class SellAlertsView extends StatelessWidget {
                       detail:
                           'How many deterioration signals tend to agree before the board escalates.',
                       tone: SignalTone.neutral,
+                      definition:
+                          'A cluster is a group of separate warning signs pointing the same way. Bigger clusters mean the warning is broader, not just louder.',
                     ),
                   ),
                 ],
@@ -171,6 +235,8 @@ class SellAlertsView extends StatelessWidget {
                           label: 'Deterioration cluster count',
                           value: '${alert.clusterCount}',
                           highlight: AppTheme.amber,
+                          definition:
+                              'How many separate warning signs agreed strongly enough to trigger this alert.',
                         ),
                         const SizedBox(height: 8),
                         Text(
@@ -182,7 +248,38 @@ class SellAlertsView extends StatelessWidget {
                           items: alert.triggers,
                           accent: AppTheme.coral,
                         ),
-                        const SizedBox(height: 8),
+                        const SizedBox(height: 10),
+                        LabelValueRow(
+                          label: 'Effective cluster weight',
+                          value: alert.effectiveClusterWeight.toStringAsFixed(
+                            2,
+                          ),
+                          highlight: AppTheme.amber,
+                          definition:
+                              'Time-decayed sum of deterioration signal weights. A fresh signal contributes ~1.0; a signal older than ~7 sessions contributes ~0.5.',
+                        ),
+                        LabelValueRow(
+                          label: 'Exit probability',
+                          value: '${alert.exitProbability.round()}%',
+                          highlight: AppTheme.coral,
+                          definition:
+                              'Rough probability that this turns into an outright exit within the next few sessions given current evidence.',
+                        ),
+                        const SizedBox(height: 12),
+                        if (alert.decayedTriggers.isNotEmpty) ...[
+                          DecayedTriggersCard(signals: alert.decayedTriggers),
+                          const SizedBox(height: 12),
+                        ],
+                        if (alert.macroGates.isNotEmpty) ...[
+                          MacroGatesCard(gates: alert.macroGates),
+                          const SizedBox(height: 12),
+                        ],
+                        if (alert.correlationCluster != null) ...[
+                          CorrelationClusterCard(
+                            cluster: alert.correlationCluster!,
+                          ),
+                          const SizedBox(height: 12),
+                        ],
                         Text(
                           'Next check: ${alert.nextCheck}',
                           style: Theme.of(
@@ -201,3 +298,31 @@ class SellAlertsView extends StatelessWidget {
     );
   }
 }
+
+const _sellAlertsGuideEntries = [
+  GuideEntry(
+    term: 'Deterioration cluster',
+    definition:
+        'A cluster means several independent warning signs are leaning negative at the same time, which is more trustworthy than one scary signal by itself.',
+  ),
+  GuideEntry(
+    term: 'Trim, de-risk, exit',
+    definition:
+        'These are escalating actions. Trim means reduce a winner. De-risk means cut exposure more meaningfully. Exit means the thesis now looks broken or not worth the pain.',
+  ),
+  GuideEntry(
+    term: 'Damage score',
+    definition:
+        'A quick summary of how badly the evidence is hurting the original story. Higher means the setup is under more pressure.',
+  ),
+  GuideEntry(
+    term: 'Trigger cluster',
+    definition:
+        'These are the exact signs that caused the alert, such as weakening price response, fading breadth, or rising options stress.',
+  ),
+  GuideEntry(
+    term: 'Next check',
+    definition:
+        'The follow-up clue that would help decide whether the setup is stabilizing or still getting worse.',
+  ),
+];

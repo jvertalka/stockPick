@@ -107,11 +107,27 @@ void main() {
         snapshot,
         source: 'fixture-research-repository',
       );
+      final snapshots = await archive.loadSnapshots();
 
       expect(firstSave.snapshotCount, 1);
       expect(secondSave.snapshotCount, 1);
       expect(secondSave.latestSnapshotAsOf, snapshot.asOf);
       expect(secondSave.sources, contains('fixture-research-repository'));
+      expect(snapshots, hasLength(1));
+    },
+  );
+
+  test(
+    'archive ignores corrupt browser storage instead of failing startup',
+    () async {
+      SharedPreferences.setMockInitialValues({
+        'market_snapshot_archive_v1': 'not valid json',
+      });
+
+      final archive = SharedPreferencesMarketSnapshotArchive();
+
+      expect(await archive.loadSnapshots(), isEmpty);
+      expect((await archive.loadSummary()).snapshotCount, 0);
     },
   );
 }

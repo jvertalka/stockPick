@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 
 import 'src/data/market_data_configuration.dart';
@@ -20,11 +22,35 @@ class FinanceOracleApp extends StatefulWidget {
 class _FinanceOracleAppState extends State<FinanceOracleApp> {
   late Future<IntelligenceAppState> _stateFuture;
   bool _isRefreshing = false;
+  Timer? _syncTimer;
+  IntelligenceAppState? _lastGoodState;
+
+  /// How often the app silently refreshes in the background. 20 minutes is
+  /// compatible with Alpha Vantage's free 25/day quota while still feeling
+  /// fresh during the trading session.
+  static const Duration _autoSyncInterval = Duration(minutes: 20);
+  static const Duration _interactiveLoadTimeout = Duration(seconds: 12);
 
   @override
   void initState() {
     super.initState();
-    _stateFuture = widget._repository.loadState();
+    _stateFuture = _loadRepositoryState();
+    _startAutoSync();
+  }
+
+  @override
+  void dispose() {
+    _syncTimer?.cancel();
+    super.dispose();
+  }
+
+  void _startAutoSync() {
+    _syncTimer?.cancel();
+    _syncTimer = Timer.periodic(_autoSyncInterval, (_) {
+      // Silently refresh in the background; failures are handled by the
+      // FutureBuilder on next successful render.
+      _refreshState(silent: true);
+    });
   }
 
   @override
@@ -53,6 +79,7 @@ class _FinanceOracleAppState extends State<FinanceOracleApp> {
             );
           }
 
+          _lastGoodState = snapshot.data!;
           return HomeShell(
             state: snapshot.data!,
             isRefreshing: _isRefreshing,
@@ -63,7 +90,7 @@ class _FinanceOracleAppState extends State<FinanceOracleApp> {
     );
   }
 
-  Future<void> _refreshState() async {
+  Future<void> _refreshState({bool silent = false}) async {
     if (_isRefreshing) {
       return;
     }
@@ -71,13 +98,22 @@ class _FinanceOracleAppState extends State<FinanceOracleApp> {
     setState(() {
       _isRefreshing = true;
     });
-    final future = widget._repository.refreshState();
-    setState(() {
-      _stateFuture = future;
-    });
+    final future = _loadRepositoryState(refresh: true);
+    if (!silent) {
+      setState(() {
+        _stateFuture = future;
+      });
+    }
 
     try {
-      await future;
+      final result = await future;
+      if (mounted && silent) {
+        setState(() {
+          _stateFuture = Future.value(result);
+        });
+      }
+    } catch (_) {
+      // Silent sync failures are ignored; the last good state stays visible.
     } finally {
       if (mounted) {
         setState(() {
@@ -85,6 +121,63 @@ class _FinanceOracleAppState extends State<FinanceOracleApp> {
         });
       }
     }
+  }
+
+  Future<IntelligenceAppState> _loadRepositoryState({
+    bool refresh = false,
+  }) async {
+    try {
+      final state = await Future<IntelligenceAppState>(
+        () => refresh
+            ? widget._repository.refreshState()
+            : widget._repository.loadState(),
+      ).timeout(_interactiveLoadTimeout);
+      _lastGoodState = state;
+      return state;
+    } on TimeoutException {
+      final lastGood = _lastGoodState;
+      if (lastGood != null) {
+        return lastGood;
+      }
+      return _buildFastStartFallback();
+    }
+  }
+
+  Future<IntelligenceAppState> _buildFastStartFallback() async {
+    final configuration = MarketDataConfiguration.fromEnvironment();
+    final fastStartUniverseLimit = configuration.stockUniverseLimit < 220
+        ? configuration.stockUniverseLimit
+        : 220;
+    final fastStartHistoryLimit = configuration.historicalSnapshotLimit < 240
+        ? configuration.historicalSnapshotLimit
+        : 240;
+    final fallback = await ProviderMarketRepository.fixtureBacked(
+      stockUniverseLimit: fastStartUniverseLimit,
+      historicalSnapshotLimit: fastStartHistoryLimit,
+    ).loadState();
+    return IntelligenceAppState(
+      snapshot: fallback.snapshot,
+      dataStatus: DataStatusReport(
+        title: 'Fast-start fallback',
+        summary:
+            'The live/free-source data layer took longer than ${_interactiveLoadTimeout.inSeconds} seconds, so the app opened with the local rules-engine fallback. Press Refresh to retry live Alpha Vantage, Treasury, SEC EDGAR, and GDELT inputs.',
+        lastRefresh: DateTime.now(),
+        archiveSummary: fallback.dataStatus.archiveSummary,
+        archiveSnapshotCount: fallback.dataStatus.archiveSnapshotCount,
+        latestArchive: fallback.dataStatus.latestArchive,
+        feeds: [
+          const DataFeedStatus(
+            name: 'Live/free-source startup',
+            availability: FeedAvailability.missing,
+            refreshCadence: FeedRefreshCadence.onDemand,
+            detail:
+                'Initial live data load timed out before the first dashboard render. The app stayed usable and will retry on refresh.',
+          ),
+          ...fallback.dataStatus.feeds,
+        ],
+      ),
+      engineStatus: fallback.engineStatus,
+    );
   }
 }
 
@@ -141,19 +234,52 @@ class _StatusScaffold extends StatelessWidget {
 class _DefaultRepository implements MarketIntelligenceRepository {
   const _DefaultRepository();
 
+  static const int _startupUniverseLimit = 220;
+  static const int _startupHistoryLimit = 240;
+
   @override
   Future<IntelligenceAppState> loadState() {
     final configuration = MarketDataConfiguration.fromEnvironment();
-    final repository = switch (configuration.mode) {
-      MarketDataMode.fixtureOnly => ProviderMarketRepository.fixtureBacked(),
-      MarketDataMode.livePreferred || MarketDataMode.liveRequired =>
-        ProviderMarketRepository.liveConfigured(configuration: configuration),
-    };
-    return repository.loadState();
+    return _buildRepository(_startupConfiguration(configuration)).loadState();
   }
 
   @override
   Future<IntelligenceAppState> refreshState() {
-    return loadState();
+    return _buildRepository(
+      MarketDataConfiguration.fromEnvironment(),
+    ).loadState();
+  }
+
+  MarketDataConfiguration _startupConfiguration(
+    MarketDataConfiguration configuration,
+  ) {
+    return configuration.copyWith(
+      stockUniverseLimit:
+          configuration.stockUniverseLimit < _startupUniverseLimit
+          ? configuration.stockUniverseLimit
+          : _startupUniverseLimit,
+      historicalSnapshotLimit:
+          configuration.historicalSnapshotLimit < _startupHistoryLimit
+          ? configuration.historicalSnapshotLimit
+          : _startupHistoryLimit,
+    );
+  }
+
+  MarketIntelligenceRepository _buildRepository(
+    MarketDataConfiguration configuration,
+  ) {
+    final repository = switch (configuration.mode) {
+      MarketDataMode.fixtureOnly => ProviderMarketRepository.fixtureBacked(
+        stockUniverseLimit: configuration.stockUniverseLimit,
+        historicalSnapshotLimit: configuration.historicalSnapshotLimit,
+      ),
+      MarketDataMode.alphaVantage =>
+        ProviderMarketRepository.alphaVantageConfigured(
+          configuration: configuration,
+        ),
+      MarketDataMode.livePreferred || MarketDataMode.liveRequired =>
+        ProviderMarketRepository.liveConfigured(configuration: configuration),
+    };
+    return repository;
   }
 }

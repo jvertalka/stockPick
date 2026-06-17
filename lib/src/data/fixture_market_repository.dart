@@ -1,44 +1,76 @@
 import '../engine/market_intelligence_engine.dart';
+import '../engine/market_metric_history_builder.dart';
 import '../engine/validation_engine.dart';
 import '../models/intelligence_app_state.dart';
+import 'default_symbol_universe.dart';
 import 'market_snapshot_archive.dart';
+import 'market_snapshot_archive_factory.dart';
 import 'market_intelligence_repository.dart';
+import 'raw_data_enrichment.dart';
 import 'raw_market_data.dart';
 
 class FixtureMarketRepository implements MarketIntelligenceRepository {
   FixtureMarketRepository({
     MarketIntelligenceEngine? engine,
     MarketSnapshotArchive? archive,
+    int stockUniverseLimit = 40,
+    int historicalSnapshotLimit = 240,
   }) : _engine = engine ?? MarketIntelligenceEngine(),
-       _archive = archive ?? SharedPreferencesMarketSnapshotArchive(),
+       _archive =
+           archive ??
+           createDefaultMarketSnapshotArchive(
+             maxSnapshots: historicalSnapshotLimit,
+           ),
+       _stockUniverseLimit = stockUniverseLimit,
+       _historicalSnapshotLimit = historicalSnapshotLimit,
        _validationEngine = ValidationEngine(
          engine: engine ?? MarketIntelligenceEngine(),
        );
 
   final MarketIntelligenceEngine _engine;
   final MarketSnapshotArchive _archive;
+  final int _stockUniverseLimit;
+  final int _historicalSnapshotLimit;
   final ValidationEngine _validationEngine;
+
+  static const RawDataEnrichment _enrichment = RawDataEnrichment();
 
   @override
   Future<IntelligenceAppState> loadState() async {
     final syncTime = DateTime.now();
-    final currentState = _currentMarketState();
+    final currentState = _enrichment.enrichState(currentMarketState());
+    final windows = validationWindows();
+    final historicalReplay = historicalReplayStates(
+      currentState: currentState,
+      validationWindows: windows,
+    ).map(_enrichment.enrichState).toList();
     final evaluation = _engine.evaluate(currentState);
+    await _archive.saveSnapshots(
+      historicalReplay,
+      source: 'fixture-research-replay',
+    );
     final archiveSummary = await _archive.saveSnapshot(
       currentState,
       source: 'fixture-research-repository',
     );
     final validation = _validationEngine.validate(
-      _validationWindows(),
+      windows,
       archivedSnapshotCount: archiveSummary.snapshotCount,
+      stockUniverseCount: currentState.stocks.length,
+    );
+    final archivedSnapshots = await _archive.loadSnapshots();
+    final snapshot = withHistoricalInsights(
+      snapshot: evaluation.snapshot,
+      historicalSnapshots: archivedSnapshots,
+      engine: _engine,
     );
 
     return IntelligenceAppState(
-      snapshot: evaluation.snapshot,
+      snapshot: snapshot,
       dataStatus: DataStatusReport(
         title: 'Fixture research repository',
         summary:
-            'The app is now driven by a structured local repository of market, sector, stock, and options-like inputs. These are still fixtures, but they now flow through a point-in-time archive path with explicit refresh cadence metadata.',
+            'The app is now driven by a structured local repository of market, sector, stock, and options-like inputs. The screened universe currently spans ${evaluation.scoredStocks.length} stocks, and the archive is hydrated with ${historicalReplay.length} historical replay states before the latest snapshot is written.',
         lastRefresh: syncTime,
         archiveSummary: archiveSummary.summaryText,
         archiveSnapshotCount: archiveSummary.snapshotCount,
@@ -75,9 +107,19 @@ class FixtureMarketRepository implements MarketIntelligenceRepository {
                 : FeedAvailability.missing,
             refreshCadence: FeedRefreshCadence.onDemand,
             detail: archiveSummary.hasSnapshots
-                ? 'Snapshots are now serialized into a local archive so the repository can start preserving what the app knew at a point in time.'
+                ? 'Snapshots are serialized into a local archive, and fixture mode also primes that archive with research replay history so trend charts have durable local context.'
                 : 'Snapshot persistence is wired, but no snapshots have been archived yet.',
             lastUpdated: archiveSummary.latestSnapshotAsOf,
+          ),
+          DataFeedStatus(
+            name: 'Historical market states',
+            availability: FeedAvailability.fixture,
+            refreshCadence: FeedRefreshCadence.daily,
+            detail:
+                'Fixture mode exposes a replay history that fills the durable archive with point-in-time market states until a connected historical feed takes over.',
+            lastUpdated: historicalReplay.isEmpty
+                ? null
+                : historicalReplay.last.asOf,
           ),
           DataFeedStatus(
             name: 'Live vendor connections',
@@ -115,11 +157,27 @@ class FixtureMarketRepository implements MarketIntelligenceRepository {
   }
 
   RawMarketState currentMarketState() {
-    return _currentMarketState();
+    return _expandStockUniverse(_currentMarketState());
   }
 
   List<ValidationWindow> validationWindows() {
     return _validationWindows();
+  }
+
+  List<RawMarketState> historicalReplayStates({
+    RawMarketState? currentState,
+    List<ValidationWindow>? validationWindows,
+  }) {
+    final resolvedCurrentState = currentState ?? currentMarketState();
+    final resolvedValidationWindows =
+        validationWindows ?? this.validationWindows();
+    return buildFixtureReplayHistory(
+      currentState: resolvedCurrentState,
+      anchorStates: resolvedValidationWindows.map(
+        (window) => window.marketState,
+      ),
+      maxHistoryPoints: _historicalSnapshotLimit,
+    );
   }
 
   RawMarketState _currentMarketState() {
@@ -1603,6 +1661,257 @@ class FixtureMarketRepository implements MarketIntelligenceRepository {
     ];
   }
 
+  RawMarketState _expandStockUniverse(RawMarketState baseState) {
+    final cappedLimit = _stockUniverseLimit < 1 ? 1 : _stockUniverseLimit;
+    if (baseState.stocks.length >= cappedLimit) {
+      return RawMarketState(
+        asOf: baseState.asOf,
+        environment: baseState.environment,
+        styles: baseState.styles,
+        sectors: baseState.sectors,
+        stocks: baseState.stocks.take(cappedLimit).toList(),
+      );
+    }
+
+    final stocks = [...baseState.stocks];
+    final existingTickers = stocks.map((stock) => stock.ticker).toSet();
+    final defaultProfiles = kDefaultSymbolUniverse
+        .map(defaultSymbolProfileFor)
+        .whereType<DefaultSymbolProfile>()
+        .toList();
+    final defaultBlueprints =
+        [
+          ...defaultProfiles.where(
+            (profile) => isCoreEtfSymbol(profile.symbol),
+          ),
+          ...defaultProfiles.where(
+            (profile) => !isCoreEtfSymbol(profile.symbol),
+          ),
+        ].map(
+          (profile) => _SyntheticStockBlueprint(
+            ticker: profile.symbol,
+            company: profile.displayName,
+            sector: profile.sector,
+            industry: profile.industry,
+            templateTicker: profile.templateTicker,
+            momentumBias: profile.momentumBias,
+            qualityBias: profile.qualityBias,
+            valuationBias: profile.valuationBias,
+            riskBias: profile.riskBias,
+            growthBias: profile.growthBias,
+            defensiveBias: profile.defensiveBias,
+            creditBias: profile.creditBias,
+            rateBias: profile.rateBias,
+          ),
+        );
+    final blueprintPool = [
+      ..._syntheticStockBlueprints,
+      ...defaultBlueprints,
+      for (var index = 1; index <= cappedLimit; index++)
+        _SyntheticStockBlueprint(
+          ticker: 'FX${index.toString().padLeft(2, '0')}',
+          company: 'Fixture Expansion $index',
+          sector: baseState.stocks[index % baseState.stocks.length].sector,
+          industry: baseState.stocks[index % baseState.stocks.length].industry,
+          templateTicker:
+              baseState.stocks[index % baseState.stocks.length].ticker,
+        ),
+    ];
+
+    var generatedCount = 0;
+    for (final blueprint in blueprintPool) {
+      if (stocks.length >= cappedLimit) {
+        break;
+      }
+      if (existingTickers.contains(blueprint.ticker)) {
+        continue;
+      }
+      stocks.add(
+        _buildSyntheticUniverseMember(
+          baseState.stocks,
+          blueprint,
+          generatedCount,
+        ),
+      );
+      existingTickers.add(blueprint.ticker);
+      generatedCount += 1;
+    }
+
+    return RawMarketState(
+      asOf: baseState.asOf,
+      environment: baseState.environment,
+      styles: baseState.styles,
+      sectors: baseState.sectors,
+      stocks: stocks,
+    );
+  }
+
+  RawStockSignal _buildSyntheticUniverseMember(
+    List<RawStockSignal> baseStocks,
+    _SyntheticStockBlueprint blueprint,
+    int index,
+  ) {
+    final template = _templateStockFor(baseStocks, blueprint.templateTicker);
+    final cycle = ((index % 5) - 2) * 1.6;
+    final riskTilt = blueprint.riskBias;
+    final qualityTilt = blueprint.qualityBias;
+    final momentumTilt = blueprint.momentumBias;
+
+    double score(double value, {double tilt = 0}) {
+      return _clampScore(value + tilt);
+    }
+
+    return RawStockSignal(
+      ticker: blueprint.ticker,
+      company: blueprint.company,
+      sector: blueprint.sector,
+      industry: blueprint.industry,
+      shortTrend: score(template.shortTrend, tilt: momentumTilt + cycle),
+      mediumTrend: score(
+        template.mediumTrend,
+        tilt: momentumTilt + cycle * 0.8,
+      ),
+      longTrend: score(template.longTrend, tilt: momentumTilt * 0.8),
+      residualStrength: score(
+        template.residualStrength,
+        tilt: momentumTilt + cycle * 0.9,
+      ),
+      momentumPersistence: score(
+        template.momentumPersistence,
+        tilt: momentumTilt * 0.9,
+      ),
+      breakoutQuality: score(
+        template.breakoutQuality,
+        tilt: momentumTilt * 0.7 - riskTilt * 0.2,
+      ),
+      volumeSupport: score(
+        template.volumeSupport,
+        tilt: momentumTilt * 0.5 - riskTilt * 0.2,
+      ),
+      earningsRevisions: score(
+        template.earningsRevisions,
+        tilt: qualityTilt * 0.4 + momentumTilt * 0.3,
+      ),
+      earningsSurprise: score(
+        template.earningsSurprise,
+        tilt: qualityTilt * 0.3 + momentumTilt * 0.2,
+      ),
+      marginTrend: score(template.marginTrend, tilt: qualityTilt * 0.6),
+      revenueTrend: score(
+        template.revenueTrend,
+        tilt: qualityTilt * 0.2 + momentumTilt * 0.4,
+      ),
+      freeCashFlowTrend: score(
+        template.freeCashFlowTrend,
+        tilt: qualityTilt * 0.6,
+      ),
+      balanceSheetQuality: score(
+        template.balanceSheetQuality,
+        tilt: qualityTilt,
+      ),
+      profitability: score(template.profitability, tilt: qualityTilt * 0.8),
+      leverageQuality: score(
+        template.leverageQuality,
+        tilt: qualityTilt * 0.7 - riskTilt * 0.2,
+      ),
+      earningsStability: score(
+        template.earningsStability,
+        tilt: qualityTilt * 0.9 - riskTilt * 0.2,
+      ),
+      valuationSupport: score(
+        template.valuationSupport,
+        tilt: blueprint.valuationBias - momentumTilt * 0.2,
+      ),
+      crowdingRisk: score(template.crowdingRisk, tilt: riskTilt + cycle * 0.3),
+      impliedVolRank: score(
+        template.impliedVolRank,
+        tilt: riskTilt * 0.8 + cycle * 0.4,
+      ),
+      realizedImpliedGap: score(
+        template.realizedImpliedGap,
+        tilt: riskTilt * 0.2,
+      ),
+      putSkewChange: score(
+        template.putSkewChange,
+        tilt: riskTilt * 0.9 + cycle * 0.2,
+      ),
+      eventPremium: score(
+        template.eventPremium,
+        tilt: riskTilt * 0.8 + momentumTilt * 0.2,
+      ),
+      downsideProtectionDemand: score(
+        template.downsideProtectionDemand,
+        tilt: riskTilt,
+      ),
+      relativeStrengthDelta: score(
+        template.relativeStrengthDelta,
+        tilt: momentumTilt * 0.7,
+      ),
+      sectorBreadthDelta: score(
+        template.sectorBreadthDelta,
+        tilt: momentumTilt * 0.3,
+      ),
+      revisionDelta: score(
+        template.revisionDelta,
+        tilt: qualityTilt * 0.2 + momentumTilt * 0.5,
+      ),
+      priceResponse: score(
+        template.priceResponse,
+        tilt: momentumTilt * 0.5 - riskTilt * 0.4,
+      ),
+      abnormalDownVolume: score(
+        template.abnormalDownVolume,
+        tilt: riskTilt * 0.8 - momentumTilt * 0.2,
+      ),
+      volatilityRepricing: score(
+        template.volatilityRepricing,
+        tilt: riskTilt * 0.9,
+      ),
+      peerLeadership: score(
+        template.peerLeadership,
+        tilt: momentumTilt * 0.4 - riskTilt * 0.3,
+      ),
+      growthExposure: score(
+        template.growthExposure,
+        tilt: blueprint.growthBias,
+      ),
+      defensiveExposure: score(
+        template.defensiveExposure,
+        tilt: blueprint.defensiveBias,
+      ),
+      creditSensitivity: score(
+        template.creditSensitivity,
+        tilt: blueprint.creditBias,
+      ),
+      rateSensitivity: score(
+        template.rateSensitivity,
+        tilt: blueprint.rateBias,
+      ),
+      expectedStability: score(
+        template.expectedStability,
+        tilt: qualityTilt * 0.8 - riskTilt * 0.4,
+      ),
+      peers: template.peers,
+    );
+  }
+
+  RawStockSignal _templateStockFor(List<RawStockSignal> stocks, String ticker) {
+    return stocks.firstWhere(
+      (stock) => stock.ticker == ticker,
+      orElse: () => stocks.first,
+    );
+  }
+
+  double _clampScore(double value) {
+    if (value < 0) {
+      return 0;
+    }
+    if (value > 100) {
+      return 100;
+    }
+    return value;
+  }
+
   RawStockSignal _stock({
     required String ticker,
     required String company,
@@ -1689,3 +1998,396 @@ class FixtureMarketRepository implements MarketIntelligenceRepository {
     );
   }
 }
+
+class _SyntheticStockBlueprint {
+  const _SyntheticStockBlueprint({
+    required this.ticker,
+    required this.company,
+    required this.sector,
+    required this.industry,
+    required this.templateTicker,
+    this.momentumBias = 0,
+    this.qualityBias = 0,
+    this.valuationBias = 0,
+    this.riskBias = 0,
+    this.growthBias = 0,
+    this.defensiveBias = 0,
+    this.creditBias = 0,
+    this.rateBias = 0,
+  });
+
+  final String ticker;
+  final String company;
+  final String sector;
+  final String industry;
+  final String templateTicker;
+  final double momentumBias;
+  final double qualityBias;
+  final double valuationBias;
+  final double riskBias;
+  final double growthBias;
+  final double defensiveBias;
+  final double creditBias;
+  final double rateBias;
+}
+
+const _syntheticStockBlueprints = [
+  _SyntheticStockBlueprint(
+    ticker: 'AVGO',
+    company: 'Broadcom',
+    sector: 'Technology',
+    industry: 'Semiconductors',
+    templateTicker: 'NVDA',
+    momentumBias: -6,
+    qualityBias: 4,
+    valuationBias: 5,
+    riskBias: 8,
+    growthBias: -4,
+  ),
+  _SyntheticStockBlueprint(
+    ticker: 'AMD',
+    company: 'AMD',
+    sector: 'Technology',
+    industry: 'Semiconductors',
+    templateTicker: 'NVDA',
+    momentumBias: -8,
+    qualityBias: -2,
+    valuationBias: 3,
+    riskBias: 6,
+    rateBias: 4,
+  ),
+  _SyntheticStockBlueprint(
+    ticker: 'TSM',
+    company: 'Taiwan Semiconductor',
+    sector: 'Technology',
+    industry: 'Semiconductors',
+    templateTicker: 'NVDA',
+    momentumBias: -10,
+    qualityBias: 7,
+    valuationBias: 6,
+    riskBias: -4,
+    defensiveBias: 6,
+  ),
+  _SyntheticStockBlueprint(
+    ticker: 'CRWD',
+    company: 'CrowdStrike',
+    sector: 'Cybersecurity',
+    industry: 'Cybersecurity',
+    templateTicker: 'PANW',
+    momentumBias: 2,
+    qualityBias: 1,
+    valuationBias: -5,
+    riskBias: 8,
+    growthBias: 6,
+  ),
+  _SyntheticStockBlueprint(
+    ticker: 'ZS',
+    company: 'Zscaler',
+    sector: 'Cybersecurity',
+    industry: 'Cybersecurity',
+    templateTicker: 'PANW',
+    momentumBias: -3,
+    qualityBias: -4,
+    valuationBias: -3,
+    riskBias: 10,
+    growthBias: 5,
+  ),
+  _SyntheticStockBlueprint(
+    ticker: 'FTNT',
+    company: 'Fortinet',
+    sector: 'Cybersecurity',
+    industry: 'Cybersecurity',
+    templateTicker: 'PANW',
+    momentumBias: -6,
+    qualityBias: 4,
+    valuationBias: 7,
+    riskBias: -2,
+    defensiveBias: 6,
+  ),
+  _SyntheticStockBlueprint(
+    ticker: 'GOOGL',
+    company: 'Alphabet',
+    sector: 'Software',
+    industry: 'Internet platforms',
+    templateTicker: 'MSFT',
+    momentumBias: -2,
+    qualityBias: 3,
+    valuationBias: 4,
+    riskBias: -1,
+    growthBias: 3,
+  ),
+  _SyntheticStockBlueprint(
+    ticker: 'ORCL',
+    company: 'Oracle',
+    sector: 'Software',
+    industry: 'Enterprise software',
+    templateTicker: 'MSFT',
+    momentumBias: -7,
+    qualityBias: 5,
+    valuationBias: 8,
+    riskBias: -3,
+    defensiveBias: 5,
+  ),
+  _SyntheticStockBlueprint(
+    ticker: 'ADBE',
+    company: 'Adobe',
+    sector: 'Software',
+    industry: 'Creative software',
+    templateTicker: 'MSFT',
+    momentumBias: -9,
+    qualityBias: 1,
+    valuationBias: -4,
+    riskBias: 4,
+    growthBias: 7,
+  ),
+  _SyntheticStockBlueprint(
+    ticker: 'CRM',
+    company: 'Salesforce',
+    sector: 'Software',
+    industry: 'Application software',
+    templateTicker: 'MSFT',
+    momentumBias: -6,
+    qualityBias: 0,
+    valuationBias: 3,
+    riskBias: 1,
+    growthBias: 2,
+  ),
+  _SyntheticStockBlueprint(
+    ticker: 'NOW',
+    company: 'ServiceNow',
+    sector: 'Software',
+    industry: 'Workflow software',
+    templateTicker: 'MSFT',
+    momentumBias: 1,
+    qualityBias: 6,
+    valuationBias: -6,
+    riskBias: 3,
+    growthBias: 6,
+  ),
+  _SyntheticStockBlueprint(
+    ticker: 'SNOW',
+    company: 'Snowflake',
+    sector: 'Software',
+    industry: 'Cloud data platforms',
+    templateTicker: 'MSFT',
+    momentumBias: -4,
+    qualityBias: -5,
+    valuationBias: -8,
+    riskBias: 12,
+    growthBias: 10,
+  ),
+  _SyntheticStockBlueprint(
+    ticker: 'BKNG',
+    company: 'Booking Holdings',
+    sector: 'Consumer',
+    industry: 'Travel platforms',
+    templateTicker: 'UBER',
+    momentumBias: -2,
+    qualityBias: 4,
+    valuationBias: 5,
+    riskBias: -1,
+    defensiveBias: 4,
+  ),
+  _SyntheticStockBlueprint(
+    ticker: 'ABNB',
+    company: 'Airbnb',
+    sector: 'Consumer',
+    industry: 'Travel platforms',
+    templateTicker: 'UBER',
+    momentumBias: -5,
+    qualityBias: 1,
+    valuationBias: -2,
+    riskBias: 5,
+    growthBias: 5,
+  ),
+  _SyntheticStockBlueprint(
+    ticker: 'DASH',
+    company: 'DoorDash',
+    sector: 'Consumer',
+    industry: 'Delivery platforms',
+    templateTicker: 'UBER',
+    momentumBias: -3,
+    qualityBias: -3,
+    valuationBias: -5,
+    riskBias: 8,
+    growthBias: 7,
+    creditBias: 8,
+  ),
+  _SyntheticStockBlueprint(
+    ticker: 'COST',
+    company: 'Costco',
+    sector: 'Consumer',
+    industry: 'Retail',
+    templateTicker: 'UBER',
+    momentumBias: -8,
+    qualityBias: 8,
+    valuationBias: -3,
+    riskBias: -6,
+    defensiveBias: 12,
+  ),
+  _SyntheticStockBlueprint(
+    ticker: 'NVO',
+    company: 'Novo Nordisk',
+    sector: 'Healthcare',
+    industry: 'Pharmaceuticals',
+    templateTicker: 'LLY',
+    momentumBias: -2,
+    qualityBias: 4,
+    valuationBias: -4,
+    riskBias: 2,
+    defensiveBias: 8,
+  ),
+  _SyntheticStockBlueprint(
+    ticker: 'MRK',
+    company: 'Merck',
+    sector: 'Healthcare',
+    industry: 'Pharmaceuticals',
+    templateTicker: 'LLY',
+    momentumBias: -9,
+    qualityBias: 7,
+    valuationBias: 6,
+    riskBias: -5,
+    defensiveBias: 12,
+  ),
+  _SyntheticStockBlueprint(
+    ticker: 'ABBV',
+    company: 'AbbVie',
+    sector: 'Healthcare',
+    industry: 'Biopharma',
+    templateTicker: 'LLY',
+    momentumBias: -10,
+    qualityBias: 6,
+    valuationBias: 8,
+    riskBias: -4,
+    defensiveBias: 10,
+  ),
+  _SyntheticStockBlueprint(
+    ticker: 'UNH',
+    company: 'UnitedHealth',
+    sector: 'Healthcare',
+    industry: 'Managed care',
+    templateTicker: 'LLY',
+    momentumBias: -11,
+    qualityBias: 9,
+    valuationBias: 7,
+    riskBias: -7,
+    defensiveBias: 14,
+  ),
+  _SyntheticStockBlueprint(
+    ticker: 'GS',
+    company: 'Goldman Sachs',
+    sector: 'Financials',
+    industry: 'Capital markets',
+    templateTicker: 'JPM',
+    momentumBias: -2,
+    qualityBias: 1,
+    valuationBias: 5,
+    riskBias: 2,
+    creditBias: 5,
+  ),
+  _SyntheticStockBlueprint(
+    ticker: 'BAC',
+    company: 'Bank of America',
+    sector: 'Financials',
+    industry: 'Banks',
+    templateTicker: 'JPM',
+    momentumBias: -6,
+    qualityBias: -1,
+    valuationBias: 7,
+    riskBias: 3,
+    creditBias: 8,
+  ),
+  _SyntheticStockBlueprint(
+    ticker: 'SCHW',
+    company: 'Charles Schwab',
+    sector: 'Financials',
+    industry: 'Brokerage',
+    templateTicker: 'JPM',
+    momentumBias: -4,
+    qualityBias: 0,
+    valuationBias: 6,
+    riskBias: 4,
+    rateBias: 5,
+  ),
+  _SyntheticStockBlueprint(
+    ticker: 'MS',
+    company: 'Morgan Stanley',
+    sector: 'Financials',
+    industry: 'Capital markets',
+    templateTicker: 'JPM',
+    momentumBias: -5,
+    qualityBias: 2,
+    valuationBias: 5,
+    riskBias: 1,
+    creditBias: 6,
+  ),
+  _SyntheticStockBlueprint(
+    ticker: 'DE',
+    company: 'Deere',
+    sector: 'Industrials',
+    industry: 'Machinery',
+    templateTicker: 'CAT',
+    momentumBias: -1,
+    qualityBias: 4,
+    valuationBias: 3,
+    riskBias: -1,
+  ),
+  _SyntheticStockBlueprint(
+    ticker: 'ETN',
+    company: 'Eaton',
+    sector: 'Industrials',
+    industry: 'Electrical equipment',
+    templateTicker: 'CAT',
+    momentumBias: 2,
+    qualityBias: 6,
+    valuationBias: -1,
+    riskBias: -3,
+  ),
+  _SyntheticStockBlueprint(
+    ticker: 'GE',
+    company: 'GE Aerospace',
+    sector: 'Industrials',
+    industry: 'Aerospace',
+    templateTicker: 'CAT',
+    momentumBias: 1,
+    qualityBias: 3,
+    valuationBias: -2,
+    riskBias: 2,
+  ),
+  _SyntheticStockBlueprint(
+    ticker: 'RTX',
+    company: 'RTX',
+    sector: 'Industrials',
+    industry: 'Defense',
+    templateTicker: 'CAT',
+    momentumBias: -7,
+    qualityBias: 5,
+    valuationBias: 5,
+    riskBias: -4,
+    defensiveBias: 8,
+  ),
+  _SyntheticStockBlueprint(
+    ticker: 'ANET',
+    company: 'Arista Networks',
+    sector: 'Technology',
+    industry: 'Networking',
+    templateTicker: 'NVDA',
+    momentumBias: -1,
+    qualityBias: 5,
+    valuationBias: -2,
+    riskBias: 1,
+    growthBias: 5,
+  ),
+  _SyntheticStockBlueprint(
+    ticker: 'MDB',
+    company: 'MongoDB',
+    sector: 'Software',
+    industry: 'Database software',
+    templateTicker: 'MSFT',
+    momentumBias: -12,
+    qualityBias: -6,
+    valuationBias: -9,
+    riskBias: 14,
+    growthBias: 11,
+  ),
+];
