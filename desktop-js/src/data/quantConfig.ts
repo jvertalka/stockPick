@@ -216,20 +216,25 @@ export const MARKET_EQUITY_RISK_PREMIUM = 0.055
      low-vol  (28 steps): IC 0.089, hit 59.4%, L/S net +2.81%/20d
      high-vol  (7 steps): IC 0.021, hit 50.2% (coin flip)
 
-   2026-06-10 (40 features incl. EDGAR fundamentals, 19,658 samples,
-   221 names):
-     low-vol  (31 steps): IC 0.033, hit 54.1%, L/S net +0.81%/20d
-     high-vol  (4 steps): IC 0.135, hit 67.6%, L/S net +5.01%/20d
+   2026-06-10 DEEP (11 pruned features incl. EDGAR fundamentals, 71,624
+   samples, 221 names, 15 years, 70 windows — first run with enough
+   high-vol windows to mean anything):
+     low-vol  (57 steps): IC 0.041, hit 56.8%, L/S net +0.86%/20d
+     high-vol (13 steps): IC 0.077, hit 50.2%, L/S net +1.71%/20d
 
-   The two vintages DISAGREE about high-vol skill, on 7 and 4 windows
-   respectively — neither is close to statistically meaningful. Doctrine
-   says gate where skill isn't PROVEN, and high-vol skill remains
-   unproven either way, so the conservative gate stays until enough
-   high-vol windows accumulate to measure it properly.
+   The deep run splits the difference revealingly: in high-vol the model
+   RANK-ORDERS well (IC 0.077, even above low-vol) but its DIRECTIONAL
+   accuracy is a coin flip (hit 50.2%). ML "action overrides" flip a
+   Hold to a Buy on the SIGN of the prediction — which is exactly the
+   coin-flip part — so the directional gate stays justified even though
+   the ranking has value. (Earlier small-sample vintages: 2026-05-12 IC
+   0.021/7 windows; 2026-06-10 shallow IC 0.135/4 windows — both too few
+   to trust.) Revisit if a future run shows high-vol hit rate clearing
+   ~55% with a real window count.
    ========================================================================= */
 export const ML_REGIME_GATE = {
   /** Regime in which ML action overrides are suppressed; null disables gating. */
   gatedRegime: 'high-vol' as 'high-vol' | 'low-vol' | null,
   rationale:
-    'High-vol ML skill is unproven: 2026-05-12 measured a coin flip there (IC 0.021, 7 windows); 2026-06-10 measured IC 0.135 on just 4 windows. Until enough high-vol windows accumulate for a real estimate, ML action overrides pause in that regime and the engine falls back to rules.',
+    'In high-vol regimes the model ranks names well (IC 0.077, 13 windows, 2026-06-10 15y run) but its directional hit rate is a coin flip (50.2%). Action overrides depend on the prediction SIGN — the coin-flip part — so ML overrides pause in high-vol and the engine falls back to rules. The ranking still informs the conviction stack.',
 } as const
