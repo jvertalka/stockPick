@@ -228,16 +228,20 @@ export const MARKET_EQUITY_RISK_PREMIUM = 0.055
    or better than low-vol, and the hit rate is 50-56% — one run landed at
    50.2% but two others at 55.9%, so "coin flip" was a noisy single draw,
    not a stable fact. With only 11-13 high-vol windows none of this
-   PROVES skill either way. The gate therefore stays as a CONSERVATIVE
-   DEFAULT (don't act on ML where we can't verify it), NOT because we
-   measured a coin flip — its empirical basis is now weak. Candidate to
-   lift once more high-vol windows accumulate, or sooner by owner call.
-   (Vintages that motivated it originally, both too few to trust:
-   2026-05-12 IC 0.021/7 windows; 2026-06-10 shallow IC 0.135/4 windows.)
+   PROVES skill either way.
+
+   OWNER DECISION (2026-06-17): gate LIFTED (gatedRegime: null). Following
+   the deep-data evidence — high-vol is no longer the no-skill regime the
+   small early studies suggested, so ML overrides now fire in all regimes.
+   Caveat owned: this leans on a thin high-vol sample (~12 windows), and
+   volatile markets are where a wrong call costs most. Re-gate if live
+   decay monitoring shows high-vol predictions degrading. (Vintages that
+   originally motivated the gate, both too few to trust: 2026-05-12 IC
+   0.021/7 windows; 2026-06-10 shallow IC 0.135/4 windows.)
    ========================================================================= */
 export const ML_REGIME_GATE = {
   /** Regime in which ML action overrides are suppressed; null disables gating. */
-  gatedRegime: 'high-vol' as 'high-vol' | 'low-vol' | null,
+  gatedRegime: null as 'high-vol' | 'low-vol' | null,
   rationale:
-    'High-vol ML skill is unproven on the deep 15y data: across re-runs the model scored IC ~0.08 and hit 50-56% in high-vol (11-13 windows) — as good as low-vol, NOT the coin flip earlier small studies suggested. Too few windows to prove skill either way, so ML action overrides pause in high-vol as a conservative default while the ranking still informs the conviction stack. Empirical basis is weak; candidate to lift.',
+    'Regime gate LIFTED (2026-06-17 owner decision). The deep 15y backtest did not replicate the high-vol coin flip the gate was built on — high-vol IC ~0.08 / hit 50-56% (11-13 windows) is as good as low-vol — so ML action overrides now apply in all regimes. Thin high-vol sample is the known risk; re-gate if live decay monitoring shows high-vol predictions degrading.',
 } as const
