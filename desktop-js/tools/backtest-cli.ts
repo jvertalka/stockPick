@@ -281,20 +281,36 @@ async function main() {
       hyperparameters: result.hyperparameters,
     }
     const base = import.meta.env.VITE_ORACLE_BACKEND_URL ?? 'http://127.0.0.1:8787'
-    const response = await fetch(`${base}/ml/model`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    })
-    const body = (await response.json()) as { ok?: boolean; bytes?: number; detail?: string }
-    if (response.ok && body.ok) {
-      console.log('')
-      console.log(
-        `Persisted trained bundle to backend /ml/model (${((body.bytes ?? 0) / 1024).toFixed(0)} KB) — app instances adopt it on next boot.`,
+    const json = JSON.stringify(payload)
+    // Always write a local fallback first, so a transient PUT drop
+    // (ECONNRESET on the multi-hundred-KB upload) never wastes the whole
+    // retrain — the file can be PUT to /ml/model separately.
+    const fs = await import('node:fs/promises')
+    await fs.writeFile('tools/ml_trained_model.json', json)
+    let persisted = false
+    for (let attempt = 0; attempt < 4 && !persisted; attempt++) {
+      if (attempt > 0) await new Promise((r) => setTimeout(r, 1500))
+      try {
+        const response = await fetch(`${base}/ml/model`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: json,
+        })
+        const body = (await response.json()) as { ok?: boolean; bytes?: number; detail?: string }
+        if (response.ok && body.ok) {
+          console.log(
+            `\nPersisted trained bundle to backend /ml/model (${((body.bytes ?? 0) / 1024).toFixed(0)} KB) — app instances adopt it on next boot.`,
+          )
+          persisted = true
+        }
+      } catch {
+        /* transient — retry */
+      }
+    }
+    if (!persisted) {
+      console.error(
+        `\nPersist to backend FAILED after retries — model saved to tools/ml_trained_model.json; PUT it to ${base}/ml/model manually.`,
       )
-    } else {
-      console.error('')
-      console.error(`Persist FAILED: ${body.detail ?? response.status}`)
       process.exitCode = 1
     }
   }
