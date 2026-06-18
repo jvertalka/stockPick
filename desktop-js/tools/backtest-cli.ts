@@ -276,6 +276,7 @@ async function main() {
       featureMeans: stats.means,
       featureStds: stats.stds,
       meanIC: result.meanIC,
+      servingConsistentIC20d: result.servingConsistentIC20d,
       meanLongShortReturnNet: result.meanLongShortReturnNet,
       meanLongShortSharpe: result.meanLongShortSharpe,
       hyperparameters: result.hyperparameters,
