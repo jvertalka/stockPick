@@ -1198,11 +1198,21 @@ export async function buildHistoricalDataset(
 }
 
 /**
- * Per-feature mean/std of the RAW (pre-normalization) feature values.
- * These are what live single-name prediction must normalize against —
- * training Z-scores cross-sectionally per date, and the global raw stats
- * are the stationary approximation of that transform for a lone ticker.
- * Compute AFTER pruning so the columns line up with the stored model.
+ * Per-feature mean/std of the RAW feature values that live single-name
+ * prediction normalizes against. The model trains on features Z-scored
+ * CROSS-SECTIONALLY PER DATE (within-date mean 0, std 1), so the serving
+ * scale must match that WITHIN-DATE unit-variance space.
+ *
+ * The std is therefore the RMS of each date's WITHIN-DATE std — NOT the
+ * global pooled std. The pooled std conflates within-date dispersion with
+ * across-date level drift (volatility_252d, fund_log_market_cap,
+ * log_price_level all drift over the 15y sample), making it far larger
+ * than any single date's spread; dividing live deviations by it would
+ * compress served Z-scores toward 0 and push the trees' split thresholds
+ * into the tails — collapsing live forecasts toward the base value. The
+ * mean is the global mean (≈ the average within-date mean, since per-date
+ * centering makes each date's mean 0). Compute AFTER pruning so columns
+ * line up with the stored model.
  */
 export function computeFeatureStats(samples: HistoricalSample[]): {
   means: number[]
@@ -1212,13 +1222,40 @@ export function computeFeatureStats(samples: HistoricalSample[]): {
   const featureCount = samples[0].rawFeatures.length
   const means = new Array(featureCount).fill(0)
   const stds = new Array(featureCount).fill(1)
+
+  // Group sample indices by date for the within-date std.
+  const byDate = new Map<string, number[]>()
+  samples.forEach((sample, idx) => {
+    const arr = byDate.get(sample.asOf) ?? []
+    arr.push(idx)
+    byDate.set(sample.asOf, arr)
+  })
+  const MIN_DATE_BREADTH = 5
+
   for (let f = 0; f < featureCount; f++) {
-    const values = samples.map((sample) => sample.rawFeatures[f])
-    const mean = values.reduce((sum, value) => sum + value, 0) / values.length
-    const variance =
-      values.reduce((sum, value) => sum + (value - mean) ** 2, 0) / values.length
-    means[f] = mean
-    stds[f] = Math.sqrt(Math.max(1e-12, variance))
+    const all = samples.map((sample) => sample.rawFeatures[f])
+    const globalMean = all.reduce((sum, value) => sum + value, 0) / all.length
+    means[f] = globalMean
+
+    // RMS of within-date stds over dates with enough breadth.
+    let sumSqStd = 0
+    let dateCount = 0
+    for (const indices of byDate.values()) {
+      if (indices.length < MIN_DATE_BREADTH) continue
+      const vals = indices.map((i) => samples[i].rawFeatures[f])
+      const m = vals.reduce((s, v) => s + v, 0) / vals.length
+      const variance = vals.reduce((s, v) => s + (v - m) ** 2, 0) / vals.length
+      sumSqStd += variance // variance = std^2; RMS of std = sqrt(mean of variance)
+      dateCount++
+    }
+    if (dateCount > 0) {
+      stds[f] = Math.sqrt(Math.max(1e-12, sumSqStd / dateCount))
+    } else {
+      // No date had breadth — fall back to the global std.
+      const variance =
+        all.reduce((sum, value) => sum + (value - globalMean) ** 2, 0) / all.length
+      stds[f] = Math.sqrt(Math.max(1e-12, variance))
+    }
   }
   return { means, stds }
 }
@@ -1729,29 +1766,43 @@ function servingConsistentIC(
   return pearsonCorrelation(preds, test.map((s) => s.forwardReturn20d))
 }
 
+
 /**
- * Bootstrap a 95% confidence interval over a sample. Resamples with
- * replacement N times and returns the 2.5th / 50th / 97.5th percentiles.
+ * MOVING-BLOCK bootstrap CI of a statistic over a SERIALLY-DEPENDENT
+ * series. The walk-forward steps are NOT i.i.d. — consecutive test windows
+ * overlap in label space (each step's 20d-forward labels reach into the
+ * next window), so the plain i.i.d. bootstrap above understates the CI
+ * width and overstates precision. Resampling contiguous blocks of length
+ * `blockLen` preserves that local dependence, widening the interval to an
+ * honest one (Künsch 1989; Politis-Romano 1994). blockLen ≈ how many
+ * adjacent windows share label space.
  */
-function bootstrapCI(values: number[], iterations = 1000): ConfidenceInterval {
-  if (values.length === 0) return { lower: 0, mean: 0, upper: 0 }
-  if (values.length === 1) {
-    return { lower: values[0], mean: values[0], upper: values[0] }
-  }
-  const means: number[] = []
+function blockBootstrapStat(
+  values: number[],
+  statistic: (sample: number[]) => number,
+  blockLen = 3,
+  iterations = 1000,
+): ConfidenceInterval {
+  const n = values.length
+  if (n === 0) return { lower: 0, mean: 0, upper: 0 }
+  const point = statistic(values)
+  if (n <= blockLen) return { lower: point, mean: point, upper: point }
+  const stats: number[] = []
   for (let it = 0; it < iterations; it++) {
-    let sum = 0
-    for (let i = 0; i < values.length; i++) {
-      sum += values[Math.floor(Math.random() * values.length)]
+    const resample: number[] = []
+    while (resample.length < n) {
+      const start = Math.floor(Math.random() * (n - blockLen + 1))
+      for (let k = 0; k < blockLen && resample.length < n; k++) {
+        resample.push(values[start + k])
+      }
     }
-    means.push(sum / values.length)
+    stats.push(statistic(resample))
   }
-  means.sort((left, right) => left - right)
-  const empiricalMean = values.reduce((sum, value) => sum + value, 0) / values.length
+  stats.sort((a, b) => a - b)
   return {
-    lower: means[Math.floor(0.025 * means.length)],
-    mean: empiricalMean,
-    upper: means[Math.floor(0.975 * means.length)],
+    lower: stats[Math.floor(0.025 * stats.length)],
+    mean: point,
+    upper: stats[Math.floor(0.975 * stats.length)],
   }
 }
 
@@ -1951,8 +2002,18 @@ export function runWalkForwardBacktest(
   })
   // Live-applicable IC measured under serving's global normalization.
   const servingIC = servingConsistentIC(sorted, chosenParams, embargoDays)
-  const trainedModel = horizonBundles.find((bundle) => bundle.horizon === 20)?.medianModel ??
-    horizonBundles[0].medianModel
+  // Serve the SQUARED-LOSS (conditional-MEAN) 20d model — the SAME
+  // estimator the walk-forward validated (walkForwardStep fits mean
+  // models, no quantile), so the served point forecast matches the
+  // reported meanIC. The 20d MEDIAN is no longer the served point
+  // estimate; the median + p10/p90 quantile models are kept only for the
+  // prediction interval. (Was: trainedModel = the q=0.5 median model,
+  // whose OOS IC was never the measured number.)
+  const trainedModel = fitGradientBoosting(
+    allFeatures,
+    sorted.map((sample) => sample.forwardReturn20d),
+    chosenParams,
+  )
 
   const mean = (key: keyof WalkForwardResult): number =>
     steps.reduce((sum, step) => sum + (step[key] as number), 0) / steps.length
@@ -1980,15 +2041,33 @@ export function runWalkForwardBacktest(
     meanFeatureImportance[f] /= steps.length
   }
 
-  // Bootstrap 95% CIs over the per-step distribution
-  const icCI = bootstrapCI(steps.map((step) => step.informationCoefficient))
-  const hitRateCI = bootstrapCI(steps.map((step) => step.hitRate))
-  const longShortReturnNetCI = bootstrapCI(steps.map((step) => step.longShortReturnNet))
-  const longShortSharpeCI = bootstrapCI(steps.map((step) => step.longShortSharpe))
+  // PORTFOLIO Sharpe from the TIME SERIES of per-step net L/S returns —
+  // mean / std of the return series, annualized. The previous per-step
+  // longShortSharpe divided ONE window's spread by that window's CROSS-
+  // SECTIONAL return dispersion, which is not a Sharpe at all; averaging
+  // those was meaningless. This is the real thing.
+  const stepNetReturns = steps.map((step) => step.longShortReturnNet)
+  const meanOfArr = (s: number[]): number =>
+    s.length === 0 ? 0 : s.reduce((a, b) => a + b, 0) / s.length
+  const sharpeOf = (s: number[]): number => {
+    if (s.length < 2) return 0
+    const m = meanOfArr(s)
+    const sd = Math.sqrt(s.reduce((a, v) => a + (v - m) ** 2, 0) / s.length)
+    return sd > 0 ? (m / sd) * Math.sqrt(TRADING_DAYS_PER_YEAR / horizonDays) : 0
+  }
+  const portfolioSharpe = sharpeOf(stepNetReturns)
+
+  // 95% CIs via MOVING-BLOCK bootstrap (steps are serially dependent —
+  // overlapping label windows). i.i.d. bootstrap here would report a
+  // spuriously tight interval.
+  const icCI = blockBootstrapStat(steps.map((step) => step.informationCoefficient), meanOfArr)
+  const hitRateCI = blockBootstrapStat(steps.map((step) => step.hitRate), meanOfArr)
+  const longShortReturnNetCI = blockBootstrapStat(stepNetReturns, meanOfArr)
+  const longShortSharpeCI = blockBootstrapStat(stepNetReturns, sharpeOf)
   const coverageSteps = steps.filter((step) => step.intervalCoverage80 != null)
   const intervalCoverage80CI =
     coverageSteps.length > 0
-      ? bootstrapCI(coverageSteps.map((step) => step.intervalCoverage80!))
+      ? blockBootstrapStat(coverageSteps.map((step) => step.intervalCoverage80!), meanOfArr)
       : undefined
   const intervalMeanWidthPct =
     coverageSteps.length > 0
@@ -2003,7 +2082,7 @@ export function runWalkForwardBacktest(
     meanHitRate: mean('hitRate'),
     meanLongShortReturnGross: mean('longShortReturnGross'),
     meanLongShortReturnNet: mean('longShortReturnNet'),
-    meanLongShortSharpe: mean('longShortSharpe'),
+    meanLongShortSharpe: portfolioSharpe,
     meanBaselineRandomIc: mean('baselineRandomIc'),
     meanBaselineMomentumIc: mean('baselineMomentumIc'),
     cumulativeReturn: runningCumReturn,
