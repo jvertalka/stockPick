@@ -22,9 +22,9 @@ const BACKTEST_TICKERS = DEFAULT_BACKTEST_TICKERS
 
 // Cache key includes a schema version so stale entries from earlier
 // builds don't crash the panel when fields rename or get added.
-// Schema bump: v6 trains on the 15y range with the 2026-06-10 pruned
-// feature set (incl. fundamentals); v5 carried 12-feature vectors.
-const CACHE_KEY = 'backtest:last-result:v6'
+// Schema bump: v7 adds size-tiered trading + borrow costs
+// (meanRealizedCostBps); v6 used a flat 10bps rate.
+const CACHE_KEY = 'backtest:last-result:v7'
 
 export function BacktestPanel() {
   const [running, setRunning] = useState(false)
@@ -176,8 +176,8 @@ export function BacktestPanel() {
         chosen by <strong>nested walk-forward CV</strong>{' '}
         {result ? `(picked: ${result.hyperparameters.numTrees} trees, depth ${result.hyperparameters.depth}, lr ${result.hyperparameters.learningRate})` : ''}.{' '}
         <strong>Purged + embargoed walk-forward</strong> (López de Prado 2018),{' '}
-        <strong>bootstrap 95% CIs</strong>, 10 bps transaction cost, baseline
-        comparisons (random + 12-month momentum), permutation feature importance,
+        <strong>bootstrap 95% CIs</strong>, size-tiered trading + short-borrow costs,
+        baseline comparisons (random + 12-month momentum), permutation feature importance,
         max drawdown.
       </p>
 
@@ -274,7 +274,7 @@ export function BacktestPanel() {
               </strong>
             </div>
             <div>
-              <span>L/S 20d (net of {result.txCostBpsUsed}bps)</span>
+              <span>L/S 20d (net of {result.meanRealizedCostBps != null ? `${result.meanRealizedCostBps.toFixed(0)}bps size-tiered` : 'costs'})</span>
               <strong className={tone(result.meanLongShortReturnNet, 0.5)}>
                 {sign(result.meanLongShortReturnNet)}
                 {result.meanLongShortReturnNet.toFixed(2)}%
@@ -430,8 +430,10 @@ export function BacktestPanel() {
             feature importance flags noise features; baselines (random + 12-month momentum)
             anchor interpretation; bootstrap 95% CIs on every headline metric;
             split-conformal prediction intervals with measured out-of-sample coverage
-            (Romano-Patterson-Candès 2019); {result.txCostBpsUsed}bps transaction cost
-            subtracted (each side); {result.embargoDaysUsed}-day embargo between train and test.
+            (Romano-Patterson-Candès 2019); size-tiered trading costs by market cap plus a
+            stock-borrow fee on the short leg (Frazzini-Israel-Moskowitz 2018, Novy-Marx-Velikov
+            2016, D'Avolio 2002 — avg {result.meanRealizedCostBps != null ? `${result.meanRealizedCostBps.toFixed(0)}bps` : 'n/a'}/window, not a flat rate);
+            {result.embargoDaysUsed}-day embargo between train and test.
             <br /><br />
             <strong>Survivorship is measured, not removed:</strong> the universe is today's
             surviving tickers, so absolute returns are inflated. The 15-year run instruments
