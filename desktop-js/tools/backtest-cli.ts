@@ -131,7 +131,7 @@ async function main() {
   console.log(
     `hyperparameters: trees=${result.hyperparameters.numTrees} depth=${result.hyperparameters.depth} lr=${result.hyperparameters.learningRate}`,
   )
-  console.log(`embargo=${result.embargoDaysUsed}d txCost=${result.txCostBpsUsed}bps`)
+  console.log(`embargo=${result.embargoDaysUsed}d  size-tiered cost (entry both legs + short borrow) avg=${f(result.meanRealizedCostBps, 1)}bps/window`)
   console.log('')
   console.log(`IC (Pearson):   ${f(result.meanIC)}  CI [${f(result.icCI.lower)}, ${f(result.icCI.upper)}]`)
   console.log(`IC (Spearman):  ${f(result.meanSpearmanIC)}`)

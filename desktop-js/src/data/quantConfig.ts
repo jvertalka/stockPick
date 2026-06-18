@@ -245,3 +245,53 @@ export const ML_REGIME_GATE = {
   rationale:
     'Regime gate LIFTED (2026-06-17 owner decision). The deep 15y backtest did not replicate the high-vol coin flip the gate was built on — high-vol IC ~0.08 / hit 50-56% (11-13 windows) is as good as low-vol — so ML action overrides now apply in all regimes. Thin high-vol sample is the known risk; re-gate if live decay monitoring shows high-vol predictions degrading.',
 } as const
+
+/* =========================================================================
+   10. Size-tiered trading costs (backtest realism)
+   -------------------------------------------------------------------------
+   A flat 10bps cost is fiction across the cap spectrum: live large-cap
+   execution runs a few bps, while small/microcap effective spreads are an
+   order of magnitude higher. Charging one flat rate inflates the modeled
+   long/short return of any strategy that tilts toward smaller names.
+
+   One-way effective trading cost (bps) by market-cap tier. Anchored to:
+     - Frazzini, Israel & Moskowitz (2018), "Trading Costs" (live AQR
+       execution data): market-cap-weighted costs are single-digit bps for
+       large caps.
+     - Novy-Marx & Velikov (2016), "A Taxonomy of Anomalies and Their
+       Trading Costs", Review of Financial Studies 29(1): effective spreads
+       rise sharply down the size distribution; small caps cost an order of
+       magnitude more than large caps.
+   Tiers are intentionally conservative (slightly high) so the backtest
+   under- rather than over-states net edge.
+   ========================================================================= */
+export const SIZE_TIERED_TRADING_COST = [
+  { minMarketCapUsd: 50e9, oneWayBps: 3 },    // mega   (> $50B)
+  { minMarketCapUsd: 10e9, oneWayBps: 6 },    // large  ($10-50B)
+  { minMarketCapUsd: 2e9, oneWayBps: 12 },    // mid    ($2-10B)
+  { minMarketCapUsd: 300e6, oneWayBps: 30 },  // small  ($300M-2B)
+  { minMarketCapUsd: 0, oneWayBps: 60 },      // micro  (< $300M)
+] as const
+
+/**
+ * Annualized stock-borrow fee (bps) on the SHORT leg by market-cap tier.
+ * The flat-cost model ignored borrow entirely — but shorting isn't free,
+ * and the fee is exactly where size bites hardest. Anchored to:
+ *   - D'Avolio (2002), "The Market for Borrowing Stock", JFE: general-
+ *     collateral large caps borrow near zero; small/special names cost
+ *     materially more and can be hard to borrow at all.
+ *   - Drechsler & Drechsler (2014), "The Shorting Premium and Asset
+ *     Pricing Anomalies": the borrow fee concentrates in small, hard-to-
+ *     short names and erodes a large share of anomaly short-leg returns.
+ * Applied pro-rata over the holding horizon (fee × horizonDays / 252).
+ */
+export const SIZE_TIERED_BORROW_FEE_ANNUAL = [
+  { minMarketCapUsd: 10e9, annualBps: 30 },   // general collateral
+  { minMarketCapUsd: 2e9, annualBps: 100 },
+  { minMarketCapUsd: 0, annualBps: 350 },     // small / hard-to-borrow
+] as const
+
+/** Cost tier used when a name has no market-cap data (ETFs, ADR/IFRS
+ * filers, pre-coverage history): treat as liquid large-cap rather than
+ * penalizing — the backtest's tradeable universe is liquid by design. */
+export const MISSING_CAP_FALLBACK_USD = 15e9

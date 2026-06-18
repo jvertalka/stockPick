@@ -7,8 +7,40 @@ import {
   pearsonCorrelation,
   type GradientBoostingModel,
 } from './quantMath'
+import {
+  MISSING_CAP_FALLBACK_USD,
+  SIZE_TIERED_BORROW_FEE_ANNUAL,
+  SIZE_TIERED_TRADING_COST,
+  TRADING_DAYS_PER_YEAR,
+} from './quantConfig'
 
 export type { DailyBar }
+
+/** One-way effective trading cost (bps) for a name of the given market
+ * cap, per the size-tiered table (Frazzini-Israel-Moskowitz 2018;
+ * Novy-Marx-Velikov 2016). NaN/missing cap → liquid large-cap fallback. */
+function oneWayCostBps(marketCapUsd: number): number {
+  const cap = Number.isFinite(marketCapUsd) ? marketCapUsd : MISSING_CAP_FALLBACK_USD
+  for (const tier of SIZE_TIERED_TRADING_COST) {
+    if (cap >= tier.minMarketCapUsd) return tier.oneWayBps
+  }
+  return SIZE_TIERED_TRADING_COST[SIZE_TIERED_TRADING_COST.length - 1].oneWayBps
+}
+
+/** Annualized stock-borrow fee (bps) for the SHORT leg by size tier
+ * (D'Avolio 2002; Drechsler-Drechsler 2014). */
+function borrowFeeAnnualBps(marketCapUsd: number): number {
+  const cap = Number.isFinite(marketCapUsd) ? marketCapUsd : MISSING_CAP_FALLBACK_USD
+  for (const tier of SIZE_TIERED_BORROW_FEE_ANNUAL) {
+    if (cap >= tier.minMarketCapUsd) return tier.annualBps
+  }
+  return SIZE_TIERED_BORROW_FEE_ANNUAL[SIZE_TIERED_BORROW_FEE_ANNUAL.length - 1].annualBps
+}
+
+/** Mean over a basket. Empty → 0. */
+function meanOf(values: number[]): number {
+  return values.length === 0 ? 0 : values.reduce((s, v) => s + v, 0) / values.length
+}
 
 /**
  * Historical backtest harness — turns Yahoo's multi-year bar history into
@@ -127,6 +159,11 @@ export type HistoricalSample = {
    * failure window; drives the delisting-haircut bound separately from
    * the size screen. */
   youngAtFormation?: boolean
+  /** Raw natural-log market cap at formation (NaN when no fundamentals),
+   * captured at build time so the size-tiered cost model survives feature
+   * pruning — it must not depend on fund_log_market_cap staying in the
+   * model's column set. */
+  logMarketCap: number
   /** Survivorship cohort AT FORMATION (assigned per cross-section date):
    *  'survivorPrivileged' = listed < 3y (Fama-French 2004 new-list
    *  failure window) OR bottom size-quintile of that date's cross-section
@@ -1130,6 +1167,9 @@ export async function buildHistoricalDataset(
         labelEnd20d: bars[i + 20].date,
         labelEnd60d: bars[i + 60].date,
         labelEnd120d: bars[i + 120].date,
+        // Raw log market cap (NaN if no fundamentals) — full-feature index,
+        // captured before pruning so the cost model always has it.
+        logMarketCap: features[LOG_MKTCAP_FEATURE_INDEX],
       })
       generated++
     }
@@ -1196,7 +1236,10 @@ export type WalkForwardResult = {
   spearmanIc: number
   hitRate: number
   longShortReturnGross: number
-  longShortReturnNet: number   // net of transaction costs
+  longShortReturnNet: number   // net of size-tiered trading + borrow costs
+  /** Total cost (bps) actually subtracted this step: long entry + short
+   * entry + short borrow, size-tiered by constituent market cap. */
+  realizedCostBps: number
   longShortSharpe: number
   predictedDecileReturns: number[]
   // Baseline comparisons
@@ -1275,7 +1318,8 @@ export function walkForwardStep(
   if (splitIndex <= 0 || splitIndex + testSize > samples.length) return null
   const embargoDays = options.embargoDays ?? 5
   const horizonDays = options.horizonDays ?? 20
-  const txCostBps = options.txCostBps ?? 10
+  // txCostBps is retained on the options for API/back-compat but no longer
+  // sets the cost — costs are size-tiered per constituent (see below).
 
   const testSamples = samples.slice(splitIndex, splitIndex + testSize)
   if (testSamples.length < 10) return null
@@ -1367,8 +1411,13 @@ export function walkForwardStep(
     predictions.filter((value, idx) => Math.sign(value) === Math.sign(actuals[idx])).length /
     predictions.length
 
-  // Long-short quintile portfolio
-  const indexed = predictions.map((value, idx) => ({ pred: value, actual: actuals[idx] }))
+  // Long-short quintile portfolio — carry each name's market cap so the
+  // trading + borrow cost can be size-tiered, not flat.
+  const indexed = predictions.map((value, idx) => ({
+    pred: value,
+    actual: actuals[idx],
+    marketCapUsd: Math.exp(testSamples[idx].logMarketCap),  // NaN-safe: exp(NaN)=NaN
+  }))
   indexed.sort((left, right) => right.pred - left.pred)
   const quintileSize = Math.max(1, Math.floor(indexed.length / 5))
   const topQ = indexed.slice(0, quintileSize)
@@ -1376,8 +1425,20 @@ export function walkForwardStep(
   const topMean = topQ.reduce((sum, item) => sum + item.actual, 0) / topQ.length
   const bottomMean = bottomQ.reduce((sum, item) => sum + item.actual, 0) / bottomQ.length
   const longShortReturnGross = topMean - bottomMean
-  // Net: subtract 2× tx cost (one for long, one for short)
-  const longShortReturnNet = longShortReturnGross - (2 * txCostBps) / 100
+  // SIZE-TIERED COSTS (replaces the flat 2×10bps). Each leg pays a one-way
+  // entry cost set by its constituents' market caps; the SHORT leg also
+  // pays a stock-borrow fee pro-rated over the holding horizon. A flat
+  // rate understated costs for any small-cap tilt — see quantConfig
+  // SIZE_TIERED_TRADING_COST / SIZE_TIERED_BORROW_FEE_ANNUAL for sources.
+  const longEntryBps = meanOf(topQ.map((item) => oneWayCostBps(item.marketCapUsd)))
+  const shortEntryBps = meanOf(bottomQ.map((item) => oneWayCostBps(item.marketCapUsd)))
+  const shortBorrowBps = meanOf(
+    bottomQ.map(
+      (item) => borrowFeeAnnualBps(item.marketCapUsd) * (horizonDays / TRADING_DAYS_PER_YEAR),
+    ),
+  )
+  const realizedCostBps = longEntryBps + shortEntryBps + shortBorrowBps
+  const longShortReturnNet = longShortReturnGross - realizedCostBps / 100
   const meanActual = actuals.reduce((sum, value) => sum + value, 0) / actuals.length
   const stdActual = Math.sqrt(
     actuals.reduce((sum, value) => sum + (value - meanActual) ** 2, 0) / actuals.length,
@@ -1465,6 +1526,7 @@ export function walkForwardStep(
     hitRate,
     longShortReturnGross,
     longShortReturnNet,
+    realizedCostBps,
     longShortSharpe,
     predictedDecileReturns: decileReturns,
     baselineRandomIc,
@@ -1548,6 +1610,10 @@ export type FullBacktestResult = {
   horizonBundles: HorizonModelBundle[]
   embargoDaysUsed: number
   txCostBpsUsed: number
+  /** Mean per-step realized cost (bps) actually subtracted from the L/S
+   * spread — size-tiered (entry both legs + short borrow). This, not
+   * txCostBpsUsed, is what the net returns reflect. */
+  meanRealizedCostBps: number
   icCI: ConfidenceInterval
   hitRateCI: ConfidenceInterval
   longShortReturnNetCI: ConfidenceInterval
@@ -1843,6 +1909,7 @@ export function runWalkForwardBacktest(
     horizonBundles,
     embargoDaysUsed: embargoDays,
     txCostBpsUsed: txCostBps,
+    meanRealizedCostBps: mean('realizedCostBps'),
     icCI,
     hitRateCI,
     longShortReturnNetCI,
