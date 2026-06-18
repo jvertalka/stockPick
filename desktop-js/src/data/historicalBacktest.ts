@@ -136,11 +136,22 @@ export type HistoricalSample = {
   asOfIndex: number   // bar index within the ticker's series — needed for purging
   features: number[]
   rawFeatures: number[]  // pre-normalization values for diagnostic display
-  // Forward returns at multiple horizons for multi-horizon ensemble training
+  // RAW forward returns at multiple horizons — what the L/S portfolio
+  // actually earns (the tradeable spread).
   forwardReturn5d: number
   forwardReturn20d: number
   forwardReturn60d: number
   forwardReturn120d: number
+  // RELATIVE forward returns: raw minus that date's cross-sectional mean
+  // return at the same horizon. The TRAINING TARGET and the IC are measured
+  // against these — a cross-sectional model can only predict RELATIVE
+  // (idiosyncratic) performance; the common market/cross-section move is
+  // unpredictable noise that, left in the target, just dilutes the loss.
+  // (Filled by applyCrossSectionalReturnDemeaning; default to raw until then.)
+  forwardReturn5dRel: number
+  forwardReturn20dRel: number
+  forwardReturn60dRel: number
+  forwardReturn120dRel: number
   /** ISO dates when each horizon's label window CLOSES (bars[i+h].date).
    * Purging must compare in LABEL space: 20 trading days ≈ 28 calendar
    * days, so "asOf + horizon·86400s" calendar arithmetic under-purges and
@@ -1029,6 +1040,46 @@ function assignSurvivorshipCohorts(samples: HistoricalSample[]): void {
 }
 
 /**
+ * Demean each forward-return target by its date's cross-sectional mean,
+ * so the model's TARGET is RELATIVE (idiosyncratic) return, not raw.
+ *
+ * A cross-sectional ranking model can only predict how a stock does
+ * RELATIVE to its peers that day — the common market/cross-section move
+ * (everyone +5% one day, −3% the next) is unpredictable from per-name
+ * features and, left in the target, just inflates the loss with noise the
+ * model can't fit. Subtracting the per-date mean focuses the model on
+ * relative alpha. The RAW forward returns are kept untouched: the L/S
+ * portfolio earns those (the tradeable spread), and only the training
+ * target + IC use the relative version. Dates below a small breadth floor
+ * keep raw (a 1–2 name "cross-section" has no meaningful mean).
+ */
+function applyCrossSectionalReturnDemeaning(samples: HistoricalSample[]): void {
+  if (samples.length === 0) return
+  const byDate = new Map<string, number[]>()
+  samples.forEach((sample, idx) => {
+    const arr = byDate.get(sample.asOf) ?? []
+    arr.push(idx)
+    byDate.set(sample.asOf, arr)
+  })
+  const MIN_BREADTH = 5
+  const pairs = [
+    ['forwardReturn5d', 'forwardReturn5dRel'],
+    ['forwardReturn20d', 'forwardReturn20dRel'],
+    ['forwardReturn60d', 'forwardReturn60dRel'],
+    ['forwardReturn120d', 'forwardReturn120dRel'],
+  ] as const
+  for (const indices of byDate.values()) {
+    if (indices.length < MIN_BREADTH) continue // too thin to demean meaningfully
+    for (const [rawKey, relKey] of pairs) {
+      let sum = 0
+      for (const idx of indices) sum += samples[idx][rawKey]
+      const meanReturn = sum / indices.length
+      for (const idx of indices) samples[idx][relKey] = samples[idx][rawKey] - meanReturn
+    }
+  }
+}
+
+/**
  * Apply cross-sectional Z-score normalization to features WITHIN each
  * as-of date. After this, every feature has mean 0 and stddev 1 across
  * stocks at any given date — the model learns relative ranking rather
@@ -1163,6 +1214,11 @@ export async function buildHistoricalDataset(
         forwardReturn20d: fwd20,
         forwardReturn60d: fwd60,
         forwardReturn120d: fwd120,
+        // Seeded to raw; overwritten by applyCrossSectionalReturnDemeaning.
+        forwardReturn5dRel: fwd5,
+        forwardReturn20dRel: fwd20,
+        forwardReturn60dRel: fwd60,
+        forwardReturn120dRel: fwd120,
         labelEnd5d: bars[i + 5].date,
         labelEnd20d: bars[i + 20].date,
         labelEnd60d: bars[i + 60].date,
@@ -1179,10 +1235,12 @@ export async function buildHistoricalDataset(
 
   // Impute missing fundamentals with per-date cross-sectional medians
   // (must run BEFORE normalization so NaNs never reach the Z-scores),
-  // then tag survivorship cohorts, then normalize.
+  // then tag survivorship cohorts, then normalize, then demean the
+  // forward-return targets cross-sectionally (relative-alpha target).
   imputeMissingWithDateMedians(samples)
   assignSurvivorshipCohorts(samples)
   applyCrossSectionalNormalization(samples)
+  applyCrossSectionalReturnDemeaning(samples)
 
   return {
     samples,
@@ -1378,11 +1436,17 @@ export function walkForwardStep(
   if (trainSamples.length < 50) return null
 
   const trainFeatures = trainSamples.map((sample) => sample.features)
-  const trainTargets = trainSamples.map((sample) => sample.forwardReturn20d)
+  // TRAIN on RELATIVE (cross-sectionally demeaned) return — the model
+  // learns idiosyncratic alpha, not the unpredictable market move.
+  const trainTargets = trainSamples.map((sample) => sample.forwardReturn20dRel)
   const model = fitGradientBoosting(trainFeatures, trainTargets, options.modelOptions ?? {})
 
   const predictions = testSamples.map((sample) => predictGradientBoosting(model, sample.features))
-  const actuals = testSamples.map((sample) => sample.forwardReturn20d)
+  // IC / hit rate measured against RELATIVE actuals (the ranking skill the
+  // model is actually trained for; raw actuals carry market noise the
+  // model never tries to predict). The L/S quintile below uses RAW returns
+  // — that is the tradeable spread the strategy earns.
+  const actuals = testSamples.map((sample) => sample.forwardReturn20dRel)
 
   // SPLIT-CONFORMAL 80% INTERVALS (Romano, Patterson, Candès 2019 —
   // "Conformalized Quantile Regression", NeurIPS). Fit q10/q90 on the
@@ -1410,7 +1474,10 @@ export function walkForwardStep(
     // data — weak quantile heads would just report meaningless coverage.
     if (properTrain.length >= 100) {
       const properFeatures = properTrain.map((sample) => sample.features)
-      const properTargets = properTrain.map((sample) => sample.forwardReturn20d)
+      // Quantile heads + conformal calibration on the RELATIVE target, so
+      // the prediction interval is an interval on the same (relative)
+      // quantity the point model predicts.
+      const properTargets = properTrain.map((sample) => sample.forwardReturn20dRel)
       const q10Model = fitGradientBoosting(properFeatures, properTargets, {
         ...options.modelOptions,
         quantile: 0.1,
@@ -1422,7 +1489,7 @@ export function walkForwardStep(
       const scores = calibration.map((sample) => {
         const lo = predictGradientBoosting(q10Model, sample.features)
         const hi = predictGradientBoosting(q90Model, sample.features)
-        return Math.max(lo - sample.forwardReturn20d, sample.forwardReturn20d - hi)
+        return Math.max(lo - sample.forwardReturn20dRel, sample.forwardReturn20dRel - hi)
       })
       scores.sort((a, b) => a - b)
       const n = scores.length
@@ -1433,7 +1500,7 @@ export function walkForwardStep(
       for (const sample of testSamples) {
         const lo = predictGradientBoosting(q10Model, sample.features) - offset
         const hi = predictGradientBoosting(q90Model, sample.features) + offset
-        if (sample.forwardReturn20d >= lo && sample.forwardReturn20d <= hi) covered++
+        if (sample.forwardReturn20dRel >= lo && sample.forwardReturn20dRel <= hi) covered++
         widthSum += hi - lo
       }
       intervalCoverage80 = covered / testSamples.length
@@ -1448,11 +1515,12 @@ export function walkForwardStep(
     predictions.filter((value, idx) => Math.sign(value) === Math.sign(actuals[idx])).length /
     predictions.length
 
-  // Long-short quintile portfolio — carry each name's market cap so the
-  // trading + borrow cost can be size-tiered, not flat.
+  // Long-short quintile portfolio — sorted by the (relative) prediction
+  // but earning RAW returns (the actual tradeable spread). Carry each
+  // name's market cap so the trading + borrow cost can be size-tiered.
   const indexed = predictions.map((value, idx) => ({
     pred: value,
-    actual: actuals[idx],
+    actual: testSamples[idx].forwardReturn20d, // RAW — the return earned
     marketCapUsd: Math.exp(testSamples[idx].logMarketCap),  // NaN-safe: exp(NaN)=NaN
   }))
   indexed.sort((left, right) => right.pred - left.pred)
@@ -1682,14 +1750,15 @@ function heldOutHorizonMetrics(
   modelOptions: { numTrees?: number; depth?: number; learningRate?: number },
   embargoDays: number,
 ): { ic: number; hitRate: number } {
+  // RELATIVE target — same as the shipped models train on.
   const targetFn = (s: HistoricalSample): number =>
     horizon === 5
-      ? s.forwardReturn5d
+      ? s.forwardReturn5dRel
       : horizon === 20
-        ? s.forwardReturn20d
+        ? s.forwardReturn20dRel
         : horizon === 60
-          ? s.forwardReturn60d
-          : s.forwardReturn120d
+          ? s.forwardReturn60dRel
+          : s.forwardReturn120dRel
   const labelEndFn = (s: HistoricalSample): string =>
     horizon === 5
       ? s.labelEnd5d
@@ -1748,7 +1817,7 @@ function servingConsistentIC(
   if (train.length < 100) return Number.NaN
   const model = fitGradientBoosting(
     train.map((s) => s.features),
-    train.map((s) => s.forwardReturn20d),
+    train.map((s) => s.forwardReturn20dRel), // RELATIVE target, as shipped
     modelOptions,
   )
   // Global train-window raw-feature stats = exactly what live serving
@@ -1763,7 +1832,7 @@ function servingConsistentIC(
     })
     return predictGradientBoosting(model, norm)
   })
-  return pearsonCorrelation(preds, test.map((s) => s.forwardReturn20d))
+  return pearsonCorrelation(preds, test.map((s) => s.forwardReturn20dRel))
 }
 
 
@@ -1929,11 +1998,13 @@ export function runWalkForwardBacktest(
   // quantile models never saw — Romano et al. 2019), purged by the
   // horizon so calibration labels don't overlap quantile training.
   const allFeatures = sorted.map((sample) => sample.features)
+  // RELATIVE targets for the shipped median/quantile ensemble — the
+  // models predict idiosyncratic outperformance, not raw return.
   const targetForHorizon = (sample: HistoricalSample, horizon: HorizonKey): number => {
-    if (horizon === 5) return sample.forwardReturn5d
-    if (horizon === 20) return sample.forwardReturn20d
-    if (horizon === 60) return sample.forwardReturn60d
-    return sample.forwardReturn120d
+    if (horizon === 5) return sample.forwardReturn5dRel
+    if (horizon === 20) return sample.forwardReturn20dRel
+    if (horizon === 60) return sample.forwardReturn60dRel
+    return sample.forwardReturn120dRel
   }
   const horizonBundles: HorizonModelBundle[] = ENSEMBLE_HORIZONS.map((horizon) => {
     const horizonTargets = sorted.map((sample) => targetForHorizon(sample, horizon))
@@ -2011,7 +2082,7 @@ export function runWalkForwardBacktest(
   // whose OOS IC was never the measured number.)
   const trainedModel = fitGradientBoosting(
     allFeatures,
-    sorted.map((sample) => sample.forwardReturn20d),
+    sorted.map((sample) => sample.forwardReturn20dRel), // RELATIVE target
     chosenParams,
   )
 
