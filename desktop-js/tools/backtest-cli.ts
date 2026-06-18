@@ -133,7 +133,10 @@ async function main() {
   )
   console.log(`embargo=${result.embargoDaysUsed}d  size-tiered cost (entry both legs + short borrow) avg=${f(result.meanRealizedCostBps, 1)}bps/window`)
   console.log('')
-  console.log(`IC (Pearson):   ${f(result.meanIC)}  CI [${f(result.icCI.lower)}, ${f(result.icCI.upper)}]`)
+  console.log(`IC (Pearson, validated):  ${f(result.meanIC)}  CI [${f(result.icCI.lower)}, ${f(result.icCI.upper)}]   (per-date cross-sectional norm)`)
+  if (result.servingConsistentIC20d != null && Number.isFinite(result.servingConsistentIC20d)) {
+    console.log(`IC (live-applicable):     ${f(result.servingConsistentIC20d)}   (held-out, under SERVING's global normalization — what live predictions realize)`)
+  }
   console.log(`IC (Spearman):  ${f(result.meanSpearmanIC)}`)
   console.log(`Hit rate:       ${f(result.meanHitRate * 100, 1)}%  CI [${f(result.hitRateCI.lower * 100, 1)}%, ${f(result.hitRateCI.upper * 100, 1)}%]`)
   console.log('')
@@ -162,7 +165,7 @@ async function main() {
     )
     console.log('')
   }
-  console.log('--- Multi-horizon in-sample IC + conformal offsets ---')
+  console.log('--- Multi-horizon OUT-OF-FOLD IC + conformal offsets ---')
   for (const bundle of result.horizonBundles) {
     console.log(
       `  ${String(bundle.horizon).padStart(3)}d: IC ${f(bundle.meanIC)} hit ${f(bundle.meanHitRate * 100, 1)}%` +

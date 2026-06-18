@@ -1623,7 +1623,110 @@ export type FullBacktestResult = {
    * Honest interval validation per Romano et al. 2019. */
   intervalCoverage80CI?: ConfidenceInterval
   intervalMeanWidthPct?: number
+  /** LIVE-APPLICABLE 20d IC: the held-out IC the model realizes when the
+   * test set is normalized the way SERVING normalizes (global train-window
+   * stats), not the per-date cross-sectional Z the walk-forward meanIC is
+   * measured under. meanIC is the validated-pipeline number; this is what
+   * single-ticker live predictions actually get. NaN if too few samples. */
+  servingConsistentIC20d?: number
   hyperparameters: { numTrees: number; depth: number; learningRate: number }
+}
+
+/**
+ * Single purged + embargoed train/test split for a quick OUT-OF-FOLD IC
+ * (+ hit rate) at one horizon — replaces the upward-biased in-sample
+ * correlation that was being shown as "horizon IC". Trains on the older
+ * ~70%, scores the newest ~30%, train side purged in label space +
+ * embargoed. NaN when too few samples to measure honestly.
+ */
+function heldOutHorizonMetrics(
+  sorted: HistoricalSample[],
+  horizon: HorizonKey,
+  modelOptions: { numTrees?: number; depth?: number; learningRate?: number },
+  embargoDays: number,
+): { ic: number; hitRate: number } {
+  const targetFn = (s: HistoricalSample): number =>
+    horizon === 5
+      ? s.forwardReturn5d
+      : horizon === 20
+        ? s.forwardReturn20d
+        : horizon === 60
+          ? s.forwardReturn60d
+          : s.forwardReturn120d
+  const labelEndFn = (s: HistoricalSample): string =>
+    horizon === 5
+      ? s.labelEnd5d
+      : horizon === 20
+        ? s.labelEnd20d
+        : horizon === 60
+          ? s.labelEnd60d
+          : s.labelEnd120d
+  const splitIndex = Math.floor(sorted.length * 0.7)
+  if (splitIndex < 100 || sorted.length - splitIndex < 30) {
+    return { ic: Number.NaN, hitRate: Number.NaN }
+  }
+  const testStartDate = sorted[splitIndex].asOf
+  const embargoCutoff = new Date(testStartDate).getTime() - embargoDays * 86_400_000
+  const train = sorted
+    .slice(0, splitIndex)
+    .filter(
+      (s) => labelEndFn(s) < testStartDate && new Date(s.asOf).getTime() <= embargoCutoff,
+    )
+  const test = sorted.slice(splitIndex)
+  if (train.length < 100) return { ic: Number.NaN, hitRate: Number.NaN }
+  const model = fitGradientBoosting(
+    train.map((s) => s.features),
+    train.map(targetFn),
+    { ...modelOptions, quantile: 0.5 },
+  )
+  const preds = test.map((s) => predictGradientBoosting(model, s.features))
+  const actuals = test.map(targetFn)
+  const hits = preds.filter((v, i) => Math.sign(v) === Math.sign(actuals[i])).length
+  return { ic: pearsonCorrelation(preds, actuals), hitRate: hits / Math.max(1, preds.length) }
+}
+
+/**
+ * LIVE-APPLICABLE 20d IC. Trains the model on per-date-Z features exactly
+ * as shipped, but SCORES the held-out test set under the global train-
+ * window normalization that live single-ticker serving uses
+ * (computeFeatureStats over the train window). This is the honest answer
+ * to "does the validated IC survive the train/serve normalization skew?"
+ * — the per-date-Z walk-forward IC is not the transform live reproduces.
+ */
+function servingConsistentIC(
+  sorted: HistoricalSample[],
+  modelOptions: { numTrees?: number; depth?: number; learningRate?: number },
+  embargoDays: number,
+): number {
+  const splitIndex = Math.floor(sorted.length * 0.7)
+  if (splitIndex < 100 || sorted.length - splitIndex < 30) return Number.NaN
+  const testStartDate = sorted[splitIndex].asOf
+  const embargoCutoff = new Date(testStartDate).getTime() - embargoDays * 86_400_000
+  const train = sorted
+    .slice(0, splitIndex)
+    .filter(
+      (s) => s.labelEnd20d < testStartDate && new Date(s.asOf).getTime() <= embargoCutoff,
+    )
+  const test = sorted.slice(splitIndex)
+  if (train.length < 100) return Number.NaN
+  const model = fitGradientBoosting(
+    train.map((s) => s.features),
+    train.map((s) => s.forwardReturn20d),
+    modelOptions,
+  )
+  // Global train-window raw-feature stats = exactly what live serving
+  // normalizes against (computeFeatureStats / model.featureMeans/Stds).
+  const stats = computeFeatureStats(train)
+  const preds = test.map((s) => {
+    const norm = s.rawFeatures.map((v, i) => {
+      const m = stats.means[i] ?? 0
+      const sd = stats.stds[i] ?? 1
+      const filled = Number.isNaN(v) ? m : v
+      return (filled - m) / Math.max(1e-12, sd)
+    })
+    return predictGradientBoosting(model, norm)
+  })
+  return pearsonCorrelation(preds, test.map((s) => s.forwardReturn20d))
 }
 
 /**
@@ -1827,25 +1930,27 @@ export function runWalkForwardBacktest(
     const rank = Math.min(scores.length - 1, Math.ceil((scores.length + 1) * 0.8) - 1)
     const conformalOffsetPct = scores.length > 0 ? scores[rank] : 0
 
-    // Estimate this horizon's IC using a quick in-sample correlation
-    // between median predictions and actuals (cheap proxy — real IC
-    // would need its own walk-forward at this horizon).
-    const predictions = allFeatures.map((features) => predictGradientBoosting(medianModel, features))
-    const inSampleIC = pearsonCorrelation(predictions, horizonTargets)
-    // Approximate hit rate
-    const hits = predictions.filter((value, idx) => Math.sign(value) === Math.sign(horizonTargets[idx])).length
+    // This horizon's IC + hit rate from a genuine OUT-OF-FOLD split (was
+    // an in-sample correlation of the all-data model against its own
+    // training targets — upward-biased and previously shown to the user
+    // as the horizon's skill). The shipped medianModel still trains on
+    // ALL samples for the best live point estimate; only the REPORTED
+    // metric is now honest.
+    const oof = heldOutHorizonMetrics(sorted, horizon, chosenParams, embargoDays)
     return {
       horizon,
       medianModel,
       p10Model,
       p90Model,
-      meanIC: inSampleIC,
-      meanHitRate: hits / Math.max(1, predictions.length),
-      icCI: { lower: inSampleIC, mean: inSampleIC, upper: inSampleIC },
+      meanIC: oof.ic,
+      meanHitRate: oof.hitRate,
+      icCI: { lower: oof.ic, mean: oof.ic, upper: oof.ic },
       conformalOffsetPct,
       conformalCalibrationSize: calibration.length,
     }
   })
+  // Live-applicable IC measured under serving's global normalization.
+  const servingIC = servingConsistentIC(sorted, chosenParams, embargoDays)
   const trainedModel = horizonBundles.find((bundle) => bundle.horizon === 20)?.medianModel ??
     horizonBundles[0].medianModel
 
@@ -1916,6 +2021,7 @@ export function runWalkForwardBacktest(
     longShortSharpeCI,
     intervalCoverage80CI,
     intervalMeanWidthPct,
+    servingConsistentIC20d: servingIC,
     hyperparameters: {
       numTrees: chosenParams.numTrees ?? 50,
       depth: chosenParams.depth ?? 3,
