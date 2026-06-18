@@ -1810,6 +1810,105 @@ const List<DefaultSymbolBucket> kDefaultSymbolBuckets = [
       'QAT',
     ],
   ),
+  // ---------------------------------------------------------------------
+  // Gap-fill (2026-06-17): liquid US names verified missing from the
+  // universe AND resolvable to SEC filings (so EDGAR fundamentals
+  // populate). Neutral biases by design — biases only set a cosmetic
+  // "style" label, so 0 lets the data speak (doctrine: no guessed
+  // constants). Sector strings match existing buckets so sector
+  // benchmarks and sector-adjusted fundamental ranking group correctly.
+  // ---------------------------------------------------------------------
+  DefaultSymbolBucket(
+    sector: 'Industrials',
+    industry: 'Capital Goods & Engineering',
+    templateTicker: 'GEV',
+    symbols: [
+      'GEV',
+      'BLDR',
+      'EME',
+      'SKYW',
+      'BMI',
+      'LOAR',
+      'SARO',
+      'CSL',
+    ],
+  ),
+  DefaultSymbolBucket(
+    sector: 'Healthcare',
+    industry: 'Devices & Health Technology',
+    templateTicker: 'SOLV',
+    symbols: [
+      'SOLV',
+      'TEM',
+      'WAY',
+      'DOCS',
+      'RVMD',
+    ],
+  ),
+  DefaultSymbolBucket(
+    sector: 'Software',
+    industry: 'Application & Infrastructure Software',
+    templateTicker: 'SAP',
+    symbols: [
+      'CVLT',
+      'NTNX',
+      'GDDY',
+      'MANH',
+      'PCTY',
+      'SAP',
+      'KVYO',
+    ],
+  ),
+  DefaultSymbolBucket(
+    sector: 'Technology',
+    industry: 'Payments & Hardware',
+    templateTicker: 'FOUR',
+    symbols: [
+      'FOUR',
+      'SONY',
+    ],
+  ),
+  DefaultSymbolBucket(
+    sector: 'Materials',
+    industry: 'Metals & Packaging',
+    templateTicker: 'MLI',
+    symbols: [
+      'MLI',
+      'AMCR',
+    ],
+  ),
+  DefaultSymbolBucket(
+    sector: 'Energy',
+    industry: 'Royalties & Midstream',
+    templateTicker: 'TPL',
+    symbols: [
+      'TPL',
+    ],
+  ),
+  DefaultSymbolBucket(
+    sector: 'Financials',
+    industry: 'Regional Banks',
+    templateTicker: 'FCNCA',
+    symbols: [
+      'FCNCA',
+    ],
+  ),
+  DefaultSymbolBucket(
+    sector: 'Communications',
+    industry: 'Information Services',
+    templateTicker: 'RELX',
+    symbols: [
+      'RELX',
+    ],
+  ),
+  DefaultSymbolBucket(
+    sector: 'Consumer Discretionary',
+    industry: 'Automobiles',
+    templateTicker: 'TM',
+    symbols: [
+      'TM',
+    ],
+  ),
 ];
 
 List<String> get kDefaultSymbolUniverse {
