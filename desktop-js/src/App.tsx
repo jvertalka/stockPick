@@ -70,6 +70,15 @@ import {
   fetchSnapshotsBatched,
   pickTickersToEnhance,
 } from './data/optionsEnhancer'
+import {
+  applyRevisionsOverlay,
+  fetchRevisionRaw,
+  finnhubToken,
+  getCachedRevisionRaw,
+  rankRevisions,
+  type RevisionRaw,
+  type RevisionRanks,
+} from './data/revisionsEnhancer'
 import { cachedComputeQuantAnalysis, type QuantAnalysis } from './data/quantAnalysis'
 import {
   getRegimeGate,
@@ -1497,6 +1506,7 @@ function App() {
   const [optionsSnapshots, setOptionsSnapshots] = useState<Map<string, OptionsSnapshot>>(
     () => new Map(),
   )
+  const [revisionRanks, setRevisionRanks] = useState<RevisionRanks>(() => new Map())
   const [quantAnalyses, setQuantAnalyses] = useState<Map<string, QuantAnalysis>>(
     () => new Map(),
   )
@@ -1518,14 +1528,20 @@ function App() {
   const ownedKey = useMemo(() => Array.from(ownedTickers).sort().join(','), [ownedTickers])
   const watchKey = useMemo(() => Array.from(watchTickers).sort().join(','), [watchTickers])
   const universe = useMemo(() => {
-    // 1. Overlay live options data onto rawSignals BEFORE scoring.
+    // 1. Overlay live options + analyst-revision data onto rawSignals
+    //    BEFORE scoring, so the cross-sectional Z-scores see real values.
     const baseSignals = signalInputs ?? []
-    const enriched = optionsSnapshots.size === 0
-      ? baseSignals
-      : baseSignals.map((signal) => {
-          const snapshot = optionsSnapshots.get(signal.ticker)
-          return snapshot ? applyOptionsOverlay(signal, snapshot) : signal
-        })
+    const enriched =
+      optionsSnapshots.size === 0 && revisionRanks.size === 0
+        ? baseSignals
+        : baseSignals.map((signal) => {
+            let next = signal
+            const snapshot = optionsSnapshots.get(signal.ticker)
+            if (snapshot) next = applyOptionsOverlay(next, snapshot)
+            const revisions = revisionRanks.get(signal.ticker)
+            if (revisions) next = applyRevisionsOverlay(next, revisions)
+            return next
+          })
     // 2. Run the statistical scoring pipeline (Z-scores + factors + regime).
     const scored = scoreUniverse(enriched, activeScenario)
     // 3. Overlay Monte Carlo + BSM + Kelly outputs onto the scored signals.
@@ -1576,7 +1592,7 @@ function App() {
       })
     }
     return withQuant
-  }, [activeScenario, signalInputs, optionsSnapshots, quantAnalyses, decisionMode, mlPredictions, regimeGate])
+  }, [activeScenario, signalInputs, optionsSnapshots, revisionRanks, quantAnalyses, decisionMode, mlPredictions, regimeGate])
   // Conviction stacks: six independent evidence layers per name (rules,
   // ML, Monte Carlo, options skew, regime, multi-horizon agreement).
   const convictionStacks = useMemo(
@@ -2009,6 +2025,59 @@ function App() {
     // Refetch when refresh count changes (manual re-rank) or owned/watch
     // changes meaningfully. We deliberately do NOT depend on the full
     // universe array because it remounts on every score run.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [refreshCount, ownedKey, watchKey])
+
+  // Background analyst-revision enhancement (Finnhub free tier). Fills the
+  // dormant revisionTrend / surpriseMomentum growth-factor inputs for a
+  // prioritized slice of the universe. Cached names (IDB, 12h) seed
+  // instant signal; only genuinely uncached names hit the throttled
+  // fetch (free tier is 60 req/min, 2 calls/ticker). Skipped entirely
+  // when no VITE_FINNHUB_TOKEN is set — fields stay neutral, never faked.
+  useEffect(() => {
+    if (universe.length === 0) return
+    const token = finnhubToken()
+    if (!token) return
+    // Owned + watch + top opportunity; cap bounds the first-warm time.
+    const tickers = pickTickersToEnhance(universe, ownedTickers, watchTickers, 300)
+    if (tickers.length === 0) return
+
+    let cancelled = false
+    void (async () => {
+      const raws = new Map<string, RevisionRaw>()
+      const publish = () => {
+        if (!cancelled && raws.size >= 20) setRevisionRanks(rankRevisions(new Map(raws)))
+      }
+      // 1. Seed from IDB cache instantly (no network, no throttle).
+      const cached = await Promise.all(
+        tickers.map((t) => getCachedRevisionRaw(t).catch(() => null)),
+      )
+      const uncached: string[] = []
+      tickers.forEach((t, i) => {
+        const hit = cached[i]
+        if (hit) raws.set(t, hit)
+        else uncached.push(t)
+      })
+      publish()
+      // 2. Throttled network fetch for the rest, re-ranking periodically.
+      const batchSize = 3
+      for (let i = 0; i < uncached.length && !cancelled; i += batchSize) {
+        const batch = uncached.slice(i, i + batchSize)
+        const results = await Promise.all(
+          batch.map((t) => fetchRevisionRaw(t, token).catch(() => null)),
+        )
+        results.forEach((r) => {
+          if (r) raws.set(r.ticker, r)
+        })
+        if (raws.size % 30 < batchSize || i + batchSize >= uncached.length) publish()
+        if (i + batchSize < uncached.length && !cancelled) {
+          await new Promise((resolve) => setTimeout(resolve, 7000))
+        }
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [refreshCount, ownedKey, watchKey])
 
