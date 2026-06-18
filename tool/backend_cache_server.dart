@@ -435,6 +435,7 @@ class MarketDataCache {
     'stooq.com',
     'sandbox.tradier.com',
     'api.tradier.com',
+    'finnhub.io',
   };
 
   bool isAllowed(Uri uri) {
@@ -604,6 +605,15 @@ class _CachePolicy {
   factory _CachePolicy.forUri(Uri uri) {
     final host = uri.host.toLowerCase();
     final path = uri.path.toLowerCase();
+    if (host == 'finnhub.io') {
+      // Analyst recommendation trends update ~monthly and earnings
+      // surprises ~quarterly, so a 12h TTL keeps the free-tier rate
+      // budget (60 req/min) from being re-spent every session.
+      return const _CachePolicy(
+        ttl: Duration(hours: 12),
+        timeout: Duration(seconds: 12),
+      );
+    }
     if (host == 'data.sec.gov' || host == 'www.sec.gov') {
       if (path.contains('company_tickers')) {
         return const _CachePolicy(
