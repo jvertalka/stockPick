@@ -310,6 +310,14 @@ export async function logLivePrediction(
   prediction: LivePrediction,
 ): Promise<void> {
   const existing = (await kvGet<LoggedPrediction[]>(PREDICTION_LOG_KEY)) ?? []
+  // DEDUPE by (ticker, asOf): the predict effect re-runs on every refresh /
+  // owned-watch change, so the same (ticker, bar-date) prediction would be
+  // appended many times a day, multiplying those rows in the decay-monitor
+  // IC and skewing it toward whatever names happen to refresh most. One
+  // logged prediction per ticker per bar date.
+  if (existing.some((e) => e.ticker === prediction.ticker && e.asOf === prediction.asOf)) {
+    return
+  }
   existing.push({
     ticker: prediction.ticker,
     asOf: prediction.asOf,
