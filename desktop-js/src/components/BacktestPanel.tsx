@@ -426,15 +426,23 @@ export function BacktestPanel() {
             <strong>What's correct here:</strong> purged + embargoed walk-forward (López
             de Prado 2018) prevents label leakage from overlapping forward returns;
             cross-sectional Z-score normalization at each date so the model learns relative
-            ranking; permutation feature importance flags noise features; baselines anchor
-            interpretation; {result.txCostBpsUsed}bps transaction cost subtracted (each
-            side); {result.embargoDaysUsed}-day embargo between train and test.
+            ranking; nested-CV hyperparameter selection on training data only; permutation
+            feature importance flags noise features; baselines (random + 12-month momentum)
+            anchor interpretation; bootstrap 95% CIs on every headline metric;
+            split-conformal prediction intervals with measured out-of-sample coverage
+            (Romano-Patterson-Candès 2019); {result.txCostBpsUsed}bps transaction cost
+            subtracted (each side); {result.embargoDaysUsed}-day embargo between train and test.
             <br /><br />
-            <strong>What's still missing:</strong> survivorship bias (Yahoo gives only
-            surviving tickers — inflates every metric); shorting borrow costs not modeled;
-            no nested CV for hyperparameter tuning; bootstrap CIs on metrics not yet
-            computed. Treat IC &gt; 0.03 (over momentum baseline) and net L/S Sharpe &gt; 0.5
-            as meaningful — below that, the model isn't adding value over passive momentum.
+            <strong>Survivorship is measured, not removed:</strong> the universe is today's
+            surviving tickers, so absolute returns are inflated. The 15-year run instruments
+            this directly — a distress canary (Campbell-Hilscher-Szilagyi 2008), cohort and
+            era splits, and a delisting-haircut bound — and the canary fires, so trust the
+            rankings and relative comparisons but treat absolute return levels as upper bounds.
+            <br /><br />
+            <strong>Still not modeled:</strong> shorting borrow costs on the L/S short leg;
+            a true point-in-time universe (would need paid index-constituent data). Treat
+            IC &gt; 0.03 with its CI clear of zero and net L/S Sharpe &gt; 0.5 as meaningful —
+            below that, the model isn't adding value over passive momentum.
           </p>
         </div>
       ) : null}
