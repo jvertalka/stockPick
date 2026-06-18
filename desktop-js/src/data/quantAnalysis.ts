@@ -166,6 +166,21 @@ export async function computeQuantAnalysis(
   const returns = logReturns(closes)
   const lastPrice = closes[closes.length - 1]
 
+  // Real market series for the Kalman beta: SPY closes date-aligned to
+  // this ticker's bars (a beta needs the SAME dates on both sides). The
+  // map is keyed by bar date so trading-day gaps/halts line up correctly.
+  const spyBars = ticker === 'SPY' ? bars : await cachedFetchDailyBars('SPY', '1y')
+  const spyCloseByDate = new Map(spyBars.map((bar) => [bar.date, bar.close]))
+  const alignedStockCloses: number[] = []
+  const alignedMarketCloses: number[] = []
+  for (const bar of bars) {
+    const spyClose = spyCloseByDate.get(bar.date)
+    if (spyClose != null && spyClose > 0 && bar.close > 0) {
+      alignedStockCloses.push(bar.close)
+      alignedMarketCloses.push(spyClose)
+    }
+  }
+
   // 1. Fetch risk-free rate from FRED — or fall back to long-run avg.
   let riskFreeRate = await cachedFetchRiskFreeRate()
   let riskFreeRateSource: QuantAnalysis['riskFreeRateSource'] = 'fred-dgs1mo'
@@ -381,12 +396,19 @@ export async function computeQuantAnalysis(
   )
 
   // 14. Time-varying Kalman beta — replaces Yahoo's static historical beta
-  //     with an adaptive state-space estimate. Needs market returns; we
-  //     reuse the same return series as proxy when SPY isn't available.
-  //     This is a simplified version — real implementation would fetch SPY
-  //     bars and align dates.
-  const marketReturnsProxy = returns  // TODO: replace with real SPY series
-  const kalman = kalmanTimeVaryingBeta(returns, marketReturnsProxy)
+  //     with an adaptive state-space estimate, regressing the ticker's
+  //     returns on the DATE-ALIGNED SPY returns. Falls back to the
+  //     self-series (beta ≡ 1) only when SPY is unavailable or too few
+  //     dates overlap — a regression of a series on itself is degenerate,
+  //     so that fallback is explicitly a no-information default, not a
+  //     real beta.
+  const haveMarket = alignedStockCloses.length >= 30
+  const kalman = haveMarket
+    ? kalmanTimeVaryingBeta(
+        logReturns(alignedStockCloses),
+        logReturns(alignedMarketCloses),
+      )
+    : kalmanTimeVaryingBeta(returns, returns)
 
   return {
     ticker,
