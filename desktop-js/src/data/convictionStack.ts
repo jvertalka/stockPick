@@ -121,7 +121,7 @@ export function buildConvictionStack(input: {
       id: 'ml',
       label: 'ML forecast',
       status: ml > 0 ? 'pass' : 'fail',
-      detail: `GBT 20d forecast ${ml >= 0 ? '+' : ''}${ml.toFixed(2)}%${
+      detail: `GBT 20d RELATIVE forecast ${ml >= 0 ? '+' : ''}${ml.toFixed(2)}% (expected outperformance vs the cross-section, not an absolute return)${
         mlPrediction.p10Return20d != null && mlPrediction.p90Return20d != null
           ? ` (80% interval ${mlPrediction.p10Return20d.toFixed(1)}% to ${mlPrediction.p90Return20d.toFixed(1)}%)`
           : ''

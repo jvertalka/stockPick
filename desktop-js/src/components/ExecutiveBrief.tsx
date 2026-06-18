@@ -420,9 +420,12 @@ function ActionBucket({
                     {row.forecast20d.toFixed(1)}% 20d
                   </span>
                   {prediction ? (
-                    <span className={prediction.predictedReturn20d >= 0 ? 'positive' : 'danger'}>
+                    <span
+                      className={prediction.predictedReturn20d >= 0 ? 'positive' : 'danger'}
+                      title="ML model's expected 20-day RELATIVE outperformance vs the cross-section (not an absolute return forecast)"
+                    >
                       ML {prediction.predictedReturn20d >= 0 ? '+' : ''}
-                      {prediction.predictedReturn20d.toFixed(1)}%
+                      {prediction.predictedReturn20d.toFixed(1)}% vs peers
                     </span>
                   ) : null}
                   {row.recommendedKellyHalfPct != null && tone === 'positive' ? (

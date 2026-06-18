@@ -904,9 +904,9 @@ function DecisionTable({
                         const prediction = mlPredictions.get(row.ticker)
                         if (!prediction) return 'No ML prediction'
                         if (prediction.p10Return20d != null && prediction.p90Return20d != null) {
-                          return `GBT 20d: ${formatSignedPercent(prediction.predictedReturn20d)} | 80% interval [${formatSignedPercent(prediction.p10Return20d)}, ${formatSignedPercent(prediction.p90Return20d)}]`
+                          return `GBT 20d relative (vs peers): ${formatSignedPercent(prediction.predictedReturn20d)} | 80% interval [${formatSignedPercent(prediction.p10Return20d)}, ${formatSignedPercent(prediction.p90Return20d)}]`
                         }
-                        return `GBT 20d: ${formatSignedPercent(prediction.predictedReturn20d)}`
+                        return `GBT 20d relative (vs peers): ${formatSignedPercent(prediction.predictedReturn20d)}`
                       })()}>
                         {(() => {
                           const prediction = mlPredictions.get(row.ticker)
