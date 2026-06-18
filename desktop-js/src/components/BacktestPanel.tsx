@@ -22,9 +22,9 @@ const BACKTEST_TICKERS = DEFAULT_BACKTEST_TICKERS
 
 // Cache key includes a schema version so stale entries from earlier
 // builds don't crash the panel when fields rename or get added.
-// Schema bump: v7 adds size-tiered trading + borrow costs
-// (meanRealizedCostBps); v6 used a flat 10bps rate.
-const CACHE_KEY = 'backtest:last-result:v7'
+// Schema bump: v8 adds servingConsistentIC20d + out-of-fold per-horizon
+// IC (was in-sample); v7 added size-tiered costs.
+const CACHE_KEY = 'backtest:last-result:v8'
 
 export function BacktestPanel() {
   const [running, setRunning] = useState(false)
@@ -110,6 +110,7 @@ export function BacktestPanel() {
             featureMeans: data.featureStats.means,
             featureStds: data.featureStats.stds,
             meanIC: backtestResult.meanIC,
+            servingConsistentIC20d: backtestResult.servingConsistentIC20d,
             meanLongShortReturnNet: backtestResult.meanLongShortReturnNet,
             meanLongShortSharpe: backtestResult.meanLongShortSharpe,
             hyperparameters: backtestResult.hyperparameters,
@@ -244,7 +245,7 @@ export function BacktestPanel() {
               <strong>{result.steps.length}</strong>
             </div>
             <div>
-              <span>Mean IC (95% CI)</span>
+              <span>Mean IC, validated (95% CI)</span>
               <strong className={tone(result.meanIC, 0.02)}>
                 {result.meanIC.toFixed(3)}
               </strong>
@@ -254,6 +255,17 @@ export function BacktestPanel() {
                 </small>
               ) : null}
             </div>
+            {result.servingConsistentIC20d != null && Number.isFinite(result.servingConsistentIC20d) ? (
+              <div>
+                <span title="Held-out IC measured under the SAME global normalization that live single-ticker serving uses — not the per-date cross-sectional Z the validated IC is measured under. This is what live predictions actually realize, usually below the validated IC.">
+                  Mean IC, live-applicable
+                </span>
+                <strong className={tone(result.servingConsistentIC20d, 0.02)}>
+                  {result.servingConsistentIC20d.toFixed(3)}
+                </strong>
+                <small style={{ fontSize: 10, color: 'var(--muted)' }}>serving-normalized</small>
+              </div>
+            ) : null}
             <div>
               <span>Mean IC (Spearman)</span>
               <strong className={tone(result.meanSpearmanIC, 0.02)}>
@@ -356,7 +368,7 @@ export function BacktestPanel() {
             </div>
           </div>
 
-          <h3 className="backtest-section-title">Multi-horizon ensemble (in-sample IC by horizon)</h3>
+          <h3 className="backtest-section-title">Multi-horizon ensemble (out-of-fold IC by horizon)</h3>
           <p className="backtest-section-note">
             Separate GBT trained for each forward horizon (5d, 20d, 60d, 120d). For each
             horizon, three models are trained: median (point estimate), p10 (lower bound),

@@ -65,7 +65,14 @@ export type StoredMlModel = {
   featureNames: string[]
   featureMeans: number[]
   featureStds: number[]
+  /** Walk-forward IC under per-date cross-sectional normalization — the
+   * validated-pipeline number. */
   meanIC: number
+  /** LIVE-APPLICABLE IC: held-out IC under the global normalization this
+   * very serving path uses. This, not meanIC, is what single-ticker live
+   * predictions realize; usually below meanIC due to the train/serve
+   * normalization skew. */
+  servingConsistentIC20d?: number
   meanLongShortReturnNet: number
   meanLongShortSharpe: number
   hyperparameters: { numTrees: number; depth: number; learningRate: number }
@@ -108,6 +115,7 @@ export async function persistModel(
     featureMeans: number[]
     featureStds: number[]
     meanIC: number
+    servingConsistentIC20d?: number
     meanLongShortReturnNet: number
     meanLongShortSharpe: number
     hyperparameters: { numTrees: number; depth: number; learningRate: number }
@@ -135,6 +143,7 @@ export async function persistModel(
     featureMeans: meta.featureMeans,
     featureStds: meta.featureStds,
     meanIC: meta.meanIC,
+    servingConsistentIC20d: meta.servingConsistentIC20d,
     meanLongShortReturnNet: meta.meanLongShortReturnNet,
     meanLongShortSharpe: meta.meanLongShortSharpe,
     hyperparameters: meta.hyperparameters,
