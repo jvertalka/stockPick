@@ -217,45 +217,185 @@ export async function clearModel(): Promise<void> {
    Live prediction
    ========================================================================= */
 
+/** Minimum number of live names required to form a trustworthy cross-section
+ * for serve-time normalization. Mirrors the training-side MIN_GROUP_FOR_ZSCORE
+ * in applyCrossSectionalNormalization: below this many names a single date's
+ * (here: the live batch's) mean/std is too noisy, so the whole batch falls
+ * back to the model's frozen training stats. The live universe passed in is
+ * the top ~30 opportunity/owned/watched names, so this floor only trips for
+ * tiny watchlists. */
+const CROSS_SECTION_MIN_BREADTH = 5
+
+type RawServingFeatures = { rawFeatures: number[]; asOf: string }
+
 /**
- * Fetch current bars for a ticker and predict its 20-day forward return
- * using the persisted trained model. Returns null if no model is loaded
- * or the ticker has insufficient history.
+ * Fetch a ticker's current bars + point-in-time fundamentals and compute its
+ * RAW (un-normalized) feature vector, sliced to the model's column order.
+ * Missing fundamentals stay as NaN — the caller imputes + normalizes them.
+ * Returns null when history is too short or features can't be built.
  */
-export async function predictForTicker(
+async function computeRawServingFeatures(
   ticker: string,
   model: StoredMlModel,
-): Promise<LivePrediction | null> {
+): Promise<RawServingFeatures | null> {
   // 'max' so listing_age_years sees the TRUE first bar — a 5y fetch would
   // cap every mature company's age at 5 and shift the feature vs training.
   const bars = await cachedFetchDailyBars(ticker, 'max')
   if (bars.length < 280) return null
   // Same inputs as training: price features + point-in-time fundamentals
-  // (null for ETFs/non-filers — those columns use the neutral encoding).
+  // (null for ETFs/non-filers — those columns arrive NaN and get imputed).
   const fundamentals = await fetchFundamentalsTimeline(ticker)
   const fullFeatures = computeFeaturesAtDate(bars, bars.length - 1, fundamentals)
   if (!fullFeatures) return null
-  // Respect the model's feature subset: a model trained on pruned
-  // features stores its featureNames, and live features must be sliced
-  // to the same columns in the same order before prediction.
-  const features =
+  // Respect the model's feature subset: a model trained on pruned features
+  // stores its featureNames, and live features must be sliced to the same
+  // columns in the same order before prediction. An unknown name (should
+  // never happen) arrives NaN so it imputes to the neutral center.
+  const rawFeatures =
     model.featureNames.length > 0 && model.featureNames.length !== HISTORICAL_FEATURE_NAMES.length
       ? model.featureNames.map((name) => {
           const idx = HISTORICAL_FEATURE_NAMES.indexOf(name)
-          return idx >= 0 ? fullFeatures[idx] : 0
+          return idx >= 0 ? fullFeatures[idx] : Number.NaN
         })
       : fullFeatures
-  // Normalize using training-set statistics (Z-scoring against historical
-  // distribution, not against the current cross-section). Missing
-  // fundamentals arrive as NaN; impute the training mean — the live
-  // counterpart of the per-date median imputation used in training —
-  // which lands exactly on Z = 0.
-  const normalized = features.map((value, i) => {
-    const mean = model.featureMeans[i] ?? 0
-    const std = model.featureStds[i] ?? 1
-    const filled = Number.isNaN(value) ? mean : value
+  return { rawFeatures, asOf: bars[bars.length - 1].date }
+}
+
+/** Frozen-stats normalization: Z-score a single raw vector against the
+ * model's stored training means/stds (RMS-of-within-date-std scaled). Missing
+ * (non-finite) values impute to the mean and land exactly on Z = 0. Used for
+ * single-name predictions and as the small-batch fallback below. */
+function normalizeWithFrozenStats(
+  rawFeatures: number[],
+  frozen: { means: number[]; stds: number[] },
+): number[] {
+  return rawFeatures.map((value, i) => {
+    const mean = frozen.means[i] ?? 0
+    const std = frozen.stds[i] ?? 1
+    const filled = !Number.isFinite(value) ? mean : value
     return (filled - mean) / Math.max(1e-12, std)
   })
+}
+
+/**
+ * Serve-time CROSS-SECTIONAL normalization (Improvement #2) — the live
+ * counterpart of training's imputeMissingWithDateMedians +
+ * applyCrossSectionalNormalization, with "today's live universe" playing the
+ * role of one training date. Per feature, across the batch:
+ *   1. impute missing (non-finite) values to the cross-sectional MEDIAN of
+ *      the names that have it (matches imputeMissingWithDateMedians), then
+ *   2. Z-score every name against the cross-sectional MEAN/STD of the now-
+ *      complete column (matches applyCrossSectionalNormalization).
+ * The four exact-fidelity choices match training: ascending-sort median at
+ * Math.floor(n/2), population variance (/N), median-imputed values INCLUDED
+ * in the mean/std, and the Math.max(1e-12, .) std floor.
+ *
+ * Breadth guard: with fewer than `minBreadth` names the batch mean/std is too
+ * noisy to trust, so the whole batch falls back to the model's frozen
+ * training stats. A feature absent for EVERY name in the batch likewise falls
+ * back to frozen for that one column — there is no live cross-section to
+ * estimate it from. NOTE this frozen fallback is a knowing APPROXIMATION, not
+ * a faithful copy of training's <MIN_GROUP_FOR_ZSCORE sparse-date rule: that
+ * rule divides by the global POOLED std, whereas the frozen stats use the RMS
+ * of within-date stds (computeFeatureStats). The two differ for drifting
+ * features, so tiny batches are not expected to recover meanIC — acceptable
+ * because the production batch is ~30 names and this path only fires for a
+ * near-empty watchlist.
+ *
+ * "Missing" means non-finite (NaN OR ±Infinity): a single Infinity admitted
+ * into the cross-section would poison the whole column's mean/std to NaN, so
+ * we treat it as missing and impute it.
+ *
+ * One cross-section: the batch is normalized as a single group even though
+ * each name's asOf is its own last-bar date. Training groups strictly by
+ * date; on a normal trading day every active name shares the last-bar date,
+ * so they coincide. A day-stale straggler enters at the wrong date, but its
+ * effect is bounded (1 of ~30 names, dampened by the median impute).
+ *
+ * Pure (no I/O) so it is unit-testable in isolation.
+ */
+export function crossSectionalNormalizeServingBatch(
+  rawByTicker: Map<string, number[]>,
+  frozen: { means: number[]; stds: number[] },
+  minBreadth = CROSS_SECTION_MIN_BREADTH,
+): Map<string, number[]> {
+  const tickers = [...rawByTicker.keys()]
+  const out = new Map<string, number[]>()
+  if (tickers.length === 0) return out
+  const featureCount = rawByTicker.get(tickers[0])!.length
+
+  // Too few names for a trustworthy cross-section — frozen fallback for all.
+  if (tickers.length < minBreadth) {
+    for (const ticker of tickers) {
+      out.set(ticker, normalizeWithFrozenStats(rawByTicker.get(ticker)!, frozen))
+    }
+    return out
+  }
+
+  // Per-feature cross-sectional median (for imputation) + mean/std (for the
+  // Z-score), each computed over the median-imputed-complete column exactly
+  // as training does after imputeMissingWithDateMedians.
+  const csMean = new Array<number>(featureCount).fill(0)
+  const csStd = new Array<number>(featureCount).fill(1)
+  const csMedian = new Array<number>(featureCount).fill(Number.NaN)
+  const featureUsesFrozen = new Array<boolean>(featureCount).fill(false)
+
+  for (let f = 0; f < featureCount; f++) {
+    const present: number[] = []
+    for (const ticker of tickers) {
+      const value = rawByTicker.get(ticker)![f]
+      if (Number.isFinite(value)) present.push(value)
+    }
+    if (present.length === 0) {
+      // Feature absent across the whole batch — no cross-section to form.
+      featureUsesFrozen[f] = true
+      continue
+    }
+    present.sort((a, b) => a - b)
+    const median = present[Math.floor(present.length / 2)]
+    csMedian[f] = median
+    let sum = 0
+    const imputed: number[] = []
+    for (const ticker of tickers) {
+      const value = rawByTicker.get(ticker)![f]
+      const filled = !Number.isFinite(value) ? median : value
+      imputed.push(filled)
+      sum += filled
+    }
+    const mean = sum / imputed.length
+    let varSum = 0
+    for (const value of imputed) varSum += (value - mean) ** 2
+    csMean[f] = mean
+    csStd[f] = Math.sqrt(Math.max(1e-12, varSum / imputed.length))
+  }
+
+  for (const ticker of tickers) {
+    const raw = rawByTicker.get(ticker)!
+    const normalized = new Array<number>(featureCount)
+    for (let f = 0; f < featureCount; f++) {
+      if (featureUsesFrozen[f]) {
+        const mean = frozen.means[f] ?? 0
+        const std = frozen.stds[f] ?? 1
+        const filled = !Number.isFinite(raw[f]) ? mean : raw[f]
+        normalized[f] = (filled - mean) / Math.max(1e-12, std)
+      } else {
+        const filled = !Number.isFinite(raw[f]) ? csMedian[f] : raw[f]
+        normalized[f] = (filled - csMean[f]) / Math.max(1e-12, csStd[f])
+      }
+    }
+    out.set(ticker, normalized)
+  }
+  return out
+}
+
+/** Run the trained GBT (+ quantile heads + horizon ensemble) on an already-
+ * normalized feature vector and assemble the LivePrediction. */
+function buildPrediction(
+  ticker: string,
+  model: StoredMlModel,
+  normalized: number[],
+  asOf: string,
+): LivePrediction {
   const prediction = predictGradientBoosting(model.model, normalized)
   // Conformal widening (Romano et al. 2019): the stored offset is what the
   // backtest measured on held-out calibration data, so the 80% interval
@@ -282,22 +422,84 @@ export async function predictForTicker(
     p10Return20d: p10,
     p90Return20d: p90,
     horizonReturns,
-    asOf: bars[bars.length - 1].date,
+    asOf,
     features: normalized,
   }
 }
 
+/**
+ * Predict a SINGLE ticker's 20-day forward return. With only one name there
+ * is no live cross-section, so this normalizes against the model's frozen
+ * training stats. Returns null if no model is loaded or history is too short.
+ * (Universe-scale predictions go through predictForUniverse, which uses the
+ * cross-sectional path.)
+ */
+export async function predictForTicker(
+  ticker: string,
+  model: StoredMlModel,
+): Promise<LivePrediction | null> {
+  const raw = await computeRawServingFeatures(ticker, model)
+  if (!raw) return null
+  const normalized = normalizeWithFrozenStats(raw.rawFeatures, {
+    means: model.featureMeans,
+    stds: model.featureStds,
+  })
+  return buildPrediction(ticker, model, normalized, raw.asOf)
+}
+
+/**
+ * Predict for a whole live universe with SERVE-TIME CROSS-SECTIONAL
+ * normalization (Improvement #2): each feature is Z-scored against the
+ * batch's own cross-section — the same FAMILY of transform the model trained
+ * under (per-date cross-sectional Z) — instead of the model's frozen 15y
+ * training stats.
+ *
+ * This REMOVES the train/serve normalization skew that depressed the frozen
+ * single-name path (whose held-out IC is the measured servingConsistentIC20d
+ * ≈ 0.072) and moves live ranking TOWARD the per-date-normalized walk-forward
+ * meanIC (≈ 0.078). It does NOT "realize" meanIC, and we deliberately do not
+ * claim a specific live number, because the live cross-section differs from
+ * the one meanIC was measured on in three ways: (a) the batch is the top ~30
+ * SELECTED opportunity/owned/watched names (pickTickersToEnhance) — a
+ * conditional, range-compressed slice, not the full per-date panel; (b) ~30
+ * names give a noisier mean/std than the full-universe panels; (c) meanIC is
+ * a POOLED multi-date Pearson IC, not a within-batch rank-IC. So treat
+ * servingConsistentIC20d and meanIC as a lower/upper BRACKET on the expected
+ * live IC, with meanIC an upper reference, not a delivered figure.
+ *
+ * Selecting the batch this way is still the right FRAME for a "who is
+ * relatively strongest among my candidates" tool — it just means the realized
+ * IC is its own unmeasured quantity inside that bracket.
+ *
+ * Phase 1 gathers raw features for every name; phase 2 normalizes them
+ * together; phase 3 runs the model.
+ */
 export async function predictForUniverse(
   tickers: string[],
   model: StoredMlModel,
   onProgress?: (current: number, total: number) => void,
 ): Promise<Map<string, LivePrediction>> {
-  const out = new Map<string, LivePrediction>()
+  // Phase 1 — gather RAW (un-normalized) feature vectors for the batch.
+  const rawByTicker = new Map<string, number[]>()
+  const asOfByTicker = new Map<string, string>()
   for (let i = 0; i < tickers.length; i++) {
     const ticker = tickers[i]
     onProgress?.(i, tickers.length)
-    const prediction = await predictForTicker(ticker, model)
-    if (prediction) out.set(ticker, prediction)
+    const raw = await computeRawServingFeatures(ticker, model)
+    if (raw) {
+      rawByTicker.set(ticker, raw.rawFeatures)
+      asOfByTicker.set(ticker, raw.asOf)
+    }
+  }
+  // Phase 2 — cross-sectional normalization over the gathered batch.
+  const normalizedByTicker = crossSectionalNormalizeServingBatch(rawByTicker, {
+    means: model.featureMeans,
+    stds: model.featureStds,
+  })
+  // Phase 3 — run the model on each normalized vector.
+  const out = new Map<string, LivePrediction>()
+  for (const [ticker, normalized] of normalizedByTicker) {
+    out.set(ticker, buildPrediction(ticker, model, normalized, asOfByTicker.get(ticker)!))
   }
   return out
 }

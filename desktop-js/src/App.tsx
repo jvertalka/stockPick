@@ -394,6 +394,32 @@ function actionFilterFor(action: Action): ActionFilter {
   return 'Risk'
 }
 
+/** Mid-rank cross-sectional percentiles (0-100) for a batch of [key, value]
+ * pairs; ties share the average rank. Used to gate ML/ensemble actions on a
+ * name's RANK within the live batch: the model predicts a RELATIVE
+ * (~zero-centered) 20d return, so absolute % thresholds are meaningless —
+ * roughly half a batch is negative by construction. A single value maps to 50
+ * (no spread to rank against). */
+function batchPercentiles(pairs: Array<[string, number]>): Map<string, number> {
+  const out = new Map<string, number>()
+  const n = pairs.length
+  if (n === 0) return out
+  if (n === 1) {
+    out.set(pairs[0][0], 50)
+    return out
+  }
+  const sorted = [...pairs].sort((a, b) => a[1] - b[1])
+  let i = 0
+  while (i < sorted.length) {
+    let j = i
+    while (j + 1 < sorted.length && sorted[j + 1][1] === sorted[i][1]) j++
+    const pct = (((i + j) / 2) / (sorted.length - 1)) * 100
+    for (let k = i; k <= j; k++) out.set(sorted[k][0], pct)
+    i = j + 1
+  }
+  return out
+}
+
 // Focusing an action bucket always lands on the Desk with the matching
 // filter — the boards that used to be separate views are now just filters.
 
@@ -1569,26 +1595,43 @@ function App() {
     // high-vol Markov regimes, so ML overrides are suppressed there and the
     // engine falls back to rules (see quantConfig.ML_REGIME_GATE).
     if (decisionMode !== 'rules' && mlPredictions.size > 0 && !regimeGate?.gated) {
+      // The ML model predicts RELATIVE (cross-sectionally demeaned) 20d return
+      // — its output is ~zero-centered, so absolute % thresholds (">1.5% =
+      // Buy") are wrong: roughly half the batch is negative BY CONSTRUCTION
+      // regardless of absolute attractiveness, which would force good names to
+      // Trim/Sell on relative weakness. Gate on the name's cross-sectional
+      // RANK within the live ML batch instead — the quintile convention used
+      // elsewhere (Fama-French portfolio cut, TOP_QUINTILE_PERCENTILE).
+      const mlPctByTicker = batchPercentiles(
+        [...mlPredictions.entries()].map(([ticker, p]) => [ticker, p.predictedReturn20d]),
+      )
+      // Below this many predictions a percentile is too noisy to act on; leave
+      // the rules action untouched rather than force a miscalibrated override.
+      const haveRankBreadth = mlPctByTicker.size >= 8
       withQuant = withQuant.map((signal) => {
         const prediction = mlPredictions.get(signal.ticker)
-        if (!prediction) return signal
-        const mlReturn = prediction.predictedReturn20d
+        if (!prediction || !haveRankBreadth) return signal
+        const pct = mlPctByTicker.get(signal.ticker)
+        if (pct == null) return signal
         if (decisionMode === 'ml') {
-          // Pure-ML action gating, anchored to the same equity-premium pace
-          // thresholds the engine uses elsewhere.
+          // Pure-ML gating on the relative-return percentile: top quintile
+          // buys, bottom quintile sells (symmetric quintile cuts).
           let mlAction: typeof signal.action = 'Hold'
-          if (mlReturn > 1.5) mlAction = 'Buy Now'
-          else if (mlReturn > 0.5) mlAction = 'Accumulate'
-          else if (mlReturn < -3) mlAction = 'Sell'
-          else if (mlReturn < -1) mlAction = 'Trim'
+          if (pct >= 80) mlAction = 'Buy Now'
+          else if (pct >= 60) mlAction = 'Accumulate'
+          else if (pct <= 20) mlAction = 'Sell'
+          else if (pct <= 40) mlAction = 'Trim'
           return { ...signal, action: mlAction }
         }
-        // Ensemble: average rules forecast and ML prediction
-        const blended = (signal.forecast20d + mlReturn) / 2
+        // Ensemble: blend in RANK space — both the rules composite-alpha
+        // percentile and the ML relative-return percentile are 0-100, so they
+        // are commensurable (the old code averaged a raw ±12 forecast with the
+        // relative ML output, mixing units). Conservative: only nudge a Hold.
+        const blendedPct = (pct + signal.alphaPercentile) / 2
         let blendedAction = signal.action
-        if (blended > 2 && signal.action === 'Hold') blendedAction = 'Accumulate'
-        if (blended < -2 && signal.action === 'Hold') blendedAction = 'Trim'
-        return { ...signal, action: blendedAction, forecast20d: blended }
+        if (blendedPct >= 80 && signal.action === 'Hold') blendedAction = 'Accumulate'
+        if (blendedPct <= 20 && signal.action === 'Hold') blendedAction = 'Trim'
+        return { ...signal, action: blendedAction }
       })
     }
     return withQuant
