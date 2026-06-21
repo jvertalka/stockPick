@@ -13,6 +13,7 @@ import {
   SIZE_TIERED_TRADING_COST,
   TRADING_DAYS_PER_YEAR,
 } from './quantConfig'
+import { benjaminiHochberg } from './selectionStats'
 
 export type { DailyBar }
 
@@ -88,7 +89,11 @@ function meanOf(values: number[]): number {
  * neutral fundamental encoding.
  */
 export const DEFAULT_BACKTEST_TICKERS = [
-  // Mega/large tech + communication
+  // Expanded training pool: the curated large/mid-cap bellwethers (first,
+  // sector-organized) + the rest of the live catalog, deduped. Train on a
+  // prefix via the CLI --limit N flag (e.g. 500 de-risk, then 1000 target).
+  // All survivors: breadth shrinks cross-sectional Z/IC variance but does NOT
+  // correct survivorship bias (the CHS canary still flags inflated absolutes).
   'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META', 'NVDA', 'TSLA', 'AVGO',
   'ORCL', 'CRM', 'ADBE', 'CSCO', 'NFLX', 'AMD', 'INTC', 'QCOM',
   'TXN', 'IBM', 'NOW', 'PANW', 'MU', 'AMAT', 'LRCX', 'KLAC',
@@ -96,36 +101,169 @@ export const DEFAULT_BACKTEST_TICKERS = [
   'ZS', 'MDB', 'SNOW', 'PLTR', 'UBER', 'ABNB', 'SHOP', 'SQ',
   'PYPL', 'INTU', 'ANET', 'MRVL', 'NXPI', 'ON', 'ADI', 'MCHP',
   'DIS', 'CMCSA', 'T', 'VZ', 'TMUS', 'CHTR', 'EA', 'TTWO',
-  // Financials
   'JPM', 'V', 'MA', 'BAC', 'WFC', 'GS', 'MS', 'BLK',
   'SCHW', 'AXP', 'C', 'USB', 'PNC', 'TFC', 'COF', 'BK',
   'SPGI', 'MCO', 'ICE', 'CME', 'AON', 'MMC', 'PGR', 'TRV',
   'ALL', 'MET', 'PRU', 'AIG', 'KKR', 'BX', 'APO', 'COIN',
-  // Health care
   'UNH', 'JNJ', 'LLY', 'MRK', 'ABBV', 'PFE', 'TMO', 'ABT',
   'DHR', 'BMY', 'AMGN', 'GILD', 'VRTX', 'REGN', 'ISRG', 'SYK',
   'BSX', 'MDT', 'EW', 'ZTS', 'CI', 'CVS', 'ELV', 'HUM',
-  'MCK', 'BIIB', 'MRNA', 'HCA',
-  // Consumer staples + discretionary
-  'WMT', 'PG', 'KO', 'PEP', 'COST', 'HD', 'NKE', 'MCD',
-  'LOW', 'TGT', 'SBUX', 'CMG', 'BKNG', 'MAR', 'HLT', 'YUM',
-  'DG', 'DLTR', 'ROST', 'TJX', 'ORLY', 'AZO', 'EL', 'CL',
-  'KMB', 'GIS', 'KHC', 'HSY', 'STZ', 'MDLZ', 'MO', 'PM',
-  'F', 'GM', 'RIVN', 'LULU',
-  // Energy + materials
+  'MCK', 'BIIB', 'MRNA', 'HCA', 'WMT', 'PG', 'KO', 'PEP',
+  'COST', 'HD', 'NKE', 'MCD', 'LOW', 'TGT', 'SBUX', 'CMG',
+  'BKNG', 'MAR', 'HLT', 'YUM', 'DG', 'DLTR', 'ROST', 'TJX',
+  'ORLY', 'AZO', 'EL', 'CL', 'KMB', 'GIS', 'KHC', 'HSY',
+  'STZ', 'MDLZ', 'MO', 'PM', 'F', 'GM', 'RIVN', 'LULU',
   'XOM', 'CVX', 'COP', 'EOG', 'SLB', 'PSX', 'MPC', 'VLO',
   'OXY', 'PXD', 'KMI', 'WMB', 'LIN', 'APD', 'SHW', 'ECL',
-  'FCX', 'NEM', 'NUE', 'DOW',
-  // Industrials
-  'CAT', 'BA', 'DE', 'GE', 'HON', 'UNP', 'UPS', 'FDX',
-  'RTX', 'LMT', 'NOC', 'GD', 'MMM', 'EMR', 'ETN', 'ITW',
-  'PH', 'CMI', 'PCAR', 'CSX', 'NSC', 'WM', 'RSG', 'URI',
-  'PWR', 'GWW', 'TT', 'CARR',
-  // Utilities + real estate
+  'FCX', 'NEM', 'NUE', 'DOW', 'CAT', 'BA', 'DE', 'GE',
+  'HON', 'UNP', 'UPS', 'FDX', 'RTX', 'LMT', 'NOC', 'GD',
+  'MMM', 'EMR', 'ETN', 'ITW', 'PH', 'CMI', 'PCAR', 'CSX',
+  'NSC', 'WM', 'RSG', 'URI', 'PWR', 'GWW', 'TT', 'CARR',
   'NEE', 'DUK', 'SO', 'D', 'AEP', 'EXC', 'SRE', 'XEL',
   'PLD', 'AMT', 'EQIX', 'CCI', 'PSA', 'SPG', 'O', 'WELL',
-  // Index/sector ETFs (regime context; no fundamentals)
   'SPY', 'QQQ', 'IWM', 'DIA', 'XLK', 'XLF', 'XLE', 'XLV',
+  'GOOG', 'TSM', 'ASML', 'ARM', 'MPWR', 'TER', 'SWKS', 'QRVO',
+  'GFS', 'LSCC', 'WOLF', 'COHR', 'ALAB', 'OKTA', 'ADSK', 'HUBS',
+  'VEEV', 'APP', 'DT', 'ESTC', 'GTLB', 'CFLT', 'BILL', 'S',
+  'TENB', 'CYBR', 'CHKP', 'GEN', 'PATH', 'AI', 'DOCU', 'ZM',
+  'TWLO', 'U', 'DELL', 'HPE', 'HPQ', 'SMCI', 'WDC', 'STX',
+  'NTAP', 'KEYS', 'GLW', 'APH', 'TEL', 'MSI', 'JNPR', 'BRK.B',
+  'STT', 'NTRS', 'CFG', 'FITB', 'HBAN', 'RF', 'KEY', 'MTB',
+  'CMA', 'ZION', 'ALLY', 'IBKR', 'HOOD', 'SOFI', 'NU', 'CBOE',
+  'MKTX', 'WTW', 'CB', 'AFL', 'HIG', 'AMP', 'TROW', 'FI',
+  'FIS', 'GPN', 'ARES', 'OWL', 'RJF', 'DFS', 'NVO', 'INCY',
+  'ALNY', 'UTHR', 'BMRN', 'EXAS', 'NBIX', 'TECH', 'RPRX', 'ARGX',
+  'BGNE', 'CNC', 'COR', 'BDX', 'IDXX', 'ILMN', 'DXCM', 'RMD',
+  'A', 'WAT', 'IQV', 'MTD', 'ALGN', 'HOLX', 'DGX', 'LH',
+  'GEHC', 'PODD', 'TNDM', 'DASH', 'RBLX', 'SPOT', 'ROKU', 'PINS',
+  'SNAP', 'SE', 'MELI', 'BABA', 'JD', 'LCID', 'NIO', 'XPEV',
+  'LI', 'CVNA', 'CART', 'DRI', 'ETSY', 'EBAY', 'LVS', 'MGM',
+  'NCLH', 'RCL', 'CCL', 'DPZ', 'PHM', 'DHI', 'LEN', 'NVR',
+  'ULTA', 'BURL', 'WSM', 'RH', 'TSCO', 'BBY', 'KMX', 'GPC',
+  'AAP', 'ANF', 'ELF', 'CELH', 'CAVA', 'WING', 'TXRH', 'DECK',
+  'CROX', 'CHWY', 'W', 'K', 'TAP', 'KDP', 'MNST', 'CHD',
+  'CLX', 'SYY', 'KR', 'ADM', 'TSN', 'CPB', 'CAG', 'HRL',
+  'MKC', 'LW', 'BG', 'CASY', 'WBA', 'HES', 'DVN', 'FANG',
+  'HAL', 'BKR', 'TRGP', 'EQT', 'CTRA', 'APA', 'OKE', 'LNG',
+  'SHEL', 'BP', 'TTE', 'ENB', 'EPD', 'DD', 'PPG', 'VMC',
+  'MLM', 'STLD', 'ALB', 'LYB', 'TECK', 'SCCO', 'RIO', 'BHP',
+  'AA', 'CF', 'MOS', 'CE', 'EMN', 'IFF', 'FMC', 'CCJ',
+  'MP', 'LHX', 'TDG', 'ROP', 'IR', 'FAST', 'CTAS', 'OTIS',
+  'HWM', 'JCI', 'DAL', 'UAL', 'LUV', 'XYL', 'HUBB', 'VRT',
+  'GNRC', 'AYI', 'ROK', 'DOV', 'TXT', 'NDSN', 'IEX', 'WAB',
+  'ALLE', 'EXPD', 'CHRW', 'JBHT', 'SAIA', 'ODFL', 'HEI', 'AXON',
+  'PAYX', 'ADP', 'PCG', 'PEG', 'WEC', 'ED', 'ETR', 'AWK',
+  'DTE', 'FE', 'PPL', 'AEE', 'CMS', 'CNP', 'EIX', 'CEG',
+  'VST', 'NRG', 'AES', 'FSLR', 'ENPH', 'SEDG', 'BEPC', 'NXT',
+  'DLR', 'VICI', 'CBRE', 'AVB', 'EQR', 'EXR', 'ARE', 'SBAC',
+  'INVH', 'ELS', 'MAA', 'UDR', 'CPT', 'ESS', 'BXP', 'VTR',
+  'DOC', 'CUBE', 'AMH', 'KIM', 'REG', 'FRT', 'IRM', 'WBD',
+  'LYV', 'OMC', 'IPG', 'FOXA', 'NWSA', 'PARA', 'RDDT', 'TTD',
+  'MTCH', 'IAC', 'DJT', 'IONQ', 'RKLB', 'ASTS', 'SOUN', 'UPST',
+  'AFRM', 'BIRK', 'IREN', 'MSTR', 'MARA', 'RIOT', 'HIMS', 'DNA',
+  'JOBY', 'ACHR', 'ACLS', 'ACMR', 'AEHR', 'AEIS', 'ALGM', 'AMBA',
+  'AMKR', 'APPF', 'ARLO', 'ATEN', 'AVT', 'AZTA', 'CEVA', 'CLS',
+  'COHU', 'CRDO', 'DIOD', 'DOX', 'FORM', 'HLIT', 'IDCC', 'IPGP',
+  'JBL', 'LITE', 'LOGI', 'MKSI', 'MTSI', 'NABL', 'NOVT', 'NVMI',
+  'PDFS', 'PLAB', 'POWI', 'RMBS', 'SANM', 'SIMO', 'SITM', 'SNX',
+  'SYNA', 'TDC', 'TTMI', 'UCTT', 'VECO', 'VIAV', 'VICR', 'VSH',
+  'ZBRA', 'ACIW', 'ALKT', 'ASAN', 'BL', 'BLKB', 'BOX', 'BRZE',
+  'CXM', 'DBX', 'DOCN', 'DUOL', 'FIVN', 'FRSH', 'GWRE', 'IOT',
+  'INST', 'JAMF', 'LSPD', 'MNDY', 'NCNO', 'PAYC', 'PCOR', 'PEGA',
+  'PRGS', 'QTWO', 'QLYS', 'RBRK', 'RNG', 'RPD', 'SEMR', 'SMAR',
+  'SPSC', 'TOST', 'UPWK', 'WK', 'WIX', 'ZETA', 'ZI', 'BMBL',
+  'CARG', 'CARS', 'CNNE', 'DV', 'EB', 'EVER', 'FUBO', 'GRND',
+  'IAS', 'IMAX', 'LQDT', 'MDIA', 'OUT', 'PUBM', 'RAMP', 'SSTK',
+  'TBLA', 'TRIP', 'YELP', 'YY', 'ZH', 'ABCL', 'ADUS', 'AGIO',
+  'ALKS', 'AMED', 'AMRX', 'APLS', 'ARDX', 'ARVN', 'ARWR', 'BCRX',
+  'BEAM', 'BHC', 'BPMC', 'CORT', 'CNMD', 'CPRX', 'CRBU', 'CRL',
+  'CRNX', 'CYRX', 'DNLI', 'DYN', 'EBS', 'EHC', 'ENTA', 'EXEL',
+  'EYE', 'FATE', 'FOLD', 'FULC', 'GERN', 'GH', 'GOSS', 'HAE',
+  'HALO', 'HROW', 'IART', 'IBRX', 'ICUI', 'IMCR', 'IMVT', 'INMD',
+  'INSM', 'IONS', 'IRWD', 'ITCI', 'ITGR', 'KNSA', 'KRYS', 'LQDA',
+  'MDGL', 'MIRM', 'MMSI', 'NARI', 'NTRA', 'NVCR', 'PACB', 'PCRX',
+  'PDCO', 'PEN', 'PRAX', 'PRGO', 'PRTA', 'PTCT', 'RCKT', 'RGEN',
+  'RXRX', 'SGMO', 'SGRY', 'SHC', 'TGTX', 'TMDX', 'TWST', 'VCEL',
+  'VCYT', 'VIR', 'XENE', 'ZLAB', 'AER', 'AFG', 'AGO', 'AMAL',
+  'APAM', 'ARCC', 'ASB', 'BANC', 'BANF', 'BHF', 'BOH', 'BPOP',
+  'CACC', 'CATY', 'CBSH', 'CBU', 'CFR', 'COLB', 'EBC', 'EGBN',
+  'ENVA', 'EWBC', 'FHN', 'FIBK', 'FNB', 'FRME', 'FULT', 'GBCI',
+  'GCMG', 'GSHD', 'HWC', 'JEF', 'LAZ', 'LOB', 'MAIN', 'MC',
+  'NMIH', 'OMF', 'ONB', 'OZK', 'PB', 'PFSI', 'PIPR', 'PRI',
+  'RDN', 'SFBS', 'SLM', 'SNV', 'TCBI', 'TFIN', 'UCB', 'UMBF',
+  'VIRT', 'WAL', 'WBS', 'WEX', 'WSFS', 'WTFC', 'ABG', 'ACVA',
+  'ADNT', 'AEO', 'AN', 'ARCO', 'ASO', 'ATGE', 'BECN', 'BJRI',
+  'BLMN', 'BROS', 'BYD', 'CHDN', 'CHH', 'CHPT', 'CPRI', 'CWH',
+  'DKS', 'DORM', 'DRVN', 'EAT', 'ETD', 'EVRI', 'FIGS', 'FIVE',
+  'FL', 'FND', 'FOXF', 'GIL', 'GME', 'GOOS', 'GPI', 'GIII',
+  'H', 'HBI', 'HGV', 'HOG', 'JACK', 'JWN', 'KAR', 'LESL',
+  'LTH', 'M', 'MOD', 'MOV', 'MTN', 'OLLI', 'PAG', 'PENN',
+  'PLNT', 'PSNY', 'RUSHA', 'SAH', 'SHAK', 'SIG', 'SKX', 'TNL',
+  'TPR', 'VAC', 'VFC', 'VRA', 'VSCO', 'YETI', 'ZUMZ', 'BRBR',
+  'CALM', 'CHEF', 'COKE', 'DAR', 'FDP', 'FLO', 'FRPT', 'GO',
+  'HAIN', 'HELE', 'KLG', 'LANC', 'NOMD', 'POST', 'PPC', 'SAM',
+  'SFM', 'SJM', 'SMPL', 'SPB', 'THS', 'TR', 'UNFI', 'USFD',
+  'UTZ', 'VITL', 'AAON', 'AIN', 'ALG', 'AMRC', 'ATKR', 'AUR',
+  'B', 'BERY', 'CCK', 'CR', 'CSWI', 'CW', 'DNOW', 'ENS',
+  'ERJ', 'FIX', 'FLS', 'GATX', 'GEF', 'GGG', 'HAYW', 'HRI',
+  'IBP', 'ITT', 'JBT', 'JELD', 'KAI', 'KBR', 'KNF', 'LII',
+  'LNN', 'MIDD', 'MTZ', 'MWA', 'NEX', 'NPO', 'NSSC', 'ODC',
+  'OI', 'OSK', 'PACK', 'POWL', 'PRIM', 'REZI', 'RXO', 'SITE',
+  'SSD', 'TEX', 'TKR', 'TREX', 'TRMB', 'VMI', 'WCC', 'WMS',
+  'WTS', 'XPO', 'AEM', 'AG', 'AGI', 'AM', 'AMR', 'AR',
+  'BTG', 'CDE', 'CHRD', 'CNX', 'CRC', 'CRK', 'DMLP', 'DTM',
+  'EGO', 'GEL', 'HCC', 'HL', 'KGC', 'LBRT', 'LTHM', 'MGY',
+  'MTDR', 'MUR', 'NFG', 'NG', 'NOG', 'NOV', 'NXE', 'OII',
+  'OR', 'PAAS', 'PARR', 'PBF', 'PTEN', 'RIG', 'RRC', 'SBSW',
+  'SM', 'TALO', 'TMC', 'TNK', 'UEC', 'UUUU', 'VAL', 'VET',
+  'VIST', 'VNOM', 'WFRD', 'YPF', 'ASH', 'AVNT', 'BALL', 'BCPC',
+  'CENX', 'CLF', 'CMC', 'CSTM', 'ESI', 'EXP', 'FUL', 'HUN',
+  'IOSP', 'KALU', 'KOP', 'KRO', 'MATV', 'MEOH', 'MT', 'NEU',
+  'OLN', 'SEE', 'SLGN', 'SMG', 'TROX', 'WLK', 'WDFC', 'AKR',
+  'ALE', 'AQN', 'AVA', 'BKH', 'BRX', 'COLD', 'CUZ', 'CWT',
+  'DEI', 'EGP', 'EPR', 'FCPT', 'FR', 'GLPI', 'HIW', 'HR',
+  'IDA', 'KRG', 'LAMR', 'LTC', 'MGEE', 'NNN', 'NSA', 'NWE',
+  'OHI', 'ORA', 'OTTR', 'PECO', 'PCH', 'PK', 'PNW', 'POR',
+  'REXR', 'RHP', 'RYN', 'SITC', 'SLG', 'SR', 'STAG', 'STWD',
+  'SWX', 'TAC', 'UGI', 'VNO', 'WPC', 'IVV', 'VOO', 'VTI',
+  'SPLG', 'QQQM', 'QQQJ', 'RSP', 'MDY', 'IJR', 'VB', 'VO',
+  'IWB', 'IWF', 'IWD', 'IWO', 'IWN', 'XLY', 'XLP', 'XLI',
+  'XLU', 'XLRE', 'XLB', 'XLC', 'SMH', 'SOXX', 'XSD', 'IGV',
+  'FDN', 'IBB', 'XBI', 'IHI', 'IHF', 'KRE', 'KBE', 'ITB',
+  'XHB', 'IYT', 'XRT', 'XME', 'XOP', 'OIH', 'TAN', 'ICLN',
+  'URA', 'REMX', 'COPX', 'HYG', 'JNK', 'LQD', 'AGG', 'BND',
+  'GOVT', 'TLT', 'IEF', 'SHY', 'BIL', 'SGOV', 'TIP', 'MUB',
+  'EMB', 'GLD', 'SLV', 'USO', 'UNG', 'DBC', 'DBA', 'UUP',
+  'FXE', 'FXY', 'VEA', 'VWO', 'EFA', 'EEM', 'IEMG', 'VXUS',
+  'ACWI', 'EWG', 'EWJ', 'EWU', 'EWZ', 'INDA', 'MCHI', 'KWEB',
+  'SCHD', 'VIG', 'VYM', 'DGRO', 'ARKK', 'ARKG', 'ARKW', 'IPO',
+  'BOTZ', 'ROBO', 'CLOU', 'BUG', 'HACK', 'FINX', 'ITOT', 'SCHX',
+  'SCHB', 'IJH', 'VBR', 'VBK', 'VOE', 'VOT', 'IVE', 'IVW',
+  'VUG', 'VTV', 'VONG', 'VOOG', 'VOOV', 'SCHG', 'SCHV', 'SPYG',
+  'SPYV', 'IUSG', 'IUSV', 'MTUM', 'QUAL', 'USMV', 'SPLV', 'VLUE',
+  'SPHQ', 'PRF', 'FNDX', 'DGRW', 'NOBL', 'SDY', 'DIV', 'DHS',
+  'RDVY', 'COWZ', 'CALF', 'DON', 'DLN', 'DES', 'FNDA', 'FNDB',
+  'FNDC', 'VGT', 'FTEC', 'IYW', 'VFH', 'IYF', 'VHT', 'IYH',
+  'VDE', 'IYE', 'VIS', 'IYJ', 'VPU', 'IDU', 'VNQ', 'IYR',
+  'RWR', 'VNQI', 'XAR', 'ITA', 'IAI', 'KIE', 'PAVE', 'GRID',
+  'PHO', 'XTL', 'XHE', 'XPH', 'IAT', 'FTXO', 'PBW', 'QCLN',
+  'CIBR', 'SKYY', 'PNQI', 'ARKF', 'ARKQ', 'ARKX', 'DRIV', 'LIT',
+  'BLOK', 'AIQ', 'IRBO', 'HERO', 'NERD', 'MOON', 'UFO', 'BSV',
+  'BIV', 'BLV', 'VGIT', 'VGLT', 'VGSH', 'SPTL', 'SPTS', 'SHV',
+  'MINT', 'NEAR', 'JPST', 'ICSH', 'FLOT', 'FLRN', 'SRLN', 'BKLN',
+  'VCIT', 'VCSH', 'VCLT', 'IGSB', 'IGIB', 'IGLB', 'MBB', 'VMBS',
+  'TFI', 'HYLB', 'ANGL', 'PDBC', 'COMT', 'CPER', 'UGA', 'CORN',
+  'WEAT', 'SOYB', 'GDX', 'GDXJ', 'SIL', 'SILJ', 'URNM', 'BNO',
+  'FXB', 'FXC', 'CYB', 'IBIT', 'FBTC', 'BITB', 'ARKB', 'GBTC',
+  'ETHA', 'FETH', 'IEFA', 'IDEV', 'EFG', 'EFV', 'SCZ', 'VSS',
+  'VEU', 'EPP', 'AAXJ', 'EMXC', 'SPEM', 'ILF', 'EWZS', 'EWC',
+  'EWW', 'EWT', 'EWY', 'EWS', 'EWA', 'EWH', 'FXI', 'ASHR',
+  'EPI', 'EWQ', 'EWN', 'EWL', 'EWP', 'EWI', 'EIDO', 'EPOL',
+  'TUR', 'GREK', 'EZA', 'EWM', 'THD', 'NORW', 'ARGT', 'ECH',
+  'EPHE', 'GXG', 'QAT', 'GEV', 'BLDR', 'EME', 'SKYW', 'BMI',
+  'LOAR', 'SARO', 'CSL', 'SOLV', 'TEM', 'WAY', 'DOCS', 'RVMD',
+  'CVLT', 'NTNX', 'GDDY', 'MANH', 'PCTY', 'SAP', 'KVYO', 'FOUR',
+  'SONY', 'MLI', 'AMCR', 'TPL', 'FCNCA', 'RELX', 'TM',
 ]
 
 export type HorizonKey = 5 | 20 | 60 | 120
@@ -1875,6 +2013,122 @@ function blockBootstrapStat(
   }
 }
 
+/* =========================================================================
+   Selection-inflation analysis (offline honesty layer)
+   -------------------------------------------------------------------------
+   How much of the headline IC / Sharpe is real vs the artifact of screening a
+   feature zoo and a hyperparameter grid? These run in the backtest CLI only.
+   ========================================================================= */
+
+/** Moving-block-bootstrap p-value for H0: mean(series) = 0, two-sided. Blocks
+ * preserve the serial dependence created by overlapping 20d-forward label
+ * windows (the same reason blockBootstrapStat exists), so the null variance is
+ * not understated the way an i.i.d. shuffle would. Add-one smoothed. */
+function blockBootstrapPValueMeanZero(values: number[], blockLen = 3, iterations = 1000): number {
+  const n = values.length
+  if (n < 3) return 1
+  const obsMean = values.reduce((s, v) => s + v, 0) / n
+  const centered = values.map((v) => v - obsMean) // impose the null
+  const eff = Math.min(blockLen, n)
+  let extreme = 0
+  for (let it = 0; it < iterations; it++) {
+    let sum = 0
+    let count = 0
+    while (count < n) {
+      const start = Math.floor(Math.random() * (n - eff + 1))
+      for (let k = 0; k < eff && count < n; k++) {
+        sum += centered[start + k]
+        count++
+      }
+    }
+    if (Math.abs(sum / n) >= Math.abs(obsMean)) extreme++
+  }
+  return (extreme + 1) / (iterations + 1)
+}
+
+export type FeatureFDRResult = {
+  perFeature: Array<{ name: string; meanIC: number; pValue: number; significant: boolean }>
+  q: number
+  significantCount: number
+}
+
+/**
+ * FDR-controlled feature screen. For each feature: per-date cross-sectional IC
+ * (Pearson of the feature vs the 20d RELATIVE forward return) → a block-
+ * bootstrap p-value for mean-IC ≠ 0 → Benjamini-Hochberg across all features.
+ * Replaces the eyeballed "+0.001 importance" cut with a multiple-testing-
+ * controlled keeper set (Harvey-Liu-Zhu 2016; Benjamini-Hochberg 1995).
+ */
+export function featureSelectionFDR(
+  samples: HistoricalSample[],
+  featureNames: string[],
+  q = 0.1,
+  iterations = 2000,
+): FeatureFDRResult {
+  const byDate = new Map<string, number[]>()
+  samples.forEach((s, i) => {
+    const a = byDate.get(s.asOf) ?? []
+    a.push(i)
+    byDate.set(s.asOf, a)
+  })
+  const dateGroups = [...byDate.values()].filter((g) => g.length >= 5)
+  const perFeature: FeatureFDRResult['perFeature'] = []
+  const pValues: number[] = []
+  for (let f = 0; f < featureNames.length; f++) {
+    const icSeries: number[] = []
+    for (const g of dateGroups) {
+      const ic = pearsonCorrelation(
+        g.map((i) => samples[i].features[f]),
+        g.map((i) => samples[i].forwardReturn20dRel),
+      )
+      if (Number.isFinite(ic)) icSeries.push(ic)
+    }
+    const meanIC = icSeries.length ? icSeries.reduce((s, v) => s + v, 0) / icSeries.length : 0
+    const pValue = blockBootstrapPValueMeanZero(icSeries, 3, iterations)
+    perFeature.push({ name: featureNames[f], meanIC, pValue, significant: false })
+    pValues.push(pValue)
+  }
+  const reject = benjaminiHochberg(pValues, q)
+  reject.forEach((sig, i) => (perFeature[i].significant = sig))
+  return { perFeature, q, significantCount: reject.filter(Boolean).length }
+}
+
+/**
+ * Per-feature single-signal long/short quintile Sharpe (non-annualized, the
+ * mean/std of the per-date top-minus-bottom RAW 20d return). The dispersion of
+ * these across the feature zoo estimates the cross-trial Sharpe variance the
+ * Deflated Sharpe Ratio needs (Bailey-López de Prado 2014).
+ */
+export function singleFeatureSharpes(
+  samples: HistoricalSample[],
+  featureNames: string[],
+): number[] {
+  const byDate = new Map<string, number[]>()
+  samples.forEach((s, i) => {
+    const a = byDate.get(s.asOf) ?? []
+    a.push(i)
+    byDate.set(s.asOf, a)
+  })
+  const dateGroups = [...byDate.values()].filter((g) => g.length >= 10)
+  const out: number[] = []
+  for (let f = 0; f < featureNames.length; f++) {
+    const dateReturns: number[] = []
+    for (const g of dateGroups) {
+      const sorted = [...g].sort((a, b) => samples[a].features[f] - samples[b].features[f])
+      const qn = Math.max(1, Math.floor(sorted.length / 5))
+      const mean = (idxs: number[]) =>
+        idxs.reduce((s, i) => s + samples[i].forwardReturn20d, 0) / idxs.length
+      dateReturns.push(mean(sorted.slice(sorted.length - qn)) - mean(sorted.slice(0, qn)))
+    }
+    if (dateReturns.length >= 5) {
+      const m = dateReturns.reduce((s, v) => s + v, 0) / dateReturns.length
+      const sd = Math.sqrt(dateReturns.reduce((s, v) => s + (v - m) ** 2, 0) / dateReturns.length)
+      out.push(sd > 0 ? m / sd : 0)
+    }
+  }
+  return out
+}
+
 /**
  * Nested walk-forward hyperparameter search. Tries a small grid of
  * (numTrees, depth, learningRate) on a held-out slice of the early
@@ -2191,33 +2445,41 @@ export function runWalkForwardBacktest(
    ========================================================================= */
 
 /**
- * Survivors of the 2026-06-10 DEEP run (45 features incl. 13 point-in-
- * time EDGAR fundamentals + survivorship-visibility features; 71,604
- * samples, 221 tickers, 15 years, 70 out-of-sample windows): every
- * feature whose mean permutation importance was >= +0.001 IC.
+ * FDR-CONTROLLED keeper set (replaces the prior eyeballed "+0.001 mean
+ * permutation importance" cut). Each candidate's per-date cross-sectional IC
+ * vs the 20d RELATIVE return is tested against a moving-block-bootstrap null
+ * (respecting the overlapping-label serial dependence), and the 13 survivors
+ * below clear Benjamini-Hochberg FDR at q=0.10 over all 45 candidates on the
+ * 224-name / 15y / 70-window run (2026-06-20). Built by featureSelectionFDR.
  *
- * The 15-year/full-daily-depth run reshuffled the ranking materially vs
- * the 5y study: fund_log_market_cap jumped to #2 (+0.016) — the Banz
- * (1981) size effect is the strongest fundamental signal by far over a
- * long horizon — and log_price_level (CHS 2008) entered at #3. Revenue
- * acceleration (Jegadeesh-Livnat 2006) and margin trend survived; most
- * other fundamentals (net margin, leverage, earnings yield, ROE, the two
- * distress features) measured as noise FOR PREDICTION even though the
- * distress canary uses them as a survivorship diagnostic. Long momentum,
- * a 5y survivor, went negative on the deeper sample.
+ * Why this changed: the old importance cut KEPT 6 features that FAIL a proper
+ * multiple-testing test (price_to_high_60d, fund_revenue_accel, kurt_252d,
+ * sma_50_distance, fund_margin_trend, vol_change_60_20) and DROPPED 8 that
+ * PASS — including momentum_252d and the short-window vols. Deflating the
+ * Sharpe for that 45-feature search (Bailey-López de Prado 2014) gave DSR≈58%
+ * (the old edge was partly the lucky winner of the search); a pre-registered
+ * FDR set removes the free search, so the relevant deflation is just the
+ * 6-config hyperparameter grid (DSR≈95%).
+ *
+ * The survivors are the classic, most-replicated cross-sectional factors:
+ * low-volatility (Ang-Hodrick-Xing-Zhang 2006), size (Banz 1981), illiquidity
+ * (Amihud 2002), momentum (Jegadeesh-Titman 1993), plus survivorship-
+ * visibility (listing age). Annotations are the measured mean per-date IC.
  */
 export const PRUNED_FEATURE_NAMES: string[] = [
-  'volatility_252d',          // +0.019
-  'fund_log_market_cap',      // +0.016  Banz 1981 size
-  'log_price_level',          // +0.009  CHS 2008 PRICE
-  'price_to_high_60d',        // +0.008
-  'range_compression_20d',    // +0.005
-  'amihud_illiquidity_20d',   // +0.003  Amihud 2002
-  'fund_revenue_accel',       // +0.003  Jegadeesh-Livnat 2006
-  'kurt_252d',                // +0.003
-  'sma_50_distance',          // +0.002
-  'fund_margin_trend',        // +0.002
-  'vol_change_60_20',         // +0.001
+  'volatility_252d',             // +0.074  low-vol (Ang et al. 2006)
+  'volatility_60d',              // +0.072
+  'range_compression_20d',       // +0.069
+  'volatility_20d',              // +0.058
+  'listing_age_years',           // -0.053  survivorship visibility
+  'momentum_252d',               // +0.050  Jegadeesh-Titman 1993
+  'fund_log_market_cap',         // -0.046  Banz 1981 size
+  'log_price_level',             // -0.046  CHS 2008
+  'price_velocity_acceleration', // -0.046
+  'amihud_illiquidity_20d',      // +0.043  Amihud 2002
+  'fund_revenue_growth_yoy',     // +0.039
+  'last_close_over_sma_20',      // -0.035
+  'fund_altman_z',               // FDR-significant (smaller |IC|)
 ]
 
 /**
