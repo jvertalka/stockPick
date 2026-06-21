@@ -25,6 +25,7 @@ async function main() {
     PRUNED_FEATURE_NAMES,
     analyzeSurvivorship,
     buildHistoricalDataset,
+    calibrationAndSizingAudit,
     computeFeatureStats,
     featureSelectionFDR,
     labelStepsByRegime,
@@ -246,6 +247,24 @@ async function main() {
     )
   }
   console.log('  (PSR(0)=P(true Sharpe>0); DSR=P(Sharpe beats the best-of-N-trials null). DSR>95% ⇒ robust to selection.)')
+
+  // === Calibration + sizing audit ===
+  const cs = calibrationAndSizingAudit(result.steps, 20)
+  if (cs) {
+    console.log('')
+    console.log('--- Calibration + sizing audit (isotonic P(outperform); conviction vs equal-weight) ---')
+    console.log(
+      `Base rate P(outperform): ${f(cs.baseRate * 100, 1)}%  ·  Brier (held-out ${cs.evalN}): calibrated ${f(cs.brierCalibrated, 4)} vs base-rate ${f(cs.brierBaseRate, 4)} (lower = better)`,
+    )
+    console.log('  reliability  (calibrated prob bin → realized win rate):')
+    for (const b of cs.reliability) {
+      console.log(`    P≈${f(b.binMeanProb * 100, 1)}%  →  won ${f(b.winRate * 100, 1)}%   (n=${b.n})`)
+    }
+    console.log(
+      `Sizing A/B (ann. Sharpe): equal-weight quintile ${f(cs.equalWeightSharpe, 2)}  vs  conviction-weighted ${f(cs.convictionWeightedSharpe, 2)}` +
+        `  (per-20d mean ${f(cs.equalWeightMeanPct, 2)}% vs ${f(cs.convictionWeightedMeanPct, 2)}%)`,
+    )
+  }
 
   // ALWAYS the unpruned samples: the diagnostics index raw features in
   // full 45-column space; pruned arrays would silently misread.

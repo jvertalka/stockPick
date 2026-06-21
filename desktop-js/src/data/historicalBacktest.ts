@@ -14,6 +14,7 @@ import {
   TRADING_DAYS_PER_YEAR,
 } from './quantConfig'
 import { benjaminiHochberg } from './selectionStats'
+import { isotonicRegression, applyIsotonic, brierScore } from './calibration'
 
 export type { DailyBar }
 
@@ -1379,6 +1380,13 @@ export async function buildHistoricalDataset(
   assignSurvivorshipCohorts(samples)
   applyCrossSectionalNormalization(samples)
   applyCrossSectionalReturnDemeaning(samples)
+  // NOTE (2026-06-21): target transforms were tested and REVERTED. Both
+  // ±3-MAD winsorization AND Gaussian rank-transform of the Rel target HURT on
+  // the curated 224 (fair Spearman IC 0.058 -> 0.048 / 0.044; Sharpe 1.54 ->
+  // 1.37 / 1.11; DSR@N=6 97% -> 94% / 79%). The raw relative-return MAGNITUDE
+  // carries ranking signal (the model scales confidence by expected move), so
+  // the pointwise squared loss on the raw demeaned target already ranks well.
+  // Keep the raw target; do not winsorize or rank-transform it.
 
   return {
     samples,
@@ -2127,6 +2135,121 @@ export function singleFeatureSharpes(
     }
   }
   return out
+}
+
+export type CalibrationSizingAudit = {
+  baseRate: number
+  brierCalibrated: number
+  brierBaseRate: number
+  reliability: Array<{ binMeanProb: number; winRate: number; n: number }>
+  equalWeightSharpe: number
+  convictionWeightedSharpe: number
+  equalWeightMeanPct: number
+  convictionWeightedMeanPct: number
+  evalN: number
+}
+
+/**
+ * Offline CALIBRATION + SIZING audit from the per-test-sample (prediction,
+ * realized-relative-return) pairs the walk-forward already captures.
+ *  (a) Calibration: isotonic-fit prediction → P(outperform) on the first 60%
+ *      of OOS dates, then score Brier on the last 40% vs a base-rate
+ *      forecaster (held-out, so no in-sample optimism) + a reliability table.
+ *  (b) Sizing A/B: per date, equal-weight quintile L/S vs conviction-weighted
+ *      (weight ∝ cross-sectionally demeaned prediction, dollar-neutral, matched
+ *      gross), compared by annualized Sharpe — does sizing by the model's own
+ *      magnitude beat the crude quintile cut? (The target-transform tests
+ *      implied the magnitude is informative; this measures it for sizing.)
+ */
+export function calibrationAndSizingAudit(
+  steps: Array<{ testDetails?: Array<{ asOf: string; prediction: number; actual: number }> }>,
+  horizonDays = 20,
+): CalibrationSizingAudit | null {
+  const details = steps.flatMap((s) => s.testDetails ?? [])
+  if (details.length < 500) return null
+  // (a) calibration — fit on early 60% of dates, score on late 40%
+  const dates = [...new Set(details.map((d) => d.asOf))].sort()
+  const splitDate = dates[Math.floor(dates.length * 0.6)]
+  const fit = details.filter((d) => d.asOf < splitDate)
+  const ev = details.filter((d) => d.asOf >= splitDate)
+  const calFit = isotonicRegression(
+    fit.map((d) => d.prediction),
+    fit.map((d) => (d.actual > 0 ? 1 : 0)),
+  )
+  const baseRate = fit.length ? fit.filter((d) => d.actual > 0).length / fit.length : 0.5
+  const evProbs = ev.map((d) => applyIsotonic(calFit, d.prediction))
+  const evOut = ev.map((d) => (d.actual > 0 ? 1 : 0))
+  const brierCalibrated = brierScore(evProbs, evOut)
+  const brierBaseRate = brierScore(
+    ev.map(() => baseRate),
+    evOut,
+  )
+  const reliability: CalibrationSizingAudit['reliability'] = []
+  const idxByProb = ev.map((_, i) => i).sort((a, b) => evProbs[a] - evProbs[b])
+  const bins = 5
+  for (let b = 0; b < bins; b++) {
+    const slice = idxByProb.slice(
+      Math.floor((b * idxByProb.length) / bins),
+      Math.floor(((b + 1) * idxByProb.length) / bins),
+    )
+    if (slice.length === 0) continue
+    reliability.push({
+      binMeanProb: slice.reduce((s, i) => s + evProbs[i], 0) / slice.length,
+      winRate: slice.reduce((s, i) => s + evOut[i], 0) / slice.length,
+      n: slice.length,
+    })
+  }
+  // (b) sizing A/B over all OOS dates
+  const byDate = new Map<string, Array<{ prediction: number; actual: number }>>()
+  for (const d of details) {
+    const a = byDate.get(d.asOf) ?? []
+    a.push(d)
+    byDate.set(d.asOf, a)
+  }
+  const ewRets: number[] = []
+  const cwRets: number[] = []
+  for (const rows of byDate.values()) {
+    const n = rows.length
+    if (n < 10) continue
+    const sorted = [...rows].sort((a, b) => a.prediction - b.prediction)
+    const qn = Math.max(1, Math.floor(n / 5))
+    const meanA = (arr: typeof rows) => arr.reduce((s, r) => s + r.actual, 0) / arr.length
+    ewRets.push(meanA(sorted.slice(n - qn)) - meanA(sorted.slice(0, qn)))
+    const meanPred = rows.reduce((s, r) => s + r.prediction, 0) / n
+    let posSum = 0
+    let negSum = 0
+    const w = rows.map((r) => {
+      const x = r.prediction - meanPred
+      if (x > 0) posSum += x
+      else negSum += -x
+      return x
+    })
+    let cw = 0
+    for (let i = 0; i < n; i++) {
+      const norm =
+        w[i] > 0 ? (posSum > 0 ? w[i] / posSum : 0) : negSum > 0 ? w[i] / negSum : 0
+      cw += norm * rows[i].actual
+    }
+    cwRets.push(cw)
+  }
+  const sharpe = (xs: number[]) => {
+    if (xs.length < 2) return 0
+    const m = xs.reduce((s, v) => s + v, 0) / xs.length
+    const sd = Math.sqrt(xs.reduce((s, v) => s + (v - m) ** 2, 0) / xs.length)
+    return sd > 0 ? (m / sd) * Math.sqrt(TRADING_DAYS_PER_YEAR / horizonDays) : 0
+  }
+  const mean = (xs: number[]) => (xs.length ? xs.reduce((s, v) => s + v, 0) / xs.length : 0)
+  return {
+    baseRate,
+    brierCalibrated,
+    brierBaseRate,
+    reliability,
+    equalWeightSharpe: sharpe(ewRets),
+    convictionWeightedSharpe: sharpe(cwRets),
+    equalWeightMeanPct: mean(ewRets),
+    convictionWeightedMeanPct: mean(cwRets),
+    evalN: ev.length,
+  }
 }
 
 /**
