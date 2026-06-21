@@ -26,12 +26,16 @@ async function main() {
     analyzeSurvivorship,
     buildHistoricalDataset,
     computeFeatureStats,
+    featureSelectionFDR,
     labelStepsByRegime,
     pruneSampleFeatures,
     runWalkForwardBacktest,
+    singleFeatureSharpes,
     summarizeStepsByRegime,
   } = await import('../src/data/historicalBacktest')
   const { cachedFetchDailyBars } = await import('../src/data/marketData')
+  const { sampleSkewness, sampleExcessKurtosis } = await import('../src/data/quantMath')
+  const { deflatedSharpeRatio } = await import('../src/data/selectionStats')
 
   const usePruned = process.argv.includes('--pruned')
   // --persist: PUT the trained bundle to the backend's /ml/model store so
@@ -43,12 +47,26 @@ async function main() {
     | '10y'
     | '15y'
     | 'max'
+  // --tickers-file PATH: train on a custom JSON array of tickers instead of
+  // DEFAULT_BACKTEST_TICKERS (used for size-segment experiments — e.g. an
+  // S&P 400 mid-cap-only or S&P 600 small-cap-only universe).
+  const tickersFileIdx = process.argv.indexOf('--tickers-file')
+  let baseTickers: readonly string[] = DEFAULT_BACKTEST_TICKERS
+  if (tickersFileIdx >= 0) {
+    const { readFileSync } = await import('node:fs')
+    baseTickers = JSON.parse(readFileSync(process.argv[tickersFileIdx + 1], 'utf-8')) as string[]
+  }
+  // --limit N: train on the first N tickers (the curated bellwethers come
+  // first). Used to stage a big retrain — e.g. 500 to de-risk, then 1000.
+  const limitArgIndex = process.argv.indexOf('--limit')
+  const limit = limitArgIndex >= 0 ? Number(process.argv[limitArgIndex + 1]) : 0
+  const tickers = limit > 0 ? baseTickers.slice(0, limit) : baseTickers
 
   console.log(
-    `Building dataset for ${DEFAULT_BACKTEST_TICKERS.length} tickers (${range} bars via proxy)…`,
+    `Building dataset for ${tickers.length} tickers (${range} bars via proxy)…`,
   )
   const started = Date.now()
-  const built = await buildHistoricalDataset(DEFAULT_BACKTEST_TICKERS, {
+  const built = await buildHistoricalDataset(tickers, {
     cadenceDays: 10,
     range,
     onProgress: (current, total, ticker) => {
@@ -183,6 +201,51 @@ async function main() {
       `  ${regime.padEnd(9)} steps=${bucket.steps}  IC ${f(bucket.meanIC)}  hit ${f(bucket.meanHitRate * 100, 1)}%  L/S net ${f(bucket.meanLongShortReturnNet, 2)}%`,
     )
   }
+
+  // === Selection-inflation audit: how much of the headline is real? ===
+  console.log('')
+  console.log('--- Selection-inflation audit (Harvey-Liu-Zhu 2016 FDR; Bailey-López de Prado 2014 DSR) ---')
+  const fdr = featureSelectionFDR(built.samples, HISTORICAL_FEATURE_NAMES, 0.1)
+  const survivors = fdr.perFeature.filter((p) => p.significant).map((p) => p.name)
+  const keptFailing = PRUNED_FEATURE_NAMES.filter((n) => !survivors.includes(n))
+  const newSignificant = survivors.filter((n) => !PRUNED_FEATURE_NAMES.includes(n))
+  console.log(
+    `FDR feature screen (q=${fdr.q}): ${fdr.significantCount}/${HISTORICAL_FEATURE_NAMES.length} features clear multiple-testing control.`,
+  )
+  console.log(
+    `  current ${PRUNED_FEATURE_NAMES.length}-feature keeper set: ${PRUNED_FEATURE_NAMES.length - keptFailing.length} survive, ${keptFailing.length} FAIL FDR` +
+      (keptFailing.length ? ` [${keptFailing.join(', ')}]` : ''),
+  )
+  if (newSignificant.length) {
+    console.log(`  significant but NOT kept (possible dropped signal): ${newSignificant.join(', ')}`)
+  }
+  const fdrRanked = [...fdr.perFeature].sort((a, b) => Math.abs(b.meanIC) - Math.abs(a.meanIC)).slice(0, 12)
+  console.log('  top features by |IC|:   feature              meanIC    p-val   FDR')
+  for (const p of fdrRanked) {
+    console.log(`    ${p.name.padEnd(22)} ${f(p.meanIC).padStart(7)}  ${f(p.pValue).padStart(6)}   ${p.significant ? 'YES' : 'no'}`)
+  }
+  // Deflated Sharpe Ratio of the L/S strategy (per-step return series).
+  const stepRets = result.steps.map((s) => s.longShortReturnNet)
+  const srMean = stepRets.reduce((s, v) => s + v, 0) / stepRets.length
+  const srStd = Math.sqrt(stepRets.reduce((s, v) => s + (v - srMean) ** 2, 0) / stepRets.length)
+  const srHat = srStd > 0 ? srMean / srStd : 0
+  const skew = sampleSkewness(stepRets)
+  const exKurt = sampleExcessKurtosis(stepRets)
+  const sfSharpes = singleFeatureSharpes(built.samples, HISTORICAL_FEATURE_NAMES)
+  const sfMean = sfSharpes.reduce((s, v) => s + v, 0) / Math.max(1, sfSharpes.length)
+  const varSr = sfSharpes.length > 1 ? sfSharpes.reduce((s, v) => s + (v - sfMean) ** 2, 0) / sfSharpes.length : 0.01
+  const nFeat = HISTORICAL_FEATURE_NAMES.length
+  console.log('')
+  console.log(
+    `Deflated Sharpe Ratio (per-step SR=${f(srHat, 3)}, n=${stepRets.length}, skew=${f(skew, 2)}, exKurt=${f(exKurt, 2)}, Var(SR_trials)=${f(varSr, 4)}):`,
+  )
+  for (const nTrials of [6, nFeat, nFeat + 6]) {
+    const { sr0, psr0, dsr } = deflatedSharpeRatio({ srHat, n: stepRets.length, skew, exKurt, nTrials, varSrAcrossTrials: varSr })
+    console.log(
+      `  N=${String(nTrials).padStart(3)} trials -> max-SR0=${f(sr0, 3)}  PSR(0)=${f(psr0 * 100, 1)}%  DSR=${f(dsr * 100, 1)}%`,
+    )
+  }
+  console.log('  (PSR(0)=P(true Sharpe>0); DSR=P(Sharpe beats the best-of-N-trials null). DSR>95% ⇒ robust to selection.)')
 
   // ALWAYS the unpruned samples: the diagnostics index raw features in
   // full 45-column space; pruned arrays would silently misread.
