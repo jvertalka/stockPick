@@ -988,7 +988,7 @@ class DecisionUniverseService {
     final metrics = analytics.metricsBySymbol[symbol];
     if (metrics == null ||
         metrics.barCount < 120 ||
-        DateTime.now().toUtc().difference(metrics.priceAsOf).inDays > 10) {
+        DateTime.now().toUtc().difference(metrics.priceAsOf).inDays > 8) {
       return null;
     }
     final marketMetrics = analytics.marketMetrics;
@@ -1769,22 +1769,37 @@ class DecisionPriceMetrics {
         : bars.length >= 30
         ? 45.0
         : 25.0;
-    final freshnessScore = ageDays <= 5
+    // Tight freshness for daily-bar TRADING: a normal weekend/holiday gap is
+    // <=4 days and stays clean; beyond that the last close is materially stale
+    // and should not back a live buy/sell call at full confidence.
+    final freshnessScore = ageDays <= 2
         ? 100.0
+        : ageDays <= 4
+        ? 82.0
+        : ageDays <= 6
+        ? 55.0
         : ageDays <= 10
-        ? 84.0
-        : ageDays <= 20
-        ? 58.0
-        : 32.0;
+        ? 30.0
+        : 15.0;
     final warnings = <String>[];
     if (bars.length < 120) {
       warnings.add('Short price history lowers model confidence.');
     }
-    if (ageDays > 10) {
-      warnings.add('Latest daily bar is stale.');
+    if (ageDays > 4) {
+      warnings.add('Latest daily bar is $ageDays days old — stale for a live decision.');
     }
     if (dollarVolume < 10000000) {
       warnings.add('Liquidity proxy is thin.');
+    }
+    // Staleness is a HARD ceiling on confidence, not just a 35%-weighted score:
+    // a name with great history but a multi-day-old last bar is not a fresh
+    // decision. >6d falls below the 45 scoreable floor (drops out); 4-6d shown
+    // but de-rated. <=4d (normal weekend/holiday gap) is untouched.
+    var dataConfidenceScore = _bounded(barScore * 0.65 + freshnessScore * 0.35);
+    if (ageDays > 6) {
+      dataConfidenceScore = math.min(dataConfidenceScore, 40);
+    } else if (ageDays > 4) {
+      dataConfidenceScore = math.min(dataConfidenceScore, 60);
     }
     return DecisionPriceMetrics(
       symbol: symbol,
@@ -1809,7 +1824,7 @@ class DecisionPriceMetrics {
       volumeTrendScore: _bounded(50 + (volumeRatio - 1) * 75),
       downsideVolumePressure: _downsideVolumePressure(bars, 20),
       breakoutQualityScore: _breakoutQuality(bars, 60),
-      dataConfidence: _bounded(barScore * 0.65 + freshnessScore * 0.35),
+      dataConfidence: dataConfidenceScore,
       warnings: warnings.isEmpty
           ? const <String>['Price-derived signals are backed by cached OHLCV.']
           : warnings,
@@ -2491,9 +2506,19 @@ class SecFundamentalsService {
       fill('valuationSupport', rank('earningsYield'));
 
       if (fieldsFilled == 0) {
+        // No real fundamentals for this name — quality/margins/valuation stay
+        // fabricated-neutral (50), which otherwise lets a weakly-supported name
+        // look as average/safe as a fully-covered one. Surface the missing
+        // evidence as LOW confidence (so the <55 low-data penalty + the UI data
+        // pill fire) and tag provenance for the trust gate. Non-ETF only — ETFs
+        // are already excluded from this overlay, so they are not penalized.
+        signal['fundamentalsCovered'] = false;
+        final c = (signal['dataConfidence'] as num?)?.toDouble() ?? 50;
+        signal['dataConfidence'] = math.min(c, 50);
         continue;
       }
       covered++;
+      signal['fundamentalsCovered'] = true;
       final filedThrough = fund.filedThrough?.toIso8601String().split('T')[0];
       signal['fundamentalsAsOf'] = filedThrough;
       signal['fundamentalsSource'] = 'sec-edgar-xbrl';

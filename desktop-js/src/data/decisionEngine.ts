@@ -166,7 +166,11 @@ export const scenarios: Scenario[] = [
   },
 ]
 
-export const rawSignals: RawSignal[] = [
+/** SAMPLE fixture — dev/Storybook/test ONLY. Never a runtime default: the
+ * live app feeds real signals from the backend (App.tsx → setSignalInputs).
+ * Renamed loud + the scoreUniverse default removed so this can't be scored as
+ * a real decision feed by accident. */
+export const SAMPLE_RAW_SIGNALS: RawSignal[] = [
   {
     ticker: 'NVDA',
     name: 'NVIDIA',
@@ -880,7 +884,10 @@ function normalCdf(z: number): number {
 }
 
 export function scoreUniverse(
-  signals: RawSignal[] = rawSignals,
+  // REQUIRED — no default. A silent fallback to the SAMPLE_RAW_SIGNALS fixture
+  // would let placeholder data be scored as if it were a real decision feed,
+  // which is unacceptable for buy/sell use. Callers must pass live signals.
+  signals: RawSignal[],
   scenario: ScenarioId = 'base',
 ): DecisionSignal[] {
   // Step 1: scenario application
