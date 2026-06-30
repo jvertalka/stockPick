@@ -1256,8 +1256,14 @@ function DetailPanel({
       <section className={`detail-thesis ${actionTone(signal.action)}`} data-testid="detail-thesis">
         <p>One-line read</p>
         <strong>{synthesizeReason(signal)}</strong>
-        <span>
-          Forecast {formatSignedPercent(signal.forecast20d)} 20d - {signal.probabilityOutperform}% outperform odds - {signal.probabilityDrawdown}% drawdown odds
+        <span
+          title={
+            signal.quantConfirmed
+              ? "Odds from this name's GJR-GARCH / HAR-RV Monte Carlo simulation."
+              : "Heuristic only: rule-derived from the composite factor score (normal-CDF of the alpha Z) — NOT a calibrated or simulated probability. Read it as a relative confidence cue, not a forecast."
+          }
+        >
+          Forecast {formatSignedPercent(signal.forecast20d)} 20d · {signal.probabilityOutperform}% outperform / {signal.probabilityDrawdown}% drawdown {signal.quantConfirmed ? '(simulated)' : '(heuristic)'}
         </span>
       </section>
 
@@ -1317,7 +1323,12 @@ function DetailPanel({
               detail={signal.dataSource ?? 'local'}
               tone={(signal.dataConfidence ?? 65) < 45 ? 'danger' : 'neutral'}
             />
-            <Metric label="Drawdown odds" value={`${signal.probabilityDrawdown}%`} tone="caution" />
+            <Metric
+              label="Drawdown odds"
+              value={`${signal.probabilityDrawdown}%`}
+              detail={signal.quantConfirmed ? 'Monte Carlo' : 'heuristic'}
+              tone="caution"
+            />
             <Metric
               label="Price as of"
               value={formatDate(signal.priceAsOf)}
