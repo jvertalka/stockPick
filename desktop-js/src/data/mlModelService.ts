@@ -167,7 +167,11 @@ async function putModelToBackend(stored: StoredMlModel): Promise<void> {
   try {
     await fetch(`${mlBackendBase()}/ml/model`, {
       method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
+      // X-Oracle-Write: model writes are gated behind this custom header —
+      // it forces a CORS preflight, which the backend only approves for
+      // local origins, so a drive-by website can't overwrite the model that
+      // decides what the app recommends.
+      headers: { 'Content-Type': 'application/json', 'X-Oracle-Write': '1' },
       body: JSON.stringify(stored),
     })
   } catch {

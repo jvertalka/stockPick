@@ -167,10 +167,26 @@ class BackendCacheServer {
   }
 
   Future<void> _handleRequest(HttpRequest request) async {
-    _addCorsHeaders(request.response);
+    // DNS-rebinding defense: a malicious website can re-resolve its own
+    // domain to 127.0.0.1 and then fetch this server SAME-ORIGIN (no CORS
+    // involved). The tell is the Host header, which still names the
+    // attacker's domain — so only local host names are served.
+    if (!_isLocalHostHeader(request.headers.value(HttpHeaders.hostHeader))) {
+      request.response.statusCode = HttpStatus.forbidden;
+      await _writeJson(request.response, {
+        'error': 'host_not_allowed',
+        'detail':
+            'This cache only serves local host names (DNS-rebinding guard).',
+      });
+      return;
+    }
+    _addCorsHeaders(request);
 
     try {
       if (request.method == 'OPTIONS') {
+        // Preflight: CORS approval headers were only attached above for
+        // local origins, so cross-origin writes from arbitrary websites
+        // fail here before the real request is ever sent.
         request.response.statusCode = HttpStatus.noContent;
         await request.response.close();
         return;
@@ -209,6 +225,24 @@ class BackendCacheServer {
           '${config.cacheDirectory.path}${Platform.pathSeparator}ml_trained_model.json',
         );
         if (request.method == 'PUT') {
+          // Write gate: the model store decides what the app RECOMMENDS, so
+          // writes must carry X-Oracle-Write. The header itself is no secret —
+          // the protection is that a CUSTOM header forces a CORS preflight,
+          // and only local origins get preflight approval (_addCorsHeaders),
+          // so a malicious website can never reach this branch. Legit callers
+          // (backtest CLI, in-app persist, a manual curl restore) just send
+          // the header. Native local processes are inside the trust boundary
+          // either way — they could edit ml_trained_model.json on disk.
+          if (request.headers.value('x-oracle-write') == null) {
+            request.response.statusCode = HttpStatus.forbidden;
+            await _writeJson(request.response, {
+              'error': 'write_not_authorized',
+              'detail':
+                  'Model writes require the X-Oracle-Write header (any '
+                  'value). Example: curl -X PUT -H "X-Oracle-Write: 1" ...',
+            });
+            return;
+          }
           final body = await utf8.decoder.bind(request).join();
           final decoded = jsonDecode(body);
           if (decoded is! Map || decoded['model'] == null) {
@@ -300,12 +334,16 @@ class BackendCacheServer {
     // Forward the inbound Authorization + Accept headers so hosts that
     // care (Tradier auths via Bearer; Tradier returns XML by default
     // unless you ask for JSON via Accept) get what the caller intended.
+    // X-Finnhub-Token rides a HEADER instead of a ?token= URL param so the
+    // secret never lands in cache keys/filenames or log lines on disk.
     final authHeader = request.headers.value(HttpHeaders.authorizationHeader);
     final acceptHeader = request.headers.value(HttpHeaders.acceptHeader);
+    final finnhubToken = request.headers.value('x-finnhub-token');
     final entry = await _cache.fetch(
       target,
       authHeader: authHeader,
       acceptHeader: acceptHeader,
+      finnhubToken: finnhubToken,
     );
     request.response.statusCode = entry.statusCode;
     request.response.headers.set(
@@ -394,16 +432,63 @@ class BackendCacheServer {
     return 'application/octet-stream';
   }
 
-  void _addCorsHeaders(HttpResponse response) {
-    response.headers.set(HttpHeaders.accessControlAllowOriginHeader, '*');
-    response.headers.set(
+  /// True when the Host header names THIS machine (any port). Anything else
+  /// is a DNS-rebinding attempt or a misdirected request.
+  bool _isLocalHostHeader(String? hostHeader) {
+    if (hostHeader == null || hostHeader.isEmpty) return false;
+    final lower = hostHeader.toLowerCase();
+    final hostOnly = lower.startsWith('[')
+        ? lower.substring(0, lower.indexOf(']') + 1) // IPv6 literal
+        : lower.split(':').first;
+    return hostOnly == '127.0.0.1' ||
+        hostOnly == 'localhost' ||
+        hostOnly == '[::1]' ||
+        hostOnly == config.host.toLowerCase();
+  }
+
+  /// CORS: was `*`, which let ANY website a browser visits read this server's
+  /// responses and preflight writes through. Now only LOCAL origins (the Vite
+  /// dev server, the packaged Tauri webview) get approval; requests without an
+  /// Origin (curl, the CLI, same-origin pages) need no CORS at all. Internet
+  /// origins get no approval headers, so the browser blocks them — including
+  /// the preflight for PUT /ml/model (see the x-oracle-write gate there).
+  /// Native local processes are inside the trust boundary regardless (they
+  /// can touch the files directly), so this targets the actual attack
+  /// surface: drive-by browser requests.
+  void _addCorsHeaders(HttpRequest request) {
+    final origin = request.headers.value('origin');
+    if (origin == null || origin.isEmpty) return;
+    if (!_isLocalOrigin(origin)) return; // no approval — browser blocks
+    final headers = request.response.headers;
+    headers.set(HttpHeaders.accessControlAllowOriginHeader, origin);
+    headers.set('Vary', 'Origin');
+    headers.set(
       HttpHeaders.accessControlAllowMethodsHeader,
       'GET, PUT, OPTIONS',
     );
-    response.headers.set(
+    headers.set(
       HttpHeaders.accessControlAllowHeadersHeader,
-      'Accept, Authorization, Content-Type',
+      'Accept, Authorization, Content-Type, X-Finnhub-Token, X-Oracle-Write',
     );
+  }
+
+  /// Local-app origins: localhost/127.0.0.1/[::1] on any port (Vite dev,
+  /// previews) plus the Tauri webview origins (http(s)://tauri.localhost on
+  /// Windows WebView2, tauri://localhost elsewhere). Port-agnostic on purpose
+  /// — an exact port list would break the app on a dev-port change, while a
+  /// remote attacker can never present a local origin.
+  bool _isLocalOrigin(String origin) {
+    final lower = origin.toLowerCase();
+    if (lower.startsWith('tauri://')) return true;
+    final uri = Uri.tryParse(lower);
+    if (uri == null || (uri.scheme != 'http' && uri.scheme != 'https')) {
+      return false;
+    }
+    final host = uri.host;
+    return host == 'localhost' ||
+        host == '127.0.0.1' ||
+        host == '::1' ||
+        host == 'tauri.localhost';
   }
 
   Future<void> _writeJson(HttpResponse response, Object value) async {
@@ -448,6 +533,7 @@ class MarketDataCache {
     Uri uri, {
     String? authHeader,
     String? acceptHeader,
+    String? finnhubToken,
   }) async {
     final key = _stableHash(uri.toString());
     final paths = _CachePaths(
@@ -466,6 +552,7 @@ class MarketDataCache {
         policy,
         authHeader: authHeader,
         acceptHeader: acceptHeader,
+        finnhubToken: finnhubToken,
       );
       if (fresh.statusCode >= 200 && fresh.statusCode < 300) {
         await _write(paths, fresh);
@@ -532,8 +619,15 @@ class MarketDataCache {
     _CachePolicy policy, {
     String? authHeader,
     String? acceptHeader,
+    String? finnhubToken,
   }) async {
     final request = await _client.getUrl(uri).timeout(policy.timeout);
+    // Finnhub-only, so the token can never leak to any other upstream host.
+    if (finnhubToken != null &&
+        finnhubToken.isNotEmpty &&
+        uri.host.toLowerCase() == 'finnhub.io') {
+      request.headers.set('X-Finnhub-Token', finnhubToken);
+    }
     request.headers.set(
       HttpHeaders.acceptHeader,
       acceptHeader != null && acceptHeader.isNotEmpty ? acceptHeader : '*/*',
@@ -805,41 +899,20 @@ class DecisionUniverseService {
       isFullUniverse: limit <= 0,
     );
 
+    // Score aggregation ONLY — the backend no longer classifies stocks into
+    // actions. Its old _classifyAction used different thresholds than the
+    // desktop's JS scoreUniverse and disagreed on ~half the labels (see the
+    // engine-divergence audit, desktop-js/tools/engine-divergence.ts), so the
+    // desktop's JS engine is now the SOLE per-stock classifier and this
+    // payload stopped emitting topBuy/topRisk/actionCounts. The summaries
+    // survive purely to aggregate market-tone scores for marketContext.
     final summaries = signals.map(_summaryForRawSignal).toList();
-    final topBuy = summaries
-        .where((row) => row.action == 'Buy Now' || row.action == 'Accumulate')
-        .fold<DecisionSummary?>(null, (best, row) {
-          if (best == null || row.opportunityScore > best.opportunityScore) {
-            return row;
-          }
-          return best;
-        });
-    final topRisk = summaries
-        .where(
-          (row) =>
-              row.action == 'Sell' ||
-              row.action == 'Trim' ||
-              row.action == 'Avoid',
-        )
-        .fold<DecisionSummary?>(null, (best, row) {
-          if (best == null || row.riskPriority > best.riskPriority) {
-            return row;
-          }
-          return best;
-        });
-    final counts = <String, int>{};
-    for (final summary in summaries) {
-      counts.update(summary.action, (value) => value + 1, ifAbsent: () => 1);
-    }
 
     final snapshot = <String, Object?>{
       'asOf': asOf.toIso8601String(),
       'universeSize': fullUniverse.length,
       'returned': signals.length,
       'scenario': scenario,
-      'topBuy': topBuy?.toJson(),
-      'topRisk': topRisk?.toJson(),
-      'actionCounts': counts,
       'priceCoverage': analytics.coverage.toJson(),
     };
     final history = await _appendHistory(snapshot, limit: historyLimit);
@@ -858,7 +931,6 @@ class DecisionUniverseService {
       'marketContext': _marketContextFor(summaries, analytics),
       'rawSignals': signals,
       'history': history,
-      'actionCounts': counts,
       'priceCoverage': analytics.coverage.toJson(),
       'sync': syncResult.toJson(),
       'portfolio': {
@@ -1092,17 +1164,14 @@ class DecisionUniverseService {
     final averageConfidence =
         summaries.fold<double>(0, (sum, row) => sum + row.confidence) /
         summaries.length;
+    // Market-TONE counts from raw scores, not per-stock actions — the backend
+    // no longer classifies stocks (the desktop's JS engine is the sole
+    // classifier). These thresholds only shade the regime/creditStress
+    // aggregate strings; they never label an individual name.
     final buyCount = summaries
-        .where((row) => row.action == 'Buy Now' || row.action == 'Accumulate')
+        .where((row) => row.opportunityScore >= 68 && row.riskScore <= 60)
         .length;
-    final riskCount = summaries
-        .where(
-          (row) =>
-              row.action == 'Sell' ||
-              row.action == 'Trim' ||
-              row.action == 'Avoid',
-        )
-        .length;
+    final riskCount = summaries.where((row) => row.riskScore >= 60).length;
     final breadth = analytics.coverage.usableSymbolCount > 0
         ? analytics.marketBreadth.round()
         : (buyCount / summaries.length * 100).round();
@@ -1841,10 +1910,15 @@ class DecisionPriceMetrics {
   }
 }
 
+/// Score aggregate for one raw signal. NOT a classification: the backend's
+/// per-stock action labeler (_classifyAction) was retired 2026-06-22 after the
+/// engine-divergence audit showed it disagreed with the desktop's JS
+/// scoreUniverse on ~half the labels — two classifiers, one screen. The
+/// desktop's JS engine is the sole classifier; these scores only feed the
+/// market-tone aggregates in _marketContextFor.
 class DecisionSummary {
   const DecisionSummary({
     required this.ticker,
-    required this.action,
     required this.opportunityScore,
     required this.confidence,
     required this.riskScore,
@@ -1853,38 +1927,11 @@ class DecisionSummary {
   });
 
   final String ticker;
-  final String action;
   final int opportunityScore;
   final int confidence;
   final int riskScore;
   final int fragilityScore;
   final int thesisDamage;
-
-  double get riskPriority {
-    final actionPenalty = switch (action) {
-      'Sell' => 28,
-      'Trim' => 18,
-      'Avoid' => 12,
-      _ => 0,
-    };
-    return thesisDamage * 0.45 +
-        riskScore * 0.3 +
-        fragilityScore * 0.18 +
-        actionPenalty;
-  }
-
-  Map<String, Object?> toJson() {
-    return {
-      'ticker': ticker,
-      'action': action,
-      'opportunityScore': opportunityScore,
-      'confidence': confidence,
-      'riskScore': riskScore,
-      'fragilityScore': fragilityScore,
-      'thesisDamage': thesisDamage,
-      'riskPriority': riskPriority,
-    };
-  }
 }
 
 DecisionSummary _summaryForRawSignal(Map<String, Object?> raw) {
@@ -1966,39 +2013,12 @@ DecisionSummary _summaryForRawSignal(Map<String, Object?> raw) {
   );
   return DecisionSummary(
     ticker: raw['ticker'] as String? ?? '',
-    action: _classifyAction(
-      opportunity: opportunity,
-      confidence: confidence,
-      risk: risk,
-      regimeFit: regimeFit,
-      thesisDamage: thesisDamage,
-    ),
     opportunityScore: opportunity.round(),
     confidence: confidence.round(),
     riskScore: risk.round(),
     fragilityScore: fragility.round(),
     thesisDamage: thesisDamage.round(),
   );
-}
-
-String _classifyAction({
-  required double opportunity,
-  required double confidence,
-  required double risk,
-  required double regimeFit,
-  required double thesisDamage,
-}) {
-  if (thesisDamage >= 58 && risk >= 56) return 'Sell';
-  if (thesisDamage >= 54 || (risk >= 58 && opportunity < 66)) return 'Trim';
-  if (risk >= 70 && opportunity < 60) return 'Avoid';
-  if (opportunity >= 74 && confidence >= 68 && regimeFit >= 62 && risk <= 55) {
-    return 'Buy Now';
-  }
-  if (opportunity >= 68 && confidence >= 62 && risk <= 64) {
-    return 'Accumulate';
-  }
-  if (opportunity < 54 && regimeFit < 52) return 'Avoid';
-  return 'Hold';
 }
 
 double _num(Object? value) {
