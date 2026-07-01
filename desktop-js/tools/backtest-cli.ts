@@ -376,7 +376,9 @@ async function main() {
       try {
         const response = await fetch(`${base}/ml/model`, {
           method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
+          // X-Oracle-Write gates model writes (CSRF-proof via CORS preflight
+          // for browsers; native callers like this CLI just send it).
+          headers: { 'Content-Type': 'application/json', 'X-Oracle-Write': '1' },
           body: json,
         })
         const body = (await response.json()) as { ok?: boolean; bytes?: number; detail?: string }

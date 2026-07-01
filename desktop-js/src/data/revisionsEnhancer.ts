@@ -71,7 +71,11 @@ type RecRow = {
 }
 type EarnRow = { period: string; surprisePercent: number | null }
 
-async function safeJson<T>(url: string, timeoutMs = 9000): Promise<T | null> {
+async function safeJson<T>(
+  url: string,
+  headers: Record<string, string> = {},
+  timeoutMs = 9000,
+): Promise<T | null> {
   try {
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), timeoutMs)
@@ -79,7 +83,7 @@ async function safeJson<T>(url: string, timeoutMs = 9000): Promise<T | null> {
     try {
       res = await fetch(url, {
         signal: controller.signal,
-        headers: { Accept: 'application/json' },
+        headers: { Accept: 'application/json', ...headers },
       })
     } finally {
       clearTimeout(timer)
@@ -120,12 +124,19 @@ export async function fetchRevisionRaw(
   const cacheKey = `finnhub:rev:${ticker}`
 
   const enc = encodeURIComponent(ticker)
+  // The token rides the X-Finnhub-Token HEADER, not a ?token= URL param: the
+  // backend proxy caches responses keyed by URL and logs URLs, so a URL-borne
+  // token would land in cache filenames and logs on disk. The proxy forwards
+  // this header to finnhub.io only. (Finnhub accepts both auth forms.)
+  const finnhubAuth = { 'X-Finnhub-Token': token }
   const [rec, earn] = await Promise.all([
     safeJson<RecRow[]>(
-      proxied(`${FINNHUB_BASE}/stock/recommendation?symbol=${enc}&token=${token}`),
+      proxied(`${FINNHUB_BASE}/stock/recommendation?symbol=${enc}`),
+      finnhubAuth,
     ),
     safeJson<EarnRow[]>(
-      proxied(`${FINNHUB_BASE}/stock/earnings?symbol=${enc}&token=${token}`),
+      proxied(`${FINNHUB_BASE}/stock/earnings?symbol=${enc}`),
+      finnhubAuth,
     ),
   ])
 
