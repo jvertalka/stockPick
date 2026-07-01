@@ -437,9 +437,18 @@ class BackendCacheServer {
   bool _isLocalHostHeader(String? hostHeader) {
     if (hostHeader == null || hostHeader.isEmpty) return false;
     final lower = hostHeader.toLowerCase();
-    final hostOnly = lower.startsWith('[')
-        ? lower.substring(0, lower.indexOf(']') + 1) // IPv6 literal
-        : lower.split(':').first;
+    String hostOnly;
+    if (lower.startsWith('[')) {
+      final end = lower.indexOf(']');
+      if (end < 0) return false;
+      // Only an optional :port may follow the bracket — reject junk like
+      // "[::1]evil.com" that would otherwise truncate to the loopback literal.
+      final rest = lower.substring(end + 1);
+      if (rest.isNotEmpty && !rest.startsWith(':')) return false;
+      hostOnly = lower.substring(0, end + 1);
+    } else {
+      hostOnly = lower.split(':').first;
+    }
     return hostOnly == '127.0.0.1' ||
         hostOnly == 'localhost' ||
         hostOnly == '[::1]' ||
@@ -470,6 +479,14 @@ class BackendCacheServer {
       HttpHeaders.accessControlAllowHeadersHeader,
       'Accept, Authorization, Content-Type, X-Finnhub-Token, X-Oracle-Write',
     );
+    // Private Network Access: if a Chromium/WebView2 build preflights a
+    // private-network request (public/local origin -> 127.0.0.1), echo
+    // approval so PNA enforcement can't silently block the packaged app's
+    // tauri.localhost -> loopback calls. Harmless when the browser doesn't ask.
+    if (request.headers.value('access-control-request-private-network') ==
+        'true') {
+      headers.set('Access-Control-Allow-Private-Network', 'true');
+    }
   }
 
   /// Local-app origins: localhost/127.0.0.1/[::1] on any port (Vite dev,
@@ -621,40 +638,83 @@ class MarketDataCache {
     String? acceptHeader,
     String? finnhubToken,
   }) async {
-    final request = await _client.getUrl(uri).timeout(policy.timeout);
-    // Finnhub-only, so the token can never leak to any other upstream host.
-    if (finnhubToken != null &&
-        finnhubToken.isNotEmpty &&
-        uri.host.toLowerCase() == 'finnhub.io') {
-      request.headers.set('X-Finnhub-Token', finnhubToken);
+    // Follow redirects MANUALLY, re-checking the allowlist on EVERY hop.
+    // dart:io auto-follows 3xx by default, so an allowlisted host emitting a
+    // redirect (open-redirect, or a normal 30x) would be chased to an
+    // arbitrary target — a blind-SSRF pivot to internal services — AND dart:io
+    // forwards custom request headers (X-Finnhub-Token, Authorization) across
+    // cross-domain redirects, leaking those secrets. Manual handling closes
+    // both: secrets are re-attached per hop against THIS hop's host, and an
+    // off-allowlist Location is refused rather than fetched.
+    var current = uri;
+    for (var hop = 0; hop < 6; hop++) {
+      final request = await _client.getUrl(current).timeout(policy.timeout);
+      request.followRedirects = false;
+      if (finnhubToken != null &&
+          finnhubToken.isNotEmpty &&
+          current.host.toLowerCase() == 'finnhub.io') {
+        request.headers.set('X-Finnhub-Token', finnhubToken);
+      }
+      request.headers.set(
+        HttpHeaders.acceptHeader,
+        acceptHeader != null && acceptHeader.isNotEmpty ? acceptHeader : '*/*',
+      );
+      request.headers.set(
+        HttpHeaders.userAgentHeader,
+        // SEC fair-access policy requires the User-Agent to identify the
+        // requester with a contact address (https://www.sec.gov/os/accessing-
+        // edgar-data); generic UAs get 403 "Request Rate Threshold Exceeded".
+        current.host.toLowerCase().endsWith('sec.gov')
+            ? 'FinanceOracleWorkstation/1.0 (personal research; '
+                  'joshua.j.vertalka@gmail.com)'
+            : 'FinanceOracleLocalCache/1.0 (${Platform.operatingSystem})',
+      );
+      if (authHeader != null && authHeader.isNotEmpty) {
+        request.headers.set(HttpHeaders.authorizationHeader, authHeader);
+      }
+      final response = await request.close().timeout(policy.timeout);
+      final location = response.headers.value(HttpHeaders.locationHeader);
+      if (response.statusCode >= 300 &&
+          response.statusCode < 400 &&
+          location != null) {
+        await response.drain<void>(); // release the socket before re-issuing
+        final next = current.resolveUri(Uri.parse(location));
+        if (!isAllowed(next)) {
+          return _StoredCacheEntry(
+            statusCode: HttpStatus.forbidden,
+            contentType: 'application/json; charset=utf-8',
+            fetchedAt: DateTime.now().toUtc(),
+            ttl: Duration.zero,
+            body: utf8.encode(
+              jsonEncode({
+                'error': 'redirect_not_allowed',
+                'detail':
+                    'Upstream redirected to a non-allowlisted host; not followed.',
+                'host': next.host,
+              }),
+            ),
+          );
+        }
+        current = next;
+        continue;
+      }
+      final body = await _readAll(response).timeout(policy.timeout);
+      return _StoredCacheEntry(
+        statusCode: response.statusCode,
+        contentType:
+            response.headers.contentType?.toString() ??
+            'application/octet-stream',
+        fetchedAt: DateTime.now().toUtc(),
+        ttl: policy.ttl,
+        body: body,
+      );
     }
-    request.headers.set(
-      HttpHeaders.acceptHeader,
-      acceptHeader != null && acceptHeader.isNotEmpty ? acceptHeader : '*/*',
-    );
-    request.headers.set(
-      HttpHeaders.userAgentHeader,
-      // SEC fair-access policy requires the User-Agent to identify the
-      // requester with a contact address (https://www.sec.gov/os/accessing-
-      // edgar-data); generic UAs get 403 "Request Rate Threshold Exceeded".
-      uri.host.toLowerCase().endsWith('sec.gov')
-          ? 'FinanceOracleWorkstation/1.0 (personal research; '
-                'joshua.j.vertalka@gmail.com)'
-          : 'FinanceOracleLocalCache/1.0 (${Platform.operatingSystem})',
-    );
-    if (authHeader != null && authHeader.isNotEmpty) {
-      request.headers.set(HttpHeaders.authorizationHeader, authHeader);
-    }
-    final response = await request.close().timeout(policy.timeout);
-    final body = await _readAll(response).timeout(policy.timeout);
     return _StoredCacheEntry(
-      statusCode: response.statusCode,
-      contentType:
-          response.headers.contentType?.toString() ??
-          'application/octet-stream',
+      statusCode: HttpStatus.loopDetected,
+      contentType: 'application/json; charset=utf-8',
       fetchedAt: DateTime.now().toUtc(),
-      ttl: policy.ttl,
-      body: body,
+      ttl: Duration.zero,
+      body: utf8.encode(jsonEncode({'error': 'too_many_redirects'})),
     );
   }
 
