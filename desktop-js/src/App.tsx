@@ -112,6 +112,7 @@ import {
 import {
   loadDecisionUniverse,
   type DecisionHistoryPoint,
+  type DecisionSummary,
   type DecisionUniverseResponse,
 } from './data/decisionApi'
 import './App.css'
@@ -1528,6 +1529,10 @@ function App() {
   const [activeScenario, setActiveScenario] = useState<ScenarioId>(persisted.activeScenario ?? 'base')
   const [signalInputs, setSignalInputs] = useState<RawSignal[] | null>(null)
   const [decisionFeed, setDecisionFeed] = useState<DecisionUniverseResponse | null>(null)
+  // Client-side history classified by the SAME JS engine the list uses — the
+  // single source of truth. Replaces the backend's independent _classifyAction
+  // history, which contradicted the list (audit: ~half the labels differed).
+  const [jsHistory, setJsHistory] = useState<DecisionHistoryPoint[]>([])
   const [feedStatus, setFeedStatus] = useState<FeedStatus>('loading')
   const [dataError, setDataError] = useState<string | null>(null)
   const [ownedTickers, setOwnedTickers] = useState<Set<string>>(() => readOwnedTickers())
@@ -1722,6 +1727,46 @@ function App() {
     universe
       .filter((row) => row.action === 'Sell' || row.action === 'Trim' || row.action === 'Avoid')
       .sort(byRiskPriority)[0] ?? undefined
+  // Append a JS-classified history snapshot whenever the leaders change, so
+  // What-Changed + the history list stay consistent with the list/Brief.
+  useEffect(() => {
+    if (universe.length === 0) return
+    const toSummary = (s: typeof topBuy): DecisionSummary | null =>
+      s
+        ? {
+            ticker: s.ticker,
+            action: s.action,
+            opportunityScore: s.opportunityScore,
+            confidence: s.confidence,
+            riskScore: s.riskScore,
+            fragilityScore: s.fragilityScore,
+            thesisDamage: s.thesisDamage,
+          }
+        : null
+    // Appends ONLY when the leaders change (guard returns prev otherwise), so
+    // there is no cascade in steady state — the heuristic is safe to disable.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setJsHistory((prev) => {
+      const head = prev[0]
+      if (
+        head &&
+        (head.topBuy?.ticker ?? null) === (topBuy?.ticker ?? null) &&
+        (head.topRisk?.ticker ?? null) === (topRisk?.ticker ?? null)
+      ) {
+        return prev // leaders unchanged — no duplicate snapshot
+      }
+      const point: DecisionHistoryPoint = {
+        asOf: new Date().toISOString(),
+        universeSize: universe.length,
+        returned: universe.length,
+        scenario: activeScenario,
+        topBuy: toSummary(topBuy),
+        topRisk: toSummary(topRisk),
+      }
+      return [point, ...prev].slice(0, 12)
+    })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [topBuy?.ticker, topRisk?.ticker, activeScenario, universe.length])
   const reviewed = selectedSignal ? reviewedTickers.has(selectedSignal.ticker) : false
   const selectedOwned = selectedSignal ? ownedTickers.has(selectedSignal.ticker) : false
   const selectedWatched = selectedSignal ? watchTickers.has(selectedSignal.ticker) : false
@@ -2612,7 +2657,7 @@ function App() {
               />
             ) : null}
 
-            <WhatChangedStrip history={decisionFeed?.history ?? []} />
+            <WhatChangedStrip history={jsHistory} />
 
             <section className="hero-grid" aria-label="Top decisions right now">
               <LeadDecisionCard
@@ -2747,7 +2792,7 @@ function App() {
             {deskMode === 'radar' ? (
               <MarketRadar
                 context={activeMarketContext}
-                history={decisionFeed?.history ?? []}
+                history={jsHistory}
                 rows={universe}
               />
             ) : null}
