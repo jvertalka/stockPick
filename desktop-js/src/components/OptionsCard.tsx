@@ -77,9 +77,12 @@ export function OptionsCard({ ticker }: { ticker: string }) {
             <span>ATM 30d IV</span>
             <strong>{snapshot.atm30dIv.toFixed(1)}%</strong>
           </div>
-          <div>
-            <span>IV rank</span>
-            <strong>{Math.round(snapshot.impliedVolRank)}</strong>
+          <div title="ESTIMATE — mapped from the ATM 30d IV onto a typical band, NOT a true percentile from a year of historical IV (not cached yet). The ATM IV, skew, and OI beside it ARE observed from live chains.">
+            <span>IV rank (est.)</span>
+            <strong>
+              {Math.round(snapshot.impliedVolRank)}
+              <sup className="proxy-mark"> proxy</sup>
+            </strong>
           </div>
           <div>
             <span>25Δ put skew</span>
