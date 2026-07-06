@@ -578,14 +578,23 @@ function LeadDecisionCard({
       ? signal.invalidation[0] ?? 'Watch for cluster of deterioration signals.'
       : signal.invalidation[0] ?? 'Watch for any single core signal turning down.'
 
+  // A hero-sized verdict is the most confident surface in the app — it must
+  // never present a thin-evidence name as decision-grade. Demote the card's
+  // tone and badge it, same rule as the detail-panel verdict zone.
+  const thin = thinEvidence(signal)
   return (
-    <section className={`hero-card ${tone}`}>
+    <section className={`hero-card ${thin ? 'caution' : tone}`}>
       <div className="hero-lead">
         <p>{label}</p>
         <h2>
           <strong>{signal.action.toUpperCase()}</strong> {signal.ticker}
         </h2>
         <span className="hero-name">{signal.name}</span>
+        {thin ? (
+          <span className="pill danger" title={signalReadiness(signal).detail}>
+            ⚠ Thin evidence — not decision-grade
+          </span>
+        ) : null}
       </div>
       <p className="hero-reason">
         <strong>Why: </strong>
@@ -915,7 +924,7 @@ function DecisionTable({
                         <span>{row.name}</span>
                       </td>
                       <td>
-                        <ActionPill action={row.action} />
+                        <ActionPill action={row.action} caveated={thinEvidence(row)} />
                       </td>
                       <td className="why">{synthesizeReason(row)}</td>
                       <td className="score" title={`Opportunity ${row.opportunityScore} - ${scoreLabel(row.opportunityScore)}`}>
@@ -1065,8 +1074,16 @@ function PortfolioPulseStrip({
       </div>
       <div className="portfolio-pulse-list">
         {pulse.rows.slice(0, 6).map((row) => (
-          <span className={`pill ${actionTone(row.action)}`} key={row.ticker} title={synthesizeReason(row)}>
-            {row.ticker} - {row.action}
+          <span
+            className={`pill ${thinEvidence(row) ? 'caution' : actionTone(row.action)}`}
+            key={row.ticker}
+            title={
+              thinEvidence(row)
+                ? `Thin evidence — not decision-grade. ${synthesizeReason(row)}`
+                : synthesizeReason(row)
+            }
+          >
+            {thinEvidence(row) ? '⚠ ' : ''}{row.ticker} - {row.action}
           </span>
         ))}
         {pulse.rows.length > 6 ? <span className="pulse-more">+{pulse.rows.length - 6} more</span> : null}
@@ -2116,6 +2133,28 @@ function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mlModel, refreshCount, ownedKey, watchKey])
 
+  // Ask the backend once which live feeds have a server-side token wired
+  // (tokens no longer ship in this bundle). Retries every 5s while the backend
+  // is still warming. Flipping providersReady re-renders the options provider
+  // chip and re-runs the options + revision feed effects below. Declared ABOVE
+  // those effects because their dependency arrays reference it at render time.
+  const [providersReady, setProvidersReady] = useState(false)
+  useEffect(() => {
+    let cancelled = false
+    let timer: number | undefined
+    const attempt = async () => {
+      await loadProviderCapabilities()
+      if (cancelled) return
+      if (providerCapabilitiesLoaded()) setProvidersReady((v) => !v)
+      else timer = window.setTimeout(attempt, 5000)
+    }
+    void attempt()
+    return () => {
+      cancelled = true
+      if (timer) window.clearTimeout(timer)
+    }
+  }, [])
+
   // Background enhancement: pull real Tradier (or other provider) snapshots
   // for the top ~20 tickers we're most likely to look at. As each snapshot
   // arrives, we splice it into optionsSnapshots which triggers re-scoring.
@@ -2141,30 +2180,12 @@ function App() {
     }
     // Refetch when refresh count changes (manual re-rank) or owned/watch
     // changes meaningfully. We deliberately do NOT depend on the full
-    // universe array because it remounts on every score run.
+    // universe array because it remounts on every score run. providersReady
+    // is a dep for the same reason as the revisions effect: the capability
+    // map loads async, so the first run may see the stub provider — without
+    // the dep, a configured Tradier feed would silently never be fetched.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [refreshCount, ownedKey, watchKey])
-
-  // Ask the backend once which live feeds have a server-side token wired
-  // (tokens no longer ship in this bundle). Retries every 5s while the backend
-  // is still warming. Flipping providersReady re-renders the options provider
-  // chip and re-runs the revision-feed effect below.
-  const [providersReady, setProvidersReady] = useState(false)
-  useEffect(() => {
-    let cancelled = false
-    let timer: number | undefined
-    const attempt = async () => {
-      await loadProviderCapabilities()
-      if (cancelled) return
-      if (providerCapabilitiesLoaded()) setProvidersReady((v) => !v)
-      else timer = window.setTimeout(attempt, 5000)
-    }
-    void attempt()
-    return () => {
-      cancelled = true
-      if (timer) window.clearTimeout(timer)
-    }
-  }, [])
+  }, [refreshCount, ownedKey, watchKey, providersReady])
 
   // Background analyst-revision enhancement (Finnhub free tier). Fills the
   // dormant revisionTrend / surpriseMomentum growth-factor inputs for a
