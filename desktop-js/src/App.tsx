@@ -87,7 +87,7 @@ import { cachedComputeQuantAnalysis, type QuantAnalysis } from './data/quantAnal
 import {
   getRegimeGate,
   loadModel,
-  logLivePrediction,
+  logLivePredictions,
   predictForUniverse,
   reconcilePredictions,
   type LivePrediction,
@@ -2122,17 +2122,22 @@ function App() {
     void predictForUniverse(tickers, mlModel).then((predictions) => {
       if (cancelled) return
       setMlPredictions(predictions)
-      // Log each prediction so the scorecard has data later; the model stamp
-      // lets samples be attributed across retrains.
-      predictions.forEach((prediction) => {
-        void logLivePrediction(prediction, mlModel.trainedAt)
-      })
+      // Log the whole batch in ONE write so the scorecard has data later —
+      // 30 concurrent single-entry writes raced each other and dropped ~29
+      // of 30. The model stamp attributes samples across retrains.
+      void logLivePredictions([...predictions.values()], mlModel.trainedAt)
     })
     return () => {
       cancelled = true
     }
+    // universe.length is a dep (the raw array remounts every score run, so
+    // depending on it would loop): on a warm backend the model loads BEFORE
+    // the first universe render, so without it this effect runs once against
+    // an empty universe and never fires again — no ML predictions, no
+    // prediction logging, silently, until a manual re-rank. Length flips
+    // 0→N exactly once when the feed populates.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mlModel, refreshCount, ownedKey, watchKey])
+  }, [mlModel, refreshCount, ownedKey, watchKey, universe.length])
 
   // Ask the backend once which live feeds have a server-side token wired
   // (tokens no longer ship in this bundle). Retries every 5s while the backend
@@ -2181,12 +2186,14 @@ function App() {
     }
     // Refetch when refresh count changes (manual re-rank) or owned/watch
     // changes meaningfully. We deliberately do NOT depend on the full
-    // universe array because it remounts on every score run. providersReady
-    // is a dep for the same reason as the revisions effect: the capability
-    // map loads async, so the first run may see the stub provider — without
-    // the dep, a configured Tradier feed would silently never be fetched.
+    // universe array because it remounts on every score run — universe.length
+    // stands in for it (flips 0→N once), so the effect can't die by running
+    // before the universe exists. providersReady is a dep for the same
+    // reason: the capability map loads async, so the first run may see the
+    // stub provider — without it, a configured Tradier feed would silently
+    // never be fetched.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [refreshCount, ownedKey, watchKey, providersReady])
+  }, [refreshCount, ownedKey, watchKey, providersReady, universe.length])
 
   // Background analyst-revision enhancement (Finnhub free tier). Fills the
   // dormant revisionTrend / surpriseMomentum growth-factor inputs for a
@@ -2240,8 +2247,9 @@ function App() {
     return () => {
       cancelled = true
     }
+    // universe.length: same guard-vs-deps race as the options effect above.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [refreshCount, ownedKey, watchKey, providersReady])
+  }, [refreshCount, ownedKey, watchKey, providersReady, universe.length])
 
   // Background quant analysis: for the top tickers we'd actually trade,
   // run Monte Carlo + GARCH + BSM. Each takes 50-100ms so we cap at 12
@@ -2270,8 +2278,10 @@ function App() {
     return () => {
       cancelled = true
     }
+    // universe.length: same guard-vs-deps race as the effects above — without
+    // it, a warm-backend boot leaves quant overlays permanently empty.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [refreshCount, ownedKey, watchKey])
+  }, [refreshCount, ownedKey, watchKey, universe.length])
 
   // Fire native notification when an owned ticker first hits a Sell or
   // a watched ticker first becomes a Buy. notifyOnce guards against

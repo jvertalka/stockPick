@@ -166,7 +166,7 @@ export function ModelDecayMonitor() {
       ) : (
         <p className="backtest-section-note">
           {card && card.pendingTotal > 0
-            ? `${card.pendingTotal} predictions logged and waiting for their 20-day windows to close` +
+            ? `${card.pendingTotal} prediction${card.pendingTotal === 1 ? '' : 's'} logged and waiting for their 20-day windows to close` +
               (card.nextEvaluable ? ` — the first becomes scoreable around ${card.nextEvaluable}.` : '.')
             : 'No predictions logged yet. They start logging automatically while the app is open.'}
           {card && card.realizedTotal > 0 && card.datesUsed === 0

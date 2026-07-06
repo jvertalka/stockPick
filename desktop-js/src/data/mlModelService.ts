@@ -520,29 +520,47 @@ export async function predictForUniverse(
    Prediction logging — for live decay monitoring
    ========================================================================= */
 
-export async function logLivePrediction(
-  prediction: LivePrediction,
+/**
+ * Log a BATCH of predictions in one read-modify-write.
+ *
+ * This must be one transaction-shaped operation: the old per-prediction
+ * logger was fired 30 times concurrently by the predict effect, and each
+ * call did kvGet → push one → kvSet on the SAME key. All 30 reads saw the
+ * same starting array, so the last write won and ~29 of 30 predictions
+ * were silently dropped (measured live: 1 of 30 survived). That starved
+ * the scorecard's per-date cross-sections at the source.
+ *
+ * DEDUPE by (ticker, asOf): the predict effect re-runs on refresh /
+ * owned-watch changes, so the same (ticker, bar-date) prediction would
+ * otherwise be appended many times a day, multiplying those rows in the
+ * live IC and skewing it toward whatever names refresh most. One logged
+ * prediction per ticker per bar date.
+ */
+export async function logLivePredictions(
+  predictions: LivePrediction[],
   modelTrainedAt?: string,
 ): Promise<void> {
+  if (predictions.length === 0) return
   const existing = (await kvGet<LoggedPrediction[]>(PREDICTION_LOG_KEY)) ?? []
-  // DEDUPE by (ticker, asOf): the predict effect re-runs on every refresh /
-  // owned-watch change, so the same (ticker, bar-date) prediction would be
-  // appended many times a day, multiplying those rows in the decay-monitor
-  // IC and skewing it toward whatever names happen to refresh most. One
-  // logged prediction per ticker per bar date.
-  if (existing.some((e) => e.ticker === prediction.ticker && e.asOf === prediction.asOf)) {
-    return
+  const seen = new Set(existing.map((e) => `${e.ticker}|${e.asOf}`))
+  let appended = false
+  for (const prediction of predictions) {
+    const key = `${prediction.ticker}|${prediction.asOf}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    appended = true
+    existing.push({
+      ticker: prediction.ticker,
+      asOf: prediction.asOf,
+      predictedReturn20d: prediction.predictedReturn20d,
+      // Interval bounds + model stamp ride along so the scorecard can audit
+      // 80%-coverage and attribute samples across retrains.
+      p10Return20d: prediction.p10Return20d,
+      p90Return20d: prediction.p90Return20d,
+      modelTrainedAt,
+    })
   }
-  existing.push({
-    ticker: prediction.ticker,
-    asOf: prediction.asOf,
-    predictedReturn20d: prediction.predictedReturn20d,
-    // Interval bounds + model stamp ride along so the scorecard can audit
-    // 80%-coverage and attribute samples across retrains.
-    p10Return20d: prediction.p10Return20d,
-    p90Return20d: prediction.p90Return20d,
-    modelTrainedAt,
-  })
+  if (!appended) return
   // Cap at 5,000 entries to avoid unbounded IDB growth
   const trimmed = existing.length > 5000 ? existing.slice(-5000) : existing
   await kvSet(PREDICTION_LOG_KEY, trimmed)
