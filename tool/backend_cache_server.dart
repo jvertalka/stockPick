@@ -710,10 +710,16 @@ class MarketDataCache {
       // Authorization: an inbound Bearer wins (back-compat / the CLI); else the
       // server-held Tradier token is injected as a Bearer — and ONLY toward the
       // Tradier hosts, so the secret never rides to SEC/finnhub/etc.
+      // The inbound header is pinned to the host the caller originally
+      // requested: without that pin, a cross-domain 30x from one allowlisted
+      // host to another would re-send the caller's Bearer to the new host —
+      // the same cross-domain leak this loop exists to prevent.
       final isTradierHost =
           host == 'sandbox.tradier.com' || host == 'api.tradier.com';
       String? effectiveAuth;
-      if (authHeader != null && authHeader.isNotEmpty) {
+      if (authHeader != null &&
+          authHeader.isNotEmpty &&
+          host == uri.host.toLowerCase()) {
         effectiveAuth = authHeader;
       } else if (isTradierHost && kServerTradierToken.isNotEmpty) {
         effectiveAuth = 'Bearer $kServerTradierToken';
