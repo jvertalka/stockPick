@@ -3267,6 +3267,14 @@ table.decision-table td.actions button {
   line-height: 1.5;
 }
 
+/* Live prediction scorecard: one pill per scored prediction day. */
+.scorecard-dates {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 10px;
+}
+
 .decile-plot {
   display: grid;
   gap: 4px;
