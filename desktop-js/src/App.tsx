@@ -2122,9 +2122,10 @@ function App() {
     void predictForUniverse(tickers, mlModel).then((predictions) => {
       if (cancelled) return
       setMlPredictions(predictions)
-      // Log each prediction so the decay monitor has data later
+      // Log each prediction so the scorecard has data later; the model stamp
+      // lets samples be attributed across retrains.
       predictions.forEach((prediction) => {
-        void logLivePrediction(prediction)
+        void logLivePrediction(prediction, mlModel.trainedAt)
       })
     })
     return () => {

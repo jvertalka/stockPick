@@ -5,10 +5,11 @@ import {
   HISTORICAL_FEATURE_NAMES,
   type RegimeLabel,
 } from './historicalBacktest'
-import { kvGet, kvSet, type DecisionLogEntry } from './storage'
+import { kvGet, kvSet } from './storage'
 import {
   fitMarkovRegime,
   logReturns,
+  pearsonCorrelation,
   predictGradientBoosting,
   type GradientBoostingModel,
 } from './quantMath'
@@ -100,8 +101,15 @@ export type LivePrediction = {
 export type LoggedPrediction = {
   ticker: string
   asOf: string                  // ISO date when prediction was made
-  predictedReturn20d: number    // %
-  realizedReturn20d?: number    // % — populated 20 trading days later
+  predictedReturn20d: number    // % — RELATIVE (cross-sectionally demeaned) forecast
+  /** 80% interval bounds at prediction time (relative-return units), when
+   * quantile models were loaded — lets the scorecard audit coverage later. */
+  p10Return20d?: number
+  p90Return20d?: number
+  /** trainedAt stamp of the model that made this prediction, so scorecard
+   * windows can be interpreted across retrains. */
+  modelTrainedAt?: string
+  realizedReturn20d?: number    // % ABSOLUTE — populated 20 trading days later
   realizedAt?: string
 }
 
@@ -514,6 +522,7 @@ export async function predictForUniverse(
 
 export async function logLivePrediction(
   prediction: LivePrediction,
+  modelTrainedAt?: string,
 ): Promise<void> {
   const existing = (await kvGet<LoggedPrediction[]>(PREDICTION_LOG_KEY)) ?? []
   // DEDUPE by (ticker, asOf): the predict effect re-runs on every refresh /
@@ -528,10 +537,20 @@ export async function logLivePrediction(
     ticker: prediction.ticker,
     asOf: prediction.asOf,
     predictedReturn20d: prediction.predictedReturn20d,
+    // Interval bounds + model stamp ride along so the scorecard can audit
+    // 80%-coverage and attribute samples across retrains.
+    p10Return20d: prediction.p10Return20d,
+    p90Return20d: prediction.p90Return20d,
+    modelTrainedAt,
   })
   // Cap at 5,000 entries to avoid unbounded IDB growth
   const trimmed = existing.length > 5000 ? existing.slice(-5000) : existing
   await kvSet(PREDICTION_LOG_KEY, trimmed)
+}
+
+/** Read the raw prediction log (for the scorecard). */
+export async function loadPredictionLog(): Promise<LoggedPrediction[]> {
+  return (await kvGet<LoggedPrediction[]>(PREDICTION_LOG_KEY)) ?? []
 }
 
 /**
@@ -559,6 +578,11 @@ export async function reconcilePredictions(): Promise<void> {
       updated.push(entry)
       continue
     }
+    // A pending entry more than a year old will never reconcile (delisted
+    // ticker, or the provider re-stamped history so the asOf bar no longer
+    // exists). Drop it instead of letting it sit as "pending" forever and
+    // quietly misstate how much evidence is still on its way.
+    if (daysSince > 370) continue
     let bars = barCache.get(entry.ticker)
     if (!bars) {
       bars = await cachedFetchDailyBars(entry.ticker, '5y')
@@ -590,63 +614,187 @@ export async function reconcilePredictions(): Promise<void> {
   await kvSet(PREDICTION_LOG_KEY, updated)
 }
 
-/**
- * Compute rolling IC over the most recent N realized predictions.
- * Returns null if fewer than 30 realized predictions exist (too noisy).
- */
-export async function computeLiveModelIc(
-  windowSize = 100,
-): Promise<{
-  ic: number
-  hitRate: number
-  meanRealized: number
-  sampleSize: number
-  oldest: string
-  newest: string
-} | null> {
-  const log = (await kvGet<LoggedPrediction[]>(PREDICTION_LOG_KEY)) ?? []
-  const realized = log.filter((entry) => entry.realizedReturn20d != null)
-  if (realized.length < 30) return null
-  const recent = realized.slice(-windowSize)
-  const predicted = recent.map((entry) => entry.predictedReturn20d)
-  const actual = recent.map((entry) => entry.realizedReturn20d!)
+/* =========================================================================
+   Live prediction scorecard
+   -------------------------------------------------------------------------
+   The model predicts RELATIVE returns (cross-sectionally demeaned per date —
+   Improvement #1), and the backtest's meanIC is measured against that same
+   relative target. The reconciler, though, can only observe each ticker's
+   ABSOLUTE price path. The old live-IC pooled all realized entries across
+   dates and correlated relative forecasts against absolute outcomes — so a
+   month where everything rose +8% injected market movement the model never
+   claimed to predict, and the "drift vs backtest IC" comparison was
+   apples-to-oranges.
 
-  const meanP = predicted.reduce((sum, value) => sum + value, 0) / predicted.length
-  const meanA = actual.reduce((sum, value) => sum + value, 0) / actual.length
-  let cov = 0
-  let varP = 0
-  let varA = 0
-  for (let i = 0; i < predicted.length; i++) {
-    cov += (predicted[i] - meanP) * (actual[i] - meanA)
-    varP += (predicted[i] - meanP) ** 2
-    varA += (actual[i] - meanA) ** 2
-  }
-  const ic = varP > 0 && varA > 0 ? cov / Math.sqrt(varP * varA) : 0
-  const hits = predicted.filter((value, i) => Math.sign(value) === Math.sign(actual[i])).length
-  return {
-    ic,
-    hitRate: hits / predicted.length,
-    meanRealized: meanA,
-    sampleSize: predicted.length,
-    oldest: recent[0].asOf,
-    newest: recent[recent.length - 1].asOf,
-  }
+   The fix: score each prediction DATE as its own cross-section, exactly like
+   training. Within one date, correlating predictions against absolute
+   realized returns is identical to correlating against demeaned returns
+   (correlation ignores a constant shift shared by the whole group), so the
+   market component cancels and the per-date IC is the same quantity family
+   the backtest reports. The scorecard averages per-date ICs over the most
+   recent dates.
+   ========================================================================= */
+
+export type LiveScorecard = {
+  /** Mean of per-date Pearson ICs — comparable to the backtest's meanIC. */
+  meanIc: number | null
+  /** Mean of per-date Spearman rank ICs (robust to outliers). */
+  meanRankIc: number | null
+  /** Within-date direction agreement: predicted above the date's average
+   * where realized was also above the date's average. */
+  hitRate: number | null
+  /** Mean per-date top-vs-bottom prediction-quintile realized spread (%,
+   * demeaned). Only dates with enough names to cut quintiles. */
+  quintileSpreadPct: number | null
+  /** Share of interval-carrying entries whose demeaned realized return
+   * landed inside [p10, p90]. Target ≈ 0.80 by construction. */
+  intervalCoverage: number | null
+  intervalSamples: number
+  datesUsed: number
+  realizedUsed: number
+  realizedTotal: number
+  pendingTotal: number
+  /** Earliest date a pending prediction becomes scoreable (asOf + 30d). */
+  nextEvaluable: string | null
+  windowOldest: string | null
+  windowNewest: string | null
+  /** Most recent participating dates (ascending), for display. */
+  recentDates: Array<{ date: string; n: number; ic: number }>
 }
 
-/** Decision-log integration: also log every prediction into the engine
- * decision log so it shows up alongside the rule-based history. */
-export function predictionToLogEntry(
-  prediction: LivePrediction,
-  modelMeanIc: number,
-): DecisionLogEntry {
+function averageRanks(values: number[]): number[] {
+  const order = values
+    .map((value, index) => ({ value, index }))
+    .sort((a, b) => a.value - b.value)
+  const ranks = new Array<number>(values.length)
+  let i = 0
+  while (i < order.length) {
+    let j = i
+    while (j + 1 < order.length && order[j + 1].value === order[i].value) j++
+    const avgRank = (i + j) / 2 + 1 // average rank for ties, 1-based
+    for (let k = i; k <= j; k++) ranks[order[k].index] = avgRank
+    i = j + 1
+  }
+  return ranks
+}
+
+/**
+ * Score the prediction log. Pure (no I/O) so it is unit-testable.
+ *
+ * minBreadth mirrors training's demeaning floor (MIN_BREADTH = 5 in
+ * applyCrossSectionalReturnDemeaning): a date with fewer realized names has
+ * no meaningful cross-section and is excluded. maxDates bounds the window to
+ * the most recent participating dates so decay shows up rather than being
+ * averaged away by ancient history.
+ */
+export function computeLiveScorecard(
+  log: LoggedPrediction[],
+  opts: { minBreadth?: number; spreadMinBreadth?: number; maxDates?: number } = {},
+): LiveScorecard {
+  const minBreadth = opts.minBreadth ?? 5
+  const spreadMinBreadth = opts.spreadMinBreadth ?? 10
+  const maxDates = opts.maxDates ?? 40
+
+  const realized = log.filter(
+    (e) =>
+      e.realizedReturn20d != null &&
+      Number.isFinite(e.realizedReturn20d) &&
+      Number.isFinite(e.predictedReturn20d),
+  )
+  const pending = log.filter((e) => e.realizedReturn20d == null)
+
+  // Earliest scoreable moment among pending predictions: asOf + 30 calendar
+  // days (the reconciler's own gate). asOf is a YYYY-MM-DD bar date.
+  let nextEvaluable: string | null = null
+  for (const entry of pending) {
+    const t = new Date(`${entry.asOf.slice(0, 10)}T00:00:00Z`).getTime()
+    if (!Number.isFinite(t)) continue
+    const evaluable = new Date(t + 30 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10)
+    if (nextEvaluable == null || evaluable < nextEvaluable) nextEvaluable = evaluable
+  }
+
+  // Group by prediction date; keep dates with a real cross-section.
+  const byDate = new Map<string, LoggedPrediction[]>()
+  for (const entry of realized) {
+    const arr = byDate.get(entry.asOf) ?? []
+    arr.push(entry)
+    byDate.set(entry.asOf, arr)
+  }
+  const participating = [...byDate.entries()]
+    .filter(([, entries]) => entries.length >= minBreadth)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .slice(-maxDates)
+
+  const perDateIc: Array<{ date: string; n: number; ic: number }> = []
+  const rankIcs: number[] = []
+  const spreads: number[] = []
+  let hits = 0
+  let hitSamples = 0
+  let covered = 0
+  let intervalSamples = 0
+  let realizedUsed = 0
+
+  for (const [date, entries] of participating) {
+    const predicted = entries.map((e) => e.predictedReturn20d)
+    const actual = entries.map((e) => e.realizedReturn20d!)
+    const n = entries.length
+    realizedUsed += n
+
+    perDateIc.push({ date, n, ic: pearsonCorrelation(predicted, actual) })
+    rankIcs.push(pearsonCorrelation(averageRanks(predicted), averageRanks(actual)))
+
+    // Demean within the date — the market's shared move cancels, leaving the
+    // relative outcome the model actually forecast.
+    const meanP = predicted.reduce((s, v) => s + v, 0) / n
+    const meanA = actual.reduce((s, v) => s + v, 0) / n
+    for (let i = 0; i < n; i++) {
+      hits += Math.sign(predicted[i] - meanP) === Math.sign(actual[i] - meanA) ? 1 : 0
+      hitSamples++
+      const e = entries[i]
+      if (
+        e.p10Return20d != null &&
+        e.p90Return20d != null &&
+        Number.isFinite(e.p10Return20d) &&
+        Number.isFinite(e.p90Return20d)
+      ) {
+        intervalSamples++
+        const rel = actual[i] - meanA
+        if (rel >= e.p10Return20d && rel <= e.p90Return20d) covered++
+      }
+    }
+
+    // Top-vs-bottom prediction-quintile realized spread (demeaned %).
+    if (n >= spreadMinBreadth) {
+      const k = Math.floor(n / 5)
+      const sorted = entries
+        .map((e, i) => ({ p: e.predictedReturn20d, a: actual[i] - meanA }))
+        .sort((x, y) => y.p - x.p)
+      const top = sorted.slice(0, k)
+      const bottom = sorted.slice(-k)
+      const meanTop = top.reduce((s, v) => s + v.a, 0) / k
+      const meanBottom = bottom.reduce((s, v) => s + v.a, 0) / k
+      spreads.push(meanTop - meanBottom)
+    }
+  }
+
+  const mean = (xs: number[]) =>
+    xs.length > 0 ? xs.reduce((s, v) => s + v, 0) / xs.length : null
+
   return {
-    ticker: prediction.ticker,
-    asOf: new Date().toISOString(),
-    action: prediction.predictedReturn20d > 0 ? 'Buy Now' : 'Avoid',
-    opportunityScore: 50 + prediction.predictedReturn20d * 5,
-    riskScore: 50,
-    confidence: 50 + Math.abs(modelMeanIc) * 200,
-    reason: `ML model 20d forecast: ${prediction.predictedReturn20d >= 0 ? '+' : ''}${prediction.predictedReturn20d.toFixed(2)}%`,
+    meanIc: mean(perDateIc.map((d) => d.ic)),
+    meanRankIc: mean(rankIcs),
+    hitRate: hitSamples > 0 ? hits / hitSamples : null,
+    quintileSpreadPct: mean(spreads),
+    intervalCoverage: intervalSamples > 0 ? covered / intervalSamples : null,
+    intervalSamples,
+    datesUsed: participating.length,
+    realizedUsed,
+    realizedTotal: realized.length,
+    pendingTotal: pending.length,
+    nextEvaluable,
+    windowOldest: participating.length > 0 ? participating[0][0] : null,
+    windowNewest: participating.length > 0 ? participating[participating.length - 1][0] : null,
+    recentDates: perDateIc.slice(-12),
   }
 }
 
