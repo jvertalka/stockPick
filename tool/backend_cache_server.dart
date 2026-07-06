@@ -5,6 +5,27 @@ import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:finance_app/src/data/default_symbol_universe.dart';
+import 'package:finance_app/src/data/local_secrets.dart';
+
+/// Provider tokens are resolved HERE, server-side, so they never ship inside
+/// the browser bundle. An environment variable wins when set (rotate a key or
+/// run CI without a recompile); otherwise the compiled-in local_secrets.dart
+/// value is used. The proxy injects these onto the matching upstream host and
+/// nowhere else, so a secret can never ride to the wrong domain.
+String _resolveSecret(String envKey, String compiledFallback) {
+  final env = Platform.environment[envKey];
+  if (env != null && env.trim().isNotEmpty) return env.trim();
+  return compiledFallback.trim();
+}
+
+final String kServerFinnhubToken = _resolveSecret('FINNHUB_TOKEN', kFinnhubApiKey);
+final String kServerTradierToken = _resolveSecret('TRADIER_TOKEN', kTradierToken);
+final String kServerTradierEnv =
+    _resolveSecret('TRADIER_ENV', kTradierEnv) == 'production'
+        ? 'production'
+        : 'sandbox';
+final String kServerPolygonToken = _resolveSecret('POLYGON_TOKEN', kPolygonToken);
+final String kServerFredToken = _resolveSecret('FRED_API_KEY', kFredApiKey);
 
 Future<void> main(List<String> args) async {
   final config = BackendCacheConfig.fromArgs(args);
@@ -204,6 +225,19 @@ class BackendCacheServer {
       }
       if (path == '/cache/status') {
         await _writeJson(request.response, await _cache.status());
+        return;
+      }
+      if (path == '/config/providers') {
+        // Booleans only — which providers have a server-side token wired.
+        // Never returns the token values themselves. The frontend reads this
+        // to decide which live feeds to switch on, instead of embedding keys.
+        await _writeJson(request.response, {
+          'finnhub': kServerFinnhubToken.isNotEmpty,
+          'tradier': kServerTradierToken.isNotEmpty,
+          'polygon': kServerPolygonToken.isNotEmpty,
+          'fred': kServerFredToken.isNotEmpty,
+          'tradierEnv': kServerTradierEnv,
+        });
         return;
       }
       if (path == '/decision/universe') {
@@ -650,10 +684,14 @@ class MarketDataCache {
     for (var hop = 0; hop < 6; hop++) {
       final request = await _client.getUrl(current).timeout(policy.timeout);
       request.followRedirects = false;
-      if (finnhubToken != null &&
-          finnhubToken.isNotEmpty &&
-          current.host.toLowerCase() == 'finnhub.io') {
-        request.headers.set('X-Finnhub-Token', finnhubToken);
+      final host = current.host.toLowerCase();
+      // Finnhub token: an inbound header wins (back-compat / the CLI); else the
+      // server-held token is injected — and only ever toward finnhub.io.
+      final effectiveFinnhub = (finnhubToken != null && finnhubToken.isNotEmpty)
+          ? finnhubToken
+          : kServerFinnhubToken;
+      if (effectiveFinnhub.isNotEmpty && host == 'finnhub.io') {
+        request.headers.set('X-Finnhub-Token', effectiveFinnhub);
       }
       request.headers.set(
         HttpHeaders.acceptHeader,
@@ -669,8 +707,19 @@ class MarketDataCache {
                   'joshua.j.vertalka@gmail.com)'
             : 'FinanceOracleLocalCache/1.0 (${Platform.operatingSystem})',
       );
+      // Authorization: an inbound Bearer wins (back-compat / the CLI); else the
+      // server-held Tradier token is injected as a Bearer — and ONLY toward the
+      // Tradier hosts, so the secret never rides to SEC/finnhub/etc.
+      final isTradierHost =
+          host == 'sandbox.tradier.com' || host == 'api.tradier.com';
+      String? effectiveAuth;
       if (authHeader != null && authHeader.isNotEmpty) {
-        request.headers.set(HttpHeaders.authorizationHeader, authHeader);
+        effectiveAuth = authHeader;
+      } else if (isTradierHost && kServerTradierToken.isNotEmpty) {
+        effectiveAuth = 'Bearer $kServerTradierToken';
+      }
+      if (effectiveAuth != null && effectiveAuth.isNotEmpty) {
+        request.headers.set(HttpHeaders.authorizationHeader, effectiveAuth);
       }
       final response = await request.close().timeout(policy.timeout);
       final location = response.headers.value(HttpHeaders.locationHeader);

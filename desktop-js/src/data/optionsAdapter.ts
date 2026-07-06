@@ -2,21 +2,22 @@
  * Options-data adapter.
  *
  * Tradier (free developer tier) is wired through the backend cache's
- * /proxy?url= endpoint. The proxy now forwards Authorization headers
- * to allowlisted hosts so the browser can authenticate against Tradier
- * without exposing the token to the page network log directly.
+ * /proxy?url= endpoint. The Tradier token lives SERVER-SIDE — the backend's
+ * `local_secrets.dart` (`kTradierToken`) or the `TRADIER_TOKEN` environment
+ * variable — and the proxy injects it onto the request to Tradier. The token
+ * never appears in this browser bundle. The frontend only asks the backend
+ * which providers are configured (see providerCapabilities) and switches
+ * live data on accordingly.
  *
  * Setup:
  *   1. Sign up at https://developer.tradier.com (free)
  *   2. Generate a sandbox token
- *   3. Put it in desktop-js/.env.local as VITE_TRADIER_TOKEN=<token>
- *   4. Restart `npm run dev`
- *
- * The token never appears in built JS — Vite inlines env vars at build
- * time, but for local dev it's served fresh from .env.local on each
- * request. The token is sent only to your local backend cache, which
- * forwards it to api.tradier.com or sandbox.tradier.com.
+ *   3. Put it in the backend: lib/src/data/local_secrets.dart
+ *        const String kTradierToken = '<token>';
+ *      (or export TRADIER_TOKEN=<token>), then rebuild the backend/app.
  */
+
+import { providerConfigured, tradierEnvConfigured } from './providerCapabilities'
 
 const DEFAULT_BACKEND = 'http://127.0.0.1:8787'
 
@@ -104,16 +105,16 @@ type TradierQuoteResponse = {
 
 async function tradierFetch<T>(
   path: string,
-  token: string,
   timeoutMs = 8000,
 ): Promise<T | null> {
   const controller = new AbortController()
   const timer = window.setTimeout(() => controller.abort(), timeoutMs)
   try {
     const response = await fetch(proxied(path), {
+      // No Authorization header here — the backend proxy injects the Tradier
+      // Bearer token server-side, so the secret never enters this bundle.
       headers: {
         Accept: 'application/json',
-        Authorization: `Bearer ${token}`,
       },
       signal: controller.signal,
     })
@@ -127,24 +128,22 @@ async function tradierFetch<T>(
 }
 
 function tradierEnv(): TradierEnv {
-  const explicit = import.meta.env.VITE_TRADIER_ENV
-  if (explicit === 'production' || explicit === 'sandbox') return explicit
-  return 'sandbox'
+  // The environment must match the server-side token, so it comes from the
+  // backend capability map rather than a bundle-baked env var.
+  return tradierEnvConfigured()
 }
 
 const tradierProvider: OptionsProvider = {
   name: 'tradier',
-  isConfigured: () => Boolean(import.meta.env.VITE_TRADIER_TOKEN),
+  isConfigured: () => providerConfigured('tradier'),
   async fetchSnapshot(ticker: string) {
-    const token = import.meta.env.VITE_TRADIER_TOKEN as string | undefined
-    if (!token) return null
+    if (!providerConfigured('tradier')) return null
     const env = tradierEnv()
     const base = tradierBase(env)
 
     // 1. Pull underlier last price for ATM reference
     const quoteResp = await tradierFetch<TradierQuoteResponse>(
       `${base}/markets/quotes?symbols=${encodeURIComponent(ticker)}`,
-      token,
     )
     const last = quoteResp?.quotes?.quote?.last
     if (!last || !Number.isFinite(last) || last <= 0) return null
@@ -152,7 +151,6 @@ const tradierProvider: OptionsProvider = {
     // 2. Find the closest expiration to 30 days out
     const expirationsResp = await tradierFetch<TradierExpirationsResponse>(
       `${base}/markets/options/expirations?symbol=${encodeURIComponent(ticker)}`,
-      token,
     )
     const dates = normalizeExpirations(expirationsResp)
     if (dates.length === 0) return null
@@ -167,7 +165,6 @@ const tradierProvider: OptionsProvider = {
     // 3. Pull the chain with greeks for that expiration
     const chainResp = await tradierFetch<TradierChainResponse>(
       `${base}/markets/options/chains?symbol=${encodeURIComponent(ticker)}&expiration=${expiry}&greeks=true`,
-      token,
     )
     const options = normalizeChain(chainResp)
     if (options.length === 0) return null
@@ -267,7 +264,7 @@ function clamp(value: number, min = 0, max = 100): number {
    ========================================================================= */
 const polygonProvider: OptionsProvider = {
   name: 'polygon',
-  isConfigured: () => Boolean(import.meta.env.VITE_POLYGON_TOKEN),
+  isConfigured: () => providerConfigured('polygon'),
   async fetchSnapshot() {
     return null
   },
@@ -336,21 +333,18 @@ export async function fetchOptionsChainNear(
   ticker: string,
   targetDays = 30,
 ): Promise<OptionsChain | null> {
-  const token = import.meta.env.VITE_TRADIER_TOKEN as string | undefined
-  if (!token) return null
+  if (!providerConfigured('tradier')) return null
   const env = tradierEnv()
   const base = tradierBase(env)
 
   const quoteResp = await tradierFetch<TradierQuoteResponse>(
     `${base}/markets/quotes?symbols=${encodeURIComponent(ticker)}`,
-    token,
   )
   const last = quoteResp?.quotes?.quote?.last
   if (!last || !Number.isFinite(last) || last <= 0) return null
 
   const expirationsResp = await tradierFetch<TradierExpirationsResponse>(
     `${base}/markets/options/expirations?symbol=${encodeURIComponent(ticker)}`,
-    token,
   )
   const dates = normalizeExpirations(expirationsResp)
   if (dates.length === 0) return null
@@ -364,7 +358,6 @@ export async function fetchOptionsChainNear(
 
   const chainResp = await tradierFetch<TradierChainResponse>(
     `${base}/markets/options/chains?symbol=${encodeURIComponent(ticker)}&expiration=${expiry}&greeks=true`,
-    token,
   )
   const options = normalizeChain(chainResp)
   if (options.length === 0) return null

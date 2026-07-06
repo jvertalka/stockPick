@@ -73,12 +73,16 @@ import {
 import {
   applyRevisionsOverlay,
   fetchRevisionRaw,
-  finnhubToken,
+  revisionsConfigured,
   getCachedRevisionRaw,
   rankRevisions,
   type RevisionRaw,
   type RevisionRanks,
 } from './data/revisionsEnhancer'
+import {
+  loadProviderCapabilities,
+  providerCapabilitiesLoaded,
+} from './data/providerCapabilities'
 import { cachedComputeQuantAnalysis, type QuantAnalysis } from './data/quantAnalysis'
 import {
   getRegimeGate,
@@ -473,6 +477,13 @@ function actionableRows(rows: DecisionSignal[]) {
   return rows.filter((row) => signalReadiness(row).label !== 'Research only')
 }
 
+/** A verdict on 'Research only' evidence (dataConfidence < 60 — i.e. fallback,
+ * stale price, or no real fundamentals) is NOT decision-grade. The UI caveats
+ * such verdicts so a confident "Buy Now" can't appear on thin data. */
+function thinEvidence(signal: DecisionSignal): boolean {
+  return signalReadiness(signal).label === 'Research only'
+}
+
 function Metric({
   label,
   value,
@@ -501,8 +512,10 @@ function ScoreBar({ value, tone = 'neutral' }: { value: number; tone?: Tone }) {
   )
 }
 
-function ActionPill({ action }: { action: Action }) {
-  return <span className={`pill ${actionTone(action)}`}>{action}</span>
+function ActionPill({ action, caveated = false }: { action: Action; caveated?: boolean }) {
+  // Thin-evidence verdicts are demoted to a caution tone so a confident green
+  // "Buy Now" can't read as decision-grade on fallback/stale/uncovered data.
+  return <span className={`pill ${caveated ? 'caution' : actionTone(action)}`}>{action}</span>
 }
 
 function SignalButton({
@@ -1247,7 +1260,12 @@ function DetailPanel({
       </header>
 
       <div className="detail-action">
-        <ActionPill action={signal.action} />
+        <ActionPill action={signal.action} caveated={thinEvidence(signal)} />
+        {thinEvidence(signal) ? (
+          <span className="pill danger" title={signalReadiness(signal).detail}>
+            ⚠ Thin evidence — not decision-grade
+          </span>
+        ) : null}
         <strong>{signal.positionPlan}</strong>
         <span>{signal.nextCheck}</span>
       </div>
@@ -2127,16 +2145,39 @@ function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [refreshCount, ownedKey, watchKey])
 
+  // Ask the backend once which live feeds have a server-side token wired
+  // (tokens no longer ship in this bundle). Retries every 5s while the backend
+  // is still warming. Flipping providersReady re-renders the options provider
+  // chip and re-runs the revision-feed effect below.
+  const [providersReady, setProvidersReady] = useState(false)
+  useEffect(() => {
+    let cancelled = false
+    let timer: number | undefined
+    const attempt = async () => {
+      await loadProviderCapabilities()
+      if (cancelled) return
+      if (providerCapabilitiesLoaded()) setProvidersReady((v) => !v)
+      else timer = window.setTimeout(attempt, 5000)
+    }
+    void attempt()
+    return () => {
+      cancelled = true
+      if (timer) window.clearTimeout(timer)
+    }
+  }, [])
+
   // Background analyst-revision enhancement (Finnhub free tier). Fills the
   // dormant revisionTrend / surpriseMomentum growth-factor inputs for a
   // prioritized slice of the universe. Cached names (IDB, 12h) seed
   // instant signal; only genuinely uncached names hit the throttled
-  // fetch (free tier is 60 req/min, 2 calls/ticker). Skipped entirely
-  // when no VITE_FINNHUB_TOKEN is set — fields stay neutral, never faked.
+  // fetch (free tier is 60 req/min, 2 calls/ticker). Skipped entirely when
+  // the backend has no Finnhub token wired — fields stay neutral, never faked.
   useEffect(() => {
     if (universe.length === 0) return
-    const token = finnhubToken()
-    if (!token) return
+    // The Finnhub token lives server-side now; we only ask the backend whether
+    // the feed is wired. providersReady is a dep so this re-runs once the
+    // capability map loads (it may arrive after the universe first populates).
+    if (!revisionsConfigured()) return
     // Owned + watch + top opportunity; cap bounds the first-warm time.
     const tickers = pickTickersToEnhance(universe, ownedTickers, watchTickers, 300)
     if (tickers.length === 0) return
@@ -2163,7 +2204,7 @@ function App() {
       for (let i = 0; i < uncached.length && !cancelled; i += batchSize) {
         const batch = uncached.slice(i, i + batchSize)
         const results = await Promise.all(
-          batch.map((t) => fetchRevisionRaw(t, token).catch(() => null)),
+          batch.map((t) => fetchRevisionRaw(t).catch(() => null)),
         )
         results.forEach((r) => {
           if (r) raws.set(r.ticker, r)
@@ -2178,7 +2219,7 @@ function App() {
       cancelled = true
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [refreshCount, ownedKey, watchKey])
+  }, [refreshCount, ownedKey, watchKey, providersReady])
 
   // Background quant analysis: for the top tickers we'd actually trade,
   // run Monte Carlo + GARCH + BSM. Each takes 50-100ms so we cap at 12
@@ -2461,7 +2502,7 @@ function App() {
               }`}
               title={
                 optionsProviderName === 'stub'
-                  ? 'No options provider configured - engine uses price-derived proxies for IV and skew. Add VITE_TRADIER_TOKEN to .env.local to switch on live data.'
+                  ? 'No options provider configured - engine uses price-derived proxies for IV and skew. Add a Tradier token to the backend (local_secrets.dart kTradierToken or the TRADIER_TOKEN env var) and rebuild to switch on live data.'
                   : `Options scoring uses real ${optionsProviderName} data for ${enrichedTickers.size} of ${universe.length} ranked tickers. The rest still use price-derived proxies.`
               }
             >

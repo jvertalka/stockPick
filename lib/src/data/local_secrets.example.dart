@@ -11,6 +11,20 @@ const String kFinnhubApiKey = '';
 /// FRED API key (optional). https://fredaccount.stlouisfed.org/apikey
 const String kFredApiKey = '';
 
+/// Tradier options token (optional). https://developer.tradier.com
+/// Powers real implied-vol / skew in the options card; empty = price-derived
+/// proxies. Injected server-side by the backend proxy — never ships to the
+/// browser bundle. You can also set the TRADIER_TOKEN environment variable.
+const String kTradierToken = '';
+
+/// Which Tradier environment the token above belongs to: 'sandbox' or
+/// 'production'. Override with the TRADIER_ENV environment variable.
+const String kTradierEnv = 'sandbox';
+
+/// Polygon.io options token (optional). https://polygon.io
+/// Also settable via the POLYGON_TOKEN environment variable.
+const String kPolygonToken = '';
+
 /// Optional CORS proxy/cache for providers that don't send browser CORS headers
 /// (Yahoo Finance, Stooq, SEC EDGAR in Flutter web).
 ///

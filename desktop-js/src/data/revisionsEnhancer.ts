@@ -1,4 +1,5 @@
 import { kvGet, kvSet } from './storage'
+import { providerConfigured } from './providerCapabilities'
 import type { RawSignal } from './decisionEngine'
 
 /**
@@ -21,9 +22,11 @@ import type { RawSignal } from './decisionEngine'
  *     mean recent earnings surprise % (Bernard-Thomas 1989 SUE / post-
  *     earnings-announcement drift).
  *
- * Token comes from VITE_FINNHUB_TOKEN and is forwarded through the backend
- * proxy (finnhub.io is allowlisted; responses cached 12h). Free tier is
- * 60 req/min, so fetches are throttled and IDB-cached for 12h.
+ * The token lives SERVER-SIDE (backend local_secrets.dart `kFinnhubApiKey`
+ * or the FINNHUB_TOKEN env var); the proxy injects it toward finnhub.io only.
+ * It never enters this bundle. The frontend just checks the backend capability
+ * map (providerConfigured('finnhub')) to know whether the feed is live. Free
+ * tier is 60 req/min, so fetches are throttled and IDB-cached for 12h.
  */
 
 const FINNHUB_BASE = 'https://finnhub.io/api/v1'
@@ -39,12 +42,8 @@ function proxied(externalUrl: string): string {
   return `${backendUrl()}/proxy?url=${encodeURIComponent(externalUrl)}`
 }
 
-export function finnhubToken(): string | undefined {
-  const token = import.meta.env.VITE_FINNHUB_TOKEN as string | undefined
-  return token && token.length > 0 ? token : undefined
-}
 export function revisionsConfigured(): boolean {
-  return finnhubToken() != null
+  return providerConfigured('finnhub')
 }
 
 export type RevisionRaw = {
@@ -117,26 +116,21 @@ export async function getCachedRevisionRaw(
 
 export async function fetchRevisionRaw(
   ticker: string,
-  token: string,
 ): Promise<RevisionRaw> {
   const fresh = await getCachedRevisionRaw(ticker)
   if (fresh) return fresh
   const cacheKey = `finnhub:rev:${ticker}`
 
   const enc = encodeURIComponent(ticker)
-  // The token rides the X-Finnhub-Token HEADER, not a ?token= URL param: the
-  // backend proxy caches responses keyed by URL and logs URLs, so a URL-borne
-  // token would land in cache filenames and logs on disk. The proxy forwards
-  // this header to finnhub.io only. (Finnhub accepts both auth forms.)
-  const finnhubAuth = { 'X-Finnhub-Token': token }
+  // The Finnhub token is injected by the backend proxy server-side (onto the
+  // X-Finnhub-Token header, forwarded to finnhub.io only). It never enters
+  // this bundle and never lands in a URL, cache filename, or log line.
   const [rec, earn] = await Promise.all([
     safeJson<RecRow[]>(
       proxied(`${FINNHUB_BASE}/stock/recommendation?symbol=${enc}`),
-      finnhubAuth,
     ),
     safeJson<EarnRow[]>(
       proxied(`${FINNHUB_BASE}/stock/earnings?symbol=${enc}`),
-      finnhubAuth,
     ),
   ])
 
@@ -204,7 +198,6 @@ export async function fetchRevisionRaw(
  */
 export async function fetchRevisionsBatched(
   tickers: string[],
-  token: string,
   onProgress?: (done: number, total: number) => void,
   batchSize = 3,
   delayMs = 7000,
@@ -213,7 +206,7 @@ export async function fetchRevisionsBatched(
   for (let i = 0; i < tickers.length; i += batchSize) {
     const batch = tickers.slice(i, i + batchSize)
     const results = await Promise.all(
-      batch.map((t) => fetchRevisionRaw(t, token).catch(() => null)),
+      batch.map((t) => fetchRevisionRaw(t).catch(() => null)),
     )
     results.forEach((r) => {
       if (r) out.set(r.ticker, r)
