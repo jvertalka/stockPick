@@ -49,3 +49,7 @@ lib/src/data/local_secrets.dart
 .finance_app_secrets.json
 .env
 .env.local
+
+# Local model backup + segment-experiment scratch inputs (regenerable)
+desktop-js/tools/ml_trained_model.json
+desktop-js/tools/seg_*.json
