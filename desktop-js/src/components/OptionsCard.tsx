@@ -60,8 +60,9 @@ export function OptionsCard({ ticker }: { ticker: string }) {
         <p className="options-empty">
           No options provider configured. The engine is using price-derived
           proxies for skew, implied vol, and event risk. Set
-          <code> VITE_TRADIER_TOKEN </code> in <code>.env.local</code> and
-          restart <code>npm run dev</code> to switch on real data.
+          <code> kTradierToken </code> in the backend&apos;s{' '}
+          <code>local_secrets.dart</code> (or the <code>TRADIER_TOKEN</code>{' '}
+          environment variable) and rebuild to switch on real data.
         </p>
       ) : status === 'loading' ? (
         <p className="options-empty">Loading {ticker} chain from {provider.name}…</p>
