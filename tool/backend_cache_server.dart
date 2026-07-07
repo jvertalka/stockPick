@@ -1002,6 +1002,10 @@ class DecisionUniverseService {
         symbols: selectedSymbols,
         asOf: parsed.toUtc(),
         scenario: scenario,
+        // fundamentals=pit fills quality/value/growth from SEC filings as
+        // they were FILED by the asOf date (no look-ahead) — unlocks the
+        // engine's bullish actions historically. Omit for price-only.
+        pointInTimeFundamentals: uri.queryParameters['fundamentals'] == 'pit',
       );
     }
 
@@ -1294,6 +1298,7 @@ class DecisionUniverseService {
     required List<String> symbols,
     required DateTime asOf,
     required String scenario,
+    bool pointInTimeFundamentals = false,
   }) async {
     await _ensureStudySeries(symbols);
     final truncated = <String, DecisionPriceSeries>{};
@@ -1335,21 +1340,46 @@ class DecisionUniverseService {
         signals.add(rawSignal);
       }
     }
+
+    // Point-in-time fundamentals: fill quality/value/growth from filings
+    // FILED on or before asOf, through the same overlay transforms live
+    // uses. Ranks come from this date's own cross-section; live rank state
+    // is never touched.
+    var fundamentalsCoverage = 0;
+    if (pointInTimeFundamentals) {
+      final fundamentalsService = SecFundamentalsService.instance(_cache);
+      await fundamentalsService.ensureStudyFacts([
+        for (final signal in signals)
+          if (signal['assetType'] != 'ETF') signal['ticker'] as String,
+      ]);
+      fundamentalsCoverage = fundamentalsService.overlayOnSignalsPointInTime(
+        signals,
+        asOf,
+      );
+    }
+
     final summaries = signals.map(_summaryForRawSignal).toList();
     return {
       'asOf': asOf.toIso8601String(),
       'historicalMode': true,
       'source': 'finance-oracle-backend-cache',
-      'detail':
-          'HISTORICAL STUDY MODE: signals rebuilt from bars on or before the '
-          'asOf date through the production signal builder. Fundamentals, '
-          'revisions, and options fields are neutral (price-only), matching '
-          'how uncovered names run live. Universe is the CURRENT symbol list '
-          'applied to the past, so delisted names are absent (survivorship).',
+      'detail': pointInTimeFundamentals
+          ? 'HISTORICAL STUDY MODE with POINT-IN-TIME fundamentals: signals '
+                'rebuilt from bars on or before the asOf date; quality/value/'
+                'growth filled from SEC filings as FILED by that date (no '
+                'look-ahead), covering $fundamentalsCoverage names. Revisions '
+                'and options fields stay neutral. Universe is the CURRENT '
+                'symbol list applied to the past (survivorship).'
+          : 'HISTORICAL STUDY MODE: signals rebuilt from bars on or before '
+                'the asOf date through the production signal builder. '
+                'Fundamentals, revisions, and options fields are neutral '
+                '(price-only), matching how uncovered names run live. '
+                'Universe is the CURRENT symbol list applied to the past, so '
+                'delisted names are absent (survivorship).',
       'universeSize': symbols.length,
       'returned': signals.length,
       'excludedForInsufficientData': symbols.length - signals.length,
-      'fundamentalsCoverage': 0,
+      'fundamentalsCoverage': fundamentalsCoverage,
       'scenario': scenario,
       'marketContext': _marketContextFor(summaries, analytics),
       'rawSignals': signals,
@@ -2730,6 +2760,142 @@ class SecFundamentalsService {
   /// `limit` parameter.
   Map<String, Map<String, double>> _lastFullRanks = {};
 
+  /// Full filing-occurrence bundles for the historical study, held for the
+  /// process lifetime (fetch+parse of a companyfacts JSON is the expensive
+  /// part; per-date knowledge cuts are cheap). Successes only; failures are
+  /// capped so a CIK-less ETF stops burning fetch attempts.
+  final Map<String, _FactBundle> _studyBundles = {};
+  final Map<String, int> _studyBundleFailures = {};
+  static const int _kStudyFactsMaxAttempts = 3;
+
+  /// Warm the study fact bundles for [symbols] (SEC-paced, progress-logged).
+  Future<void> ensureStudyFacts(Iterable<String> symbols) async {
+    final missing = [
+      for (final symbol in symbols)
+        if (!_studyBundles.containsKey(symbol) &&
+            (_studyBundleFailures[symbol] ?? 0) < _kStudyFactsMaxAttempts)
+          symbol,
+    ];
+    if (missing.isEmpty) {
+      return;
+    }
+    var processed = 0;
+    for (final symbol in missing) {
+      try {
+        final bundle = await _loadFactBundle(symbol, dedup: false);
+        if (bundle != null) {
+          _studyBundles[symbol] = bundle;
+        } else {
+          _studyBundleFailures[symbol] =
+              (_studyBundleFailures[symbol] ?? 0) + 1;
+        }
+      } catch (_) {
+        _studyBundleFailures[symbol] = (_studyBundleFailures[symbol] ?? 0) + 1;
+      }
+      processed++;
+      if (_lastFetchTouchedNetwork) {
+        await Future<void>.delayed(_politePause);
+      }
+      if (processed % 50 == 0) {
+        stdout.writeln(
+          'study fundamentals: $processed/${missing.length} bundles loaded '
+          '(${_studyBundles.length} cached total)',
+        );
+      }
+    }
+    if (processed > 0) {
+      stdout.writeln(
+        'study fundamentals ready: ${_studyBundles.length} symbols with '
+        'filing history (${_studyBundleFailures.length} without).',
+      );
+    }
+  }
+
+  /// Derived-snapshot memo: fundamentals only change when a NEW FILING
+  /// crosses the knowledge date, so two knowledge dates that fall between
+  /// the same two filings share one snapshot. Keyed by (symbol, count of
+  /// filings known) — a weekly 15-year study reuses each quarterly filing
+  /// epoch ~13 times, cutting 366k derivations to ~28k.
+  final Map<String, List<DateTime>> _studyFiledDates = {};
+  final Map<String, Map<int, _SymbolFundamentals?>> _studyDerived = {};
+
+  /// Point-in-time snapshot for one symbol at [knowledge], from the study
+  /// bundle cache. Null when the symbol has no filing history loaded or
+  /// nothing had been filed yet by [knowledge].
+  _SymbolFundamentals? _studyFundamentalsAsOf(
+    String symbol,
+    DateTime knowledge,
+  ) {
+    final bundle = _studyBundles[symbol];
+    if (bundle == null) {
+      return null;
+    }
+    final filed = _studyFiledDates[symbol] ??= _collectFiledDates(bundle);
+    // Count of filings with filed <= knowledge (binary search on the
+    // sorted unique filed dates). Same count => same knowable fact set.
+    var lo = 0;
+    var hi = filed.length;
+    while (lo < hi) {
+      final mid = (lo + hi) >> 1;
+      if (filed[mid].isAfter(knowledge)) {
+        hi = mid;
+      } else {
+        lo = mid + 1;
+      }
+    }
+    final epoch = lo;
+    if (epoch == 0) {
+      return null; // nothing filed yet — genuinely unknown at that date
+    }
+    final cache = _studyDerived[symbol] ??= {};
+    if (cache.containsKey(epoch)) {
+      return cache[epoch];
+    }
+    return cache[epoch] = _deriveAsOf(bundle, knowledge);
+  }
+
+  static List<DateTime> _collectFiledDates(_FactBundle bundle) {
+    final set = <DateTime>{};
+    for (final series in [
+      bundle.revenue,
+      bundle.netIncome,
+      bundle.cashFlow,
+      bundle.capex,
+      bundle.assets,
+      bundle.liabilities,
+      bundle.equity,
+      bundle.shares,
+    ]) {
+      for (final row in series) {
+        set.add(row.filed);
+      }
+    }
+    return set.toList()..sort();
+  }
+
+  /// Fill signals from point-in-time snapshots at [knowledge]. Ranks come
+  /// ONLY from this cross-section (never the live full-universe ranks, and
+  /// never stored back) so study calls cannot pollute live state.
+  int overlayOnSignalsPointInTime(
+    List<Map<String, Object?>> signals,
+    DateTime knowledge,
+  ) {
+    final bySymbol = <String, _SymbolFundamentals?>{
+      for (final signal in signals)
+        if (signal['assetType'] != 'ETF')
+          signal['ticker'] as String: _studyFundamentalsAsOf(
+            signal['ticker'] as String,
+            knowledge,
+          ),
+    };
+    return _overlayWith(
+      bySymbol,
+      signals,
+      useStoredRanks: false,
+      storeRanks: false,
+    );
+  }
+
   /// Fill fundamental fields of stock raw-signals in place; returns how
   /// many symbols got at least one field. Must run BEFORE the signals are
   /// scored so the filled values flow into composites. [isFullUniverse]
@@ -2738,6 +2904,23 @@ class SecFundamentalsService {
   int overlayOnSignals(
     List<Map<String, Object?>> signals, {
     required bool isFullUniverse,
+  }) {
+    return _overlayWith(
+      _bySymbol,
+      signals,
+      useStoredRanks: !isFullUniverse,
+      storeRanks: isFullUniverse,
+    );
+  }
+
+  /// Shared overlay body: reads snapshots from [bySymbol] (live current map
+  /// or a point-in-time map), ranks the covered cross-section, and fills the
+  /// fundamental fields in place.
+  int _overlayWith(
+    Map<String, _SymbolFundamentals?> bySymbol,
+    List<Map<String, Object?>> signals, {
+    required bool useStoredRanks,
+    required bool storeRanks,
   }) {
     final eligible = [
       for (final signal in signals)
@@ -2755,7 +2938,7 @@ class SecFundamentalsService {
     final values = <String, Map<String, double>>{};
     for (final signal in eligible) {
       final symbol = signal['ticker'] as String;
-      final fund = _bySymbol[symbol];
+      final fund = bySymbol[symbol];
       if (fund == null) {
         continue;
       }
@@ -2795,9 +2978,9 @@ class SecFundamentalsService {
         ranks[metric] = _sectorAdjustedRanks(bySymbol, sectorBySymbol);
       }
     });
-    if (isFullUniverse && ranks.isNotEmpty) {
+    if (storeRanks && ranks.isNotEmpty) {
       _lastFullRanks = ranks;
-    } else if (!isFullUniverse && _lastFullRanks.isNotEmpty) {
+    } else if (useStoredRanks && _lastFullRanks.isNotEmpty) {
       // Limited build: reuse the full-universe percentiles so the same
       // symbol scores identically regardless of the request's limit.
       ranks = _lastFullRanks;
@@ -2809,7 +2992,7 @@ class SecFundamentalsService {
     var covered = 0;
     for (final signal in eligible) {
       final symbol = signal['ticker'] as String;
-      final fund = _bySymbol[symbol];
+      final fund = bySymbol[symbol];
       if (fund == null) {
         continue;
       }
@@ -3084,6 +3267,19 @@ class SecFundamentalsService {
   }
 
   Future<_SymbolFundamentals?> _compute(String symbol) async {
+    final bundle = await _loadFactBundle(symbol, dedup: true);
+    return bundle == null ? null : _derive(bundle);
+  }
+
+  /// Fetch + parse one symbol's companyfacts into raw fact series. With
+  /// [dedup] each (start,end) period keeps only the latest-filed restatement
+  /// (live "current best estimate"); with dedup:false every filing
+  /// occurrence survives so [deriveAsOf] can reconstruct what was knowable
+  /// at any past date without later restatements leaking backward.
+  Future<_FactBundle?> _loadFactBundle(
+    String symbol, {
+    required bool dedup,
+  }) async {
     final cik = (await _loadCikMap())[_normalizeTicker(symbol)];
     if (cik == null) {
       return null;
@@ -3095,27 +3291,101 @@ class SecFundamentalsService {
     if (facts is! Map) {
       return null;
     }
-
-    final revenue = _series(facts, 'us-gaap', _revenueConcepts, 'USD');
-    final netIncome = _series(facts, 'us-gaap', _netIncomeConcepts, 'USD');
-    final cashFlow = _series(
-      facts,
-      'us-gaap',
-      _operatingCashFlowConcepts,
-      'USD',
-    );
-    final capex = _series(facts, 'us-gaap', _capexConcepts, 'USD');
-    final assets = _series(facts, 'us-gaap', const ['Assets'], 'USD');
-    final liabilities = _series(facts, 'us-gaap', const [
-      'Liabilities',
-    ], 'USD');
-    final equity = _series(facts, 'us-gaap', _equityConcepts, 'USD');
     var shares = _series(facts, 'dei', const [
       'EntityCommonStockSharesOutstanding',
-    ], 'shares');
+    ], 'shares', dedup: dedup);
     if (shares.isEmpty) {
-      shares = _series(facts, 'us-gaap', _shareFallbackConcepts, 'shares');
+      shares = _series(
+        facts,
+        'us-gaap',
+        _shareFallbackConcepts,
+        'shares',
+        dedup: dedup,
+      );
     }
+    return _FactBundle(
+      revenue: _series(facts, 'us-gaap', _revenueConcepts, 'USD', dedup: dedup),
+      netIncome: _series(
+        facts,
+        'us-gaap',
+        _netIncomeConcepts,
+        'USD',
+        dedup: dedup,
+      ),
+      cashFlow: _series(
+        facts,
+        'us-gaap',
+        _operatingCashFlowConcepts,
+        'USD',
+        dedup: dedup,
+      ),
+      capex: _series(facts, 'us-gaap', _capexConcepts, 'USD', dedup: dedup),
+      assets: _series(facts, 'us-gaap', const ['Assets'], 'USD', dedup: dedup),
+      liabilities: _series(facts, 'us-gaap', const [
+        'Liabilities',
+      ], 'USD', dedup: dedup),
+      equity: _series(facts, 'us-gaap', _equityConcepts, 'USD', dedup: dedup),
+      shares: shares,
+    );
+  }
+
+  /// What the metrics WOULD have read on [knowledge]: only facts FILED on or
+  /// before that date participate, and per period the latest restatement
+  /// filed by then wins. Feed a dedup:false bundle — a dedup:true bundle has
+  /// already collapsed restatements using future knowledge.
+  _SymbolFundamentals? _deriveAsOf(_FactBundle bundle, DateTime knowledge) {
+    return _derive(
+      _FactBundle(
+        revenue: _knowledgeCut(bundle.revenue, knowledge),
+        netIncome: _knowledgeCut(bundle.netIncome, knowledge),
+        cashFlow: _knowledgeCut(bundle.cashFlow, knowledge),
+        capex: _knowledgeCut(bundle.capex, knowledge),
+        assets: _knowledgeCut(bundle.assets, knowledge),
+        liabilities: _knowledgeCut(bundle.liabilities, knowledge),
+        equity: _knowledgeCut(bundle.equity, knowledge),
+        shares: _knowledgeCut(bundle.shares, knowledge),
+      ),
+    );
+  }
+
+  /// Knowledge filter: drop rows filed after [knowledge], then keep the
+  /// latest-filed restatement per (start,end) period — the same collapse
+  /// _series does with dedup:true, but bounded by what was filed in time.
+  static List<_FactRow> _knowledgeCut(
+    List<_FactRow> rows,
+    DateTime knowledge,
+  ) {
+    final deduped = <String, _FactRow>{};
+    for (final row in rows) {
+      if (row.filed.isAfter(knowledge)) {
+        continue;
+      }
+      final key =
+          '${row.start?.toIso8601String() ?? 'instant'}:${row.end.toIso8601String()}';
+      final existing = deduped[key];
+      if (existing == null || row.filed.isAfter(existing.filed)) {
+        deduped[key] = row;
+      }
+    }
+    return deduped.values.toList()
+      ..sort((a, b) {
+        final byEnd = a.end.compareTo(b.end);
+        return byEnd != 0 ? byEnd : a.filed.compareTo(b.filed);
+      });
+  }
+
+  /// Derive the metric snapshot from fact series. Shared verbatim by the
+  /// live path (dedup:true, latest knowledge) and the point-in-time study
+  /// path (knowledge-cut series) so the two can never drift apart.
+  _SymbolFundamentals? _derive(_FactBundle bundle) {
+    final revenue = bundle.revenue;
+    final netIncome = bundle.netIncome;
+    final cashFlow = bundle.cashFlow;
+    final capex = bundle.capex;
+    final assets = bundle.assets;
+    final liabilities = bundle.liabilities;
+    final equity = bundle.equity;
+    final shares = bundle.shares;
 
     final ttmRevenue = _ttm(revenue);
     final ttmNetIncome = _ttm(netIncome);
@@ -3482,6 +3752,31 @@ class _FactRow {
 /// Computed trailing metrics for one symbol; all fields nullable because
 /// XBRL coverage varies by filer (banks lack Revenues, young filers lack
 /// history, foreign filers report annually).
+/// Raw fact series for one symbol — the parse-once form the derivations run
+/// on. dedup:true bundles hold current-best-estimate series; dedup:false
+/// bundles keep every filing occurrence for point-in-time reconstruction.
+class _FactBundle {
+  const _FactBundle({
+    required this.revenue,
+    required this.netIncome,
+    required this.cashFlow,
+    required this.capex,
+    required this.assets,
+    required this.liabilities,
+    required this.equity,
+    required this.shares,
+  });
+
+  final List<_FactRow> revenue;
+  final List<_FactRow> netIncome;
+  final List<_FactRow> cashFlow;
+  final List<_FactRow> capex;
+  final List<_FactRow> assets;
+  final List<_FactRow> liabilities;
+  final List<_FactRow> equity;
+  final List<_FactRow> shares;
+}
+
 class _SymbolFundamentals {
   const _SymbolFundamentals({
     required this.revenueGrowthYoYPct,

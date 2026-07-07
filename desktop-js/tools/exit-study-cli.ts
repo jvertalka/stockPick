@@ -73,8 +73,14 @@ async function main() {
   const limit = Number(arg('--limit', '500'))
   const fromDate = arg('--from', '2011-01-01')
   const outPath = arg('--out', 'tools/exit_study_results.json')
+  // 'pit' = point-in-time SEC fundamentals (filings as FILED by each date;
+  // unlocks the engine's bullish actions historically). 'off' = price-only.
+  const fundamentalsMode = arg('--fundamentals', 'pit')
+  const fundamentalsQuery = fundamentalsMode === 'pit' ? '&fundamentals=pit' : ''
 
-  console.log(`Exit-rule event study — universe limit ${limit}, from ${fromDate}`)
+  console.log(
+    `Exit-rule event study — universe limit ${limit}, from ${fromDate}, fundamentals: ${fundamentalsMode}`,
+  )
   console.log(`Study backend: ${STUDY_URL} (must run with --warmup off)\n`)
 
   const calendar = await tradingCalendar()
@@ -92,14 +98,20 @@ async function main() {
 
   const dates: StudyDateT[] = []
   let skippedThin = 0
+  let coverageSum = 0
   const t0 = Date.now()
   for (let s = 0; s < sampleIdxs.length; s++) {
     const date = calendar[sampleIdxs[s]]
-    const payload = await fetchJson<{ returned: number; rawSignals?: RawSignalWire[] }>(
-      `${STUDY_URL}/decision/universe?asOf=${date}&limit=${limit}`,
-      180_000,
+    const payload = await fetchJson<{
+      returned: number
+      fundamentalsCoverage?: number
+      rawSignals?: RawSignalWire[]
+    }>(
+      `${STUDY_URL}/decision/universe?asOf=${date}&limit=${limit}${fundamentalsQuery}`,
+      600_000, // first PIT call fetches ~500 SEC filings; be patient
     )
     const raw = payload.rawSignals ?? []
+    coverageSum += payload.fundamentalsCoverage ?? 0
     if (raw.length < MIN_NAMES_PER_DATE) {
       skippedThin++
       continue
@@ -125,6 +137,11 @@ async function main() {
     }
   }
   console.log(`\nSampled ${dates.length} usable dates (${skippedThin} skipped as too thin).`)
+  if (fundamentalsMode === 'pit') {
+    console.log(
+      `Point-in-time fundamentals coverage: ${(coverageSum / Math.max(1, dates.length)).toFixed(0)} names/date average.`,
+    )
+  }
   if (dates.length < 60) throw new Error('Too few usable dates for a meaningful study.')
 
   const events = detectEvents(dates, HORIZONS_IN_STEPS)
@@ -179,7 +196,8 @@ async function main() {
     outPath,
     JSON.stringify(
       {
-        params: { limit, fromDate, stepTradingDays: STEP_TRADING_DAYS, horizonsInSteps: HORIZONS_IN_STEPS, minNamesPerDate: MIN_NAMES_PER_DATE },
+        params: { limit, fromDate, fundamentalsMode, stepTradingDays: STEP_TRADING_DAYS, horizonsInSteps: HORIZONS_IN_STEPS, minNamesPerDate: MIN_NAMES_PER_DATE },
+        meanFundamentalsCoverage: coverageSum / Math.max(1, dates.length),
         datesSampled: dates.length,
         firstDate: dates[0]?.date,
         lastDate: dates[dates.length - 1]?.date,
