@@ -98,6 +98,7 @@ import { buildConvictionStacks, type ConvictionStack } from './data/convictionSt
 import { ConvictionStackMeter } from './components/ConvictionStackMeter'
 import {
   actionTone,
+  applyMlLedVerdicts,
   formatSignedPercent,
   marketContext,
   scenarios,
@@ -399,30 +400,36 @@ function actionFilterFor(action: Action): ActionFilter {
   return 'Risk'
 }
 
-/** Mid-rank cross-sectional percentiles (0-100) for a batch of [key, value]
- * pairs; ties share the average rank. Used to gate ML/ensemble actions on a
- * name's RANK within the live batch: the model predicts a RELATIVE
- * (~zero-centered) 20d return, so absolute % thresholds are meaningless —
- * roughly half a batch is negative by construction. A single value maps to 50
- * (no spread to rank against). */
-function batchPercentiles(pairs: Array<[string, number]>): Map<string, number> {
-  const out = new Map<string, number>()
-  const n = pairs.length
-  if (n === 0) return out
-  if (n === 1) {
-    out.set(pairs[0][0], 50)
-    return out
+// (Cross-sectional percentile ranking for ML verdicts lives in
+// decisionEngine.applyMlLedVerdicts, next to the gates that use it.)
+
+/** Plain-words provenance for the verdict pill: who decided this label. */
+function verdictSourceLabel(source: NonNullable<DecisionSignal['verdictSource']>): string {
+  switch (source) {
+    case 'ml': return 'ML verdict'
+    case 'ml-veto': return 'ML liked it — evidence held it'
+    case 'rules-exit': return 'Rules exit'
+    case 'demoted-no-ml': return 'No ML coverage — held'
+    case 'demoted-gated': return 'Regime-gated — held'
+    case 'rules': return 'Rules'
   }
-  const sorted = [...pairs].sort((a, b) => a[1] - b[1])
-  let i = 0
-  while (i < sorted.length) {
-    let j = i
-    while (j + 1 < sorted.length && sorted[j + 1][1] === sorted[i][1]) j++
-    const pct = (((i + j) / 2) / (sorted.length - 1)) * 100
-    for (let k = i; k <= j; k++) out.set(sorted[k][0], pct)
-    i = j + 1
+}
+
+function verdictSourceDetail(source: NonNullable<DecisionSignal['verdictSource']>): string {
+  switch (source) {
+    case 'ml':
+      return 'Set by the walk-forward-validated ML ensemble from its rank across all scored names.'
+    case 'ml-veto':
+      return 'The model ranked this near the top, but the evidence or risk gates (data confidence, real SEC fundamentals, risk score) blocked a confident label.'
+    case 'rules-exit':
+      return 'The rules engine flagged this bearish — its measured strength. Treat as a risk warning and review; deep-red names statistically bounce.'
+    case 'demoted-no-ml':
+      return 'The rules wanted a bullish label, but rule-made buys measured anti-predictive over 15 years — without ML backing this stays at Hold.'
+    case 'demoted-gated':
+      return 'The market regime gate is closed (the model shows no edge in this regime), so no bullish labels are minted right now.'
+    case 'rules':
+      return 'Untouched rules label (neutral zone, or legacy Rules mode).'
   }
-  return out
 }
 
 // Focusing an action bucket always lands on the Desk with the matching
@@ -1283,6 +1290,11 @@ function DetailPanel({
             ⚠ Thin evidence — not decision-grade
           </span>
         ) : null}
+        {signal.verdictSource ? (
+          <span className="pill neutral" title={verdictSourceDetail(signal.verdictSource)}>
+            {verdictSourceLabel(signal.verdictSource)}
+          </span>
+        ) : null}
         <strong>{signal.positionPlan}</strong>
         <span>{signal.nextCheck}</span>
       </div>
@@ -1594,9 +1606,14 @@ function App() {
   const [mlPredictions, setMlPredictions] = useState<Map<string, LivePrediction>>(
     () => new Map(),
   )
-  const [decisionMode, setDecisionMode] = useState<'rules' | 'ml' | 'ensemble'>(
-    () => (typeof window !== 'undefined' && (window.localStorage.getItem('decisionMode') as 'rules' | 'ml' | 'ensemble' | null)) || 'rules',
-  )
+  // ML-led is the DEFAULT since 2026-07-07: the event study measured the
+  // rules' green labels as anti-predictive, so they no longer lead. A stored
+  // legacy 'ensemble' choice migrates to 'ml'; 'rules' stays available for A/B.
+  const [decisionMode, setDecisionMode] = useState<'rules' | 'ml'>(() => {
+    if (typeof window === 'undefined') return 'ml'
+    const stored = window.localStorage.getItem('decisionMode')
+    return stored === 'rules' ? 'rules' : 'ml'
+  })
   const [reconnectIn, setReconnectIn] = useState<number | null>(null)
   const reconnectAttemptsRef = useRef(0)
   const reconnectTimerRef = useRef<number | null>(null)
@@ -1640,53 +1657,24 @@ function App() {
         })
       })
     }
-    // A/B decision mode: override action with ML prediction (or blend) when
-    // configured — UNLESS the regime gate is closed. The 2026-05-12 backtest
-    // measured IC 0.021 / 50.2% hit rate (coin flip) for the model in
-    // high-vol Markov regimes, so ML overrides are suppressed there and the
-    // engine falls back to rules (see quantConfig.ML_REGIME_GATE).
-    if (decisionMode !== 'rules' && mlPredictions.size > 0 && !regimeGate?.gated) {
-      // The ML model predicts RELATIVE (cross-sectionally demeaned) 20d return
-      // — its output is ~zero-centered, so absolute % thresholds (">1.5% =
-      // Buy") are wrong: roughly half the batch is negative BY CONSTRUCTION
-      // regardless of absolute attractiveness, which would force good names to
-      // Trim/Sell on relative weakness. Gate on the name's cross-sectional
-      // RANK within the live ML batch instead — the quintile convention used
-      // elsewhere (Fama-French portfolio cut, TOP_QUINTILE_PERCENTILE).
-      const mlPctByTicker = batchPercentiles(
-        [...mlPredictions.entries()].map(([ticker, p]) => [ticker, p.predictedReturn20d]),
+    // ML-led verdicts (default): the 15-year action event study measured the
+    // rules' bullish upgrades as ANTI-predictive while their bearish calls
+    // carry real signal — so in 'ml' mode only the walk-forward-validated
+    // ensemble can mint a green label, the rules keep exits/warnings/vetoes,
+    // and a rules-green with no ML backing is demoted to Hold instead of
+    // reaching the screen. Regime gating and evidence/risk gates live inside
+    // applyMlLedVerdicts. 'rules' mode keeps the legacy labels for A/B.
+    if (decisionMode === 'ml' && mlModel) {
+      return applyMlLedVerdicts(
+        withQuant,
+        new Map(
+          [...mlPredictions.entries()].map(([ticker, p]) => [ticker, p.predictedReturn20d]),
+        ),
+        { regimeGated: regimeGate?.gated === true },
       )
-      // Below this many predictions a percentile is too noisy to act on; leave
-      // the rules action untouched rather than force a miscalibrated override.
-      const haveRankBreadth = mlPctByTicker.size >= 8
-      withQuant = withQuant.map((signal) => {
-        const prediction = mlPredictions.get(signal.ticker)
-        if (!prediction || !haveRankBreadth) return signal
-        const pct = mlPctByTicker.get(signal.ticker)
-        if (pct == null) return signal
-        if (decisionMode === 'ml') {
-          // Pure-ML gating on the relative-return percentile: top quintile
-          // buys, bottom quintile sells (symmetric quintile cuts).
-          let mlAction: typeof signal.action = 'Hold'
-          if (pct >= 80) mlAction = 'Buy Now'
-          else if (pct >= 60) mlAction = 'Accumulate'
-          else if (pct <= 20) mlAction = 'Sell'
-          else if (pct <= 40) mlAction = 'Trim'
-          return { ...signal, action: mlAction }
-        }
-        // Ensemble: blend in RANK space — both the rules composite-alpha
-        // percentile and the ML relative-return percentile are 0-100, so they
-        // are commensurable (the old code averaged a raw ±12 forecast with the
-        // relative ML output, mixing units). Conservative: only nudge a Hold.
-        const blendedPct = (pct + signal.alphaPercentile) / 2
-        let blendedAction = signal.action
-        if (blendedPct >= 80 && signal.action === 'Hold') blendedAction = 'Accumulate'
-        if (blendedPct <= 20 && signal.action === 'Hold') blendedAction = 'Trim'
-        return { ...signal, action: blendedAction }
-      })
     }
     return withQuant
-  }, [activeScenario, signalInputs, optionsSnapshots, revisionRanks, quantAnalyses, decisionMode, mlPredictions, regimeGate])
+  }, [activeScenario, signalInputs, optionsSnapshots, revisionRanks, quantAnalyses, decisionMode, mlPredictions, regimeGate, mlModel])
   // Conviction stacks: six independent evidence layers per name (rules,
   // ML, Monte Carlo, options skew, regime, multi-horizon agreement).
   const convictionStacks = useMemo(
@@ -2117,9 +2105,23 @@ function App() {
     if (!mlModel) return
     if (universe.length === 0) return
     let cancelled = false
-    const tickers = pickTickersToEnhance(universe, ownedTickers, watchTickers, 30)
+    // ML scoring set: the liquid core of the universe (where the model was
+    // trained — serving the illiquid tail would be a distribution shift)
+    // plus everything owned or watched. Was capped at 30, which left the
+    // validated model mute on 99% of the screen while rule labels led.
+    const ML_SCORING_CAP = 600
+    const liquidCore = universe
+      .filter((row) => (row.universeRankSeed ?? Number.MAX_SAFE_INTEGER) < ML_SCORING_CAP)
+      .map((row) => row.ticker)
+    const tickers = [...new Set([...ownedTickers, ...watchTickers, ...liquidCore])].filter(
+      (ticker) => universe.some((row) => row.ticker === ticker),
+    )
     if (tickers.length === 0) return
-    void predictForUniverse(tickers, mlModel).then((predictions) => {
+    void predictForUniverse(tickers, mlModel, (done, total) => {
+      if (!cancelled && (done % 100 === 0 || done === total)) {
+        console.info(`[ml] scoring universe: ${done}/${total}`)
+      }
+    }).then((predictions) => {
       if (cancelled) return
       setMlPredictions(predictions)
       // Log the whole batch in ONE write so the scorecard has data later —
@@ -2623,17 +2625,19 @@ function App() {
               {theme === 'dark' ? <Sun size={15} /> : <Moon size={15} />}
             </button>
             {mlModel ? (
-              <label className="select-control" title="Decision mode: rules / ML / ensemble">
+              <label
+                className="select-control"
+                title="ML-led: only the validated model can mint a Buy; rules keep exits and vetoes. Rules: legacy hand-set labels (measured anti-predictive on buys)."
+              >
                 <span>Mode</span>
                 <select
                   onChange={(event) =>
-                    setDecisionMode(event.target.value as 'rules' | 'ml' | 'ensemble')
+                    setDecisionMode(event.target.value as 'rules' | 'ml')
                   }
                   value={decisionMode}
                 >
-                  <option value="rules">Rules</option>
-                  <option value="ml">ML</option>
-                  <option value="ensemble">Ensemble</option>
+                  <option value="ml">ML-led</option>
+                  <option value="rules">Rules (legacy)</option>
                 </select>
               </label>
             ) : null}

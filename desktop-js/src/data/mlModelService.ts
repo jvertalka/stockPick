@@ -10,6 +10,7 @@ import {
   fitMarkovRegime,
   logReturns,
   pearsonCorrelation,
+  predictBaggedGradientBoosting,
   predictGradientBoosting,
   type GradientBoostingModel,
 } from './quantMath'
@@ -51,6 +52,9 @@ export type StoredHorizonModel = {
 export type StoredMlModel = {
   /** 20-day median GBT — backward compat */
   model: GradientBoostingModel
+  /** Bagged 20d ensemble (member mean = the measured + served scorer).
+   * Older blobs lack it; serving falls back to `model`. */
+  bag20?: GradientBoostingModel[]
   /** Optional 20-day p10 model for prediction interval lower bound */
   p10Model?: GradientBoostingModel
   /** Optional 20-day p90 model for prediction interval upper bound */
@@ -127,6 +131,7 @@ export async function persistModel(
     meanLongShortReturnNet: number
     meanLongShortSharpe: number
     hyperparameters: { numTrees: number; depth: number; learningRate: number }
+    bag20?: GradientBoostingModel[]
     p10Model?: GradientBoostingModel
     p90Model?: GradientBoostingModel
     /** Median models per horizon from the backtest's ensemble — persisting
@@ -141,6 +146,7 @@ export async function persistModel(
 ): Promise<void> {
   const stored: StoredMlModel = {
     model,
+    bag20: meta.bag20,
     p10Model: meta.p10Model,
     p90Model: meta.p90Model,
     horizonModels: meta.horizonModels,
@@ -408,7 +414,11 @@ function buildPrediction(
   normalized: number[],
   asOf: string,
 ): LivePrediction {
-  const prediction = predictGradientBoosting(model.model, normalized)
+  // Ensemble mean when the bag shipped — the same object the walk-forward
+  // measured. Single-model fallback keeps pre-ensemble blobs working.
+  const prediction = model.bag20?.length
+    ? predictBaggedGradientBoosting(model.bag20, normalized)
+    : predictGradientBoosting(model.model, normalized)
   // Conformal widening (Romano et al. 2019): the stored offset is what the
   // backtest measured on held-out calibration data, so the 80% interval
   // label is earned rather than assumed.
@@ -492,17 +502,29 @@ export async function predictForUniverse(
   onProgress?: (current: number, total: number) => void,
 ): Promise<Map<string, LivePrediction>> {
   // Phase 1 — gather RAW (un-normalized) feature vectors for the batch.
+  // Concurrency pool of 6: at universe scale (~600 names) a sequential
+  // walk took 10+ minutes; six lanes through the local proxy (disk-cached
+  // upstream) brings a warm pass to ~1-2 minutes without hammering Yahoo.
   const rawByTicker = new Map<string, number[]>()
   const asOfByTicker = new Map<string, string>()
-  for (let i = 0; i < tickers.length; i++) {
-    const ticker = tickers[i]
-    onProgress?.(i, tickers.length)
-    const raw = await computeRawServingFeatures(ticker, model)
-    if (raw) {
-      rawByTicker.set(ticker, raw.rawFeatures)
-      asOfByTicker.set(ticker, raw.asOf)
+  const CONCURRENCY = 6
+  let nextIndex = 0
+  let completed = 0
+  const worker = async () => {
+    while (nextIndex < tickers.length) {
+      const ticker = tickers[nextIndex++]
+      const raw = await computeRawServingFeatures(ticker, model)
+      if (raw) {
+        rawByTicker.set(ticker, raw.rawFeatures)
+        asOfByTicker.set(ticker, raw.asOf)
+      }
+      completed++
+      onProgress?.(completed, tickers.length)
     }
   }
+  await Promise.all(
+    Array.from({ length: Math.min(CONCURRENCY, Math.max(1, tickers.length)) }, () => worker()),
+  )
   // Phase 2 — cross-sectional normalization over the gathered batch.
   const normalizedByTicker = crossSectionalNormalizeServingBatch(rawByTicker, {
     means: model.featureMeans,
@@ -561,8 +583,10 @@ export async function logLivePredictions(
     })
   }
   if (!appended) return
-  // Cap at 5,000 entries to avoid unbounded IDB growth
-  const trimmed = existing.length > 5000 ? existing.slice(-5000) : existing
+  // Cap keeps IDB bounded. Universe-scale scoring logs ~600 predictions per
+  // trading day, so 40,000 holds ~3 months of history — enough for the
+  // scorecard's rolling window with room to spare (a few MB at most).
+  const trimmed = existing.length > 40_000 ? existing.slice(-40_000) : existing
   await kvSet(PREDICTION_LOG_KEY, trimmed)
 }
 

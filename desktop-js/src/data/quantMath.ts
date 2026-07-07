@@ -2471,6 +2471,66 @@ export function predictGradientBoosting(
   return prediction
 }
 
+/**
+ * Bagged gradient boosting (Breiman 1996 bagging over Friedman 2001 GBTs).
+ *
+ * Trains `bags` members, each on a seeded ~`sampleFraction` row subsample,
+ * and predicts with the member MEAN. Averaging models fit on different
+ * subsamples cancels a chunk of each single model's estimation noise
+ * without changing what it can express — the reliable "free" ensemble
+ * gain, and the standard first upgrade over any single tree model.
+ * A degenerate subsample (too few rows) falls back to the full data so a
+ * member can never be nonsense.
+ */
+export function fitBaggedGradientBoosting(
+  features: number[][],
+  targets: number[],
+  options: {
+    bags?: number
+    sampleFraction?: number
+    seed?: number
+    numTrees?: number
+    depth?: number
+    learningRate?: number
+    quantile?: number
+  } = {},
+): GradientBoostingModel[] {
+  const bags = Math.max(1, options.bags ?? 5)
+  const fraction = Math.min(1, Math.max(0.1, options.sampleFraction ?? 0.8))
+  const rng = makeRng(options.seed ?? 20260707)
+  const members: GradientBoostingModel[] = []
+  for (let b = 0; b < bags; b++) {
+    const indices: number[] = []
+    for (let i = 0; i < features.length; i++) {
+      if (rng() < fraction) indices.push(i)
+    }
+    if (indices.length < 100) {
+      members.push(fitGradientBoosting(features, targets, options))
+      continue
+    }
+    members.push(
+      fitGradientBoosting(
+        indices.map((i) => features[i]),
+        indices.map((i) => targets[i]),
+        options,
+      ),
+    )
+  }
+  return members
+}
+
+/** Member-mean prediction for a bagged ensemble. */
+export function predictBaggedGradientBoosting(
+  members: GradientBoostingModel[],
+  features: number[],
+): number {
+  let sum = 0
+  for (const member of members) {
+    sum += predictGradientBoosting(member, features)
+  }
+  return sum / Math.max(1, members.length)
+}
+
 /* =========================================================================
    25. Kalman filter for time-varying beta
    -------------------------------------------------------------------------

@@ -342,6 +342,7 @@ async function main() {
     const bundle20 = result.horizonBundles.find((bundle) => bundle.horizon === 20)
     const payload = {
       model: result.trainedModel,
+      bag20: result.bag20,
       p10Model: bundle20?.p10Model,
       p90Model: bundle20?.p90Model,
       horizonModels: result.horizonBundles.map((bundle) => ({

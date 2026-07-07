@@ -114,6 +114,7 @@ export function BacktestPanel() {
             meanLongShortReturnNet: backtestResult.meanLongShortReturnNet,
             meanLongShortSharpe: backtestResult.meanLongShortSharpe,
             hyperparameters: backtestResult.hyperparameters,
+            bag20: backtestResult.bag20,
             p10Model: bundle20?.p10Model,
             p90Model: bundle20?.p90Model,
             conformalOffset20dPct: bundle20?.conformalOffsetPct,
