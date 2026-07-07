@@ -1607,11 +1607,16 @@ function App() {
     () => new Map(),
   )
   // ML-led is the DEFAULT since 2026-07-07: the event study measured the
-  // rules' green labels as anti-predictive, so they no longer lead. A stored
-  // legacy 'ensemble' choice migrates to 'ml'; 'rules' stays available for A/B.
+  // rules' green labels as anti-predictive, so they no longer lead.
+  // VERSIONED KEY: the legacy 'decisionMode' key was auto-written with the
+  // old default ('rules') on every boot, so every existing profile has it
+  // and it records nothing about user intent — honoring it silently kept
+  // the measured-backwards rules in charge (caught in live verification).
+  // Only an explicit post-migration choice, stored under the v2 key, can
+  // opt back into legacy rules mode.
   const [decisionMode, setDecisionMode] = useState<'rules' | 'ml'>(() => {
     if (typeof window === 'undefined') return 'ml'
-    const stored = window.localStorage.getItem('decisionMode')
+    const stored = window.localStorage.getItem('decisionMode.v2')
     return stored === 'rules' ? 'rules' : 'ml'
   })
   const [reconnectIn, setReconnectIn] = useState<number | null>(null)
@@ -2071,10 +2076,11 @@ function App() {
     setDockBadge(ownedRiskCount)
   }, [ownedRiskCount])
 
-  // Persist decision-mode choice
+  // Persist decision-mode choice (v2 key — see the migration note at the
+  // state declaration; the legacy 'decisionMode' key is intentionally dead).
   useEffect(() => {
     try {
-      window.localStorage.setItem('decisionMode', decisionMode)
+      window.localStorage.setItem('decisionMode.v2', decisionMode)
     } catch {
       // ignore
     }
