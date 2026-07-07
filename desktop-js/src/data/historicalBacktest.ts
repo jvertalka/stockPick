@@ -1,6 +1,8 @@
 import { cachedFetchDailyBars, type DailyBar } from './marketData'
 import {
+  fitBaggedGradientBoosting,
   fitGradientBoosting,
+  predictBaggedGradientBoosting,
   fitMarkovRegime,
   logReturns,
   predictGradientBoosting,
@@ -378,6 +380,18 @@ export const HISTORICAL_FEATURE_NAMES: FeatureNames = [
   // Range/extension (2)
   'range_compression_20d',    // (high-low)/close, last 20d
   'price_velocity_acceleration',  // 20d vel - 60d vel (momentum of momentum)
+  // Tail/lottery (3) — candidates added 2026-07-07; the FDR screen decides
+  // whether they ship, same as every other feature.
+  //   max_daily_ret_21d — Bali-Cakici-Whitelaw (2011): the "MAX" lottery
+  //   effect; a big recent one-day pop attracts lottery demand that then
+  //   underperforms.
+  //   downside_vol_60d — Ang-Chen-Xing (2006): semi-deviation of negative
+  //   days only; downside risk is priced differently than total vol.
+  //   vol_of_vol_60d — instability of the volatility regime itself
+  //   (Baltas-Karyampas 2018): how much the rolling 20d vol wobbles.
+  'max_daily_ret_21d',
+  'downside_vol_60d',
+  'vol_of_vol_60d',
   // Survivorship-visibility price features (2):
   //   listing_age_years — years since the first available bar. Fama-French
   //   (2004, "New lists") show ~half of new lists fail within 10 years;
@@ -548,6 +562,32 @@ export function computeFeaturesAtDate(
   const velocity60 = ret(60) / 60
   const velocityAccel = velocity20 - velocity60
 
+  // Tail/lottery candidates (see HISTORICAL_FEATURE_NAMES for citations).
+  // MAX: largest single-day simple return (%) over the last 21 sessions.
+  let maxDailyRet21 = 0
+  for (let i = closes.length - 21; i < closes.length; i++) {
+    const prev = closes[i - 1]
+    if (prev > 0) {
+      const r = (closes[i] / prev - 1) * 100
+      if (r > maxDailyRet21) maxDailyRet21 = r
+    }
+  }
+  // Downside vol: annualized semi-deviation of negative log-return days.
+  const downLogs60 = log60.filter((value) => value < 0)
+  const downsideVol60 =
+    downLogs60.length > 0
+      ? Math.sqrt(
+          downLogs60.reduce((sum, value) => sum + value * value, 0) / downLogs60.length,
+        ) * Math.sqrt(252)
+      : 0
+  // Vol-of-vol: std of nine overlapping 20d vols stepped 5d apart (~60d span).
+  const volWindows: number[] = []
+  for (let offset = 0; offset <= 40; offset += 5) {
+    const segment = log252.slice(log252.length - 20 - offset, log252.length - offset || undefined)
+    if (segment.length === 20) volWindows.push(stdOf(segment) * Math.sqrt(252))
+  }
+  const volOfVol60 = volWindows.length >= 3 ? stdOf(volWindows) : 0
+
   return [
     // Momentum (5)
     ret(5),
@@ -588,6 +628,10 @@ export function computeFeaturesAtDate(
     // Range/extension (2)
     rangeCompression,
     velocityAccel,
+    // Tail/lottery (3)
+    maxDailyRet21,
+    downsideVol60,
+    volOfVol60,
     // Survivorship-visibility (2)
     listingAgeYears(
       options?.firstBarDateMs ?? Date.parse(bars[0].date),
@@ -1585,9 +1629,19 @@ export function walkForwardStep(
   // TRAIN on RELATIVE (cross-sectionally demeaned) return — the model
   // learns idiosyncratic alpha, not the unpredictable market move.
   const trainTargets = trainSamples.map((sample) => sample.forwardReturn20dRel)
-  const model = fitGradientBoosting(trainFeatures, trainTargets, options.modelOptions ?? {})
+  // Bagged ensemble per fold (5 members × 80% row subsamples, fold-seeded)
+  // so the walk-forward measures the SAME object that ships live — the
+  // ensemble mean — not a single model the app then doesn't use.
+  const bag = fitBaggedGradientBoosting(trainFeatures, trainTargets, {
+    ...(options.modelOptions ?? {}),
+    bags: 5,
+    sampleFraction: 0.8,
+    seed: (Date.parse(testStartDate) / 86_400_000) | 0,
+  })
 
-  const predictions = testSamples.map((sample) => predictGradientBoosting(model, sample.features))
+  const predictions = testSamples.map((sample) =>
+    predictBaggedGradientBoosting(bag, sample.features),
+  )
   // IC / hit rate measured against RELATIVE actuals (the ranking skill the
   // model is actually trained for; raw actuals carry market noise the
   // model never tries to predict). The L/S quintile below uses RAW returns
@@ -1761,7 +1815,7 @@ export function walkForwardStep(
       features[f] = testSamples[indicesShuf[i]].features[f]
     })
     const permutedPredictions = permutedFeatures.map((features) =>
-      predictGradientBoosting(model, features),
+      predictBaggedGradientBoosting(bag, features),
     )
     const permutedIc = pearsonCorrelation(permutedPredictions, actuals)
     featureImportance.push(ic - permutedIc)
@@ -1856,6 +1910,8 @@ export type FullBacktestResult = {
   totalSamples: number
   /** Backward-compat: the 20-day median model */
   trainedModel: GradientBoostingModel
+  /** Bagged 20d ensemble — the measured + served scorer (member mean). */
+  bag20: GradientBoostingModel[]
   /** Multi-horizon ensemble: one bundle per horizon, each containing
    *  median + p10 + p90 models for prediction intervals. */
   horizonBundles: HorizonModelBundle[]
@@ -2462,6 +2518,15 @@ export function runWalkForwardBacktest(
     sorted.map((sample) => sample.forwardReturn20dRel), // RELATIVE target
     chosenParams,
   )
+  // The BAGGED ensemble is what the walk-forward now measures per fold, so
+  // it is also what ships as the live scorer (serving prefers bag20 when
+  // present; trainedModel stays as the single-model fallback for older
+  // app versions reading only `model`). Fixed seed => reproducible members.
+  const bag20 = fitBaggedGradientBoosting(
+    allFeatures,
+    sorted.map((sample) => sample.forwardReturn20dRel),
+    { ...chosenParams, bags: 5, sampleFraction: 0.8, seed: 20260707 },
+  )
 
   const mean = (key: keyof WalkForwardResult): number =>
     steps.reduce((sum, step) => sum + (step[key] as number), 0) / steps.length
@@ -2538,6 +2603,7 @@ export function runWalkForwardBacktest(
     meanFeatureImportance,
     totalSamples: sorted.length,
     trainedModel,
+    bag20,
     horizonBundles,
     embargoDaysUsed: embargoDays,
     txCostBpsUsed: txCostBps,

@@ -67,10 +67,32 @@ export type RawSignal = {
    * absent when this symbol has no EDGAR coverage (ETF / non-filer). */
   fundamentalsAsOf?: string | null
   fundamentalsSource?: string
+  /** Position in the curated universe list (0 = most established/liquid).
+   * Used to pick the ML scoring set — the model trained on liquid names,
+   * so serving it far down the illiquid tail is a distribution shift. */
+  universeRankSeed?: number
+  fundamentalsCovered?: boolean
 }
+
+/** Where a signal's final action label came from — shown in the UI so a
+ * verdict's provenance is never a mystery.
+ *  - 'ml'            the ML ensemble's cross-sectional rank set it
+ *  - 'ml-veto'       ML ranked it bullish but evidence/risk gates held it at Hold
+ *  - 'rules-exit'    the rules' bearish call (their measured strength) kept it
+ *  - 'demoted-no-ml' rules said bullish but no ML coverage — held at Hold
+ *  - 'demoted-gated' regime gate closed; unearned bullish held at Hold
+ *  - 'rules'         untouched rules label (legacy mode, or neutral) */
+export type VerdictSource =
+  | 'ml'
+  | 'ml-veto'
+  | 'rules-exit'
+  | 'demoted-no-ml'
+  | 'demoted-gated'
+  | 'rules'
 
 export type DecisionSignal = RawSignal & {
   action: Action
+  verdictSource?: VerdictSource
   opportunityScore: number
   confidence: number
   riskScore: number
@@ -1230,6 +1252,138 @@ function actionRank(action: Action) {
     Sell: 5,
     Avoid: 6,
   }[action]
+}
+
+/* =========================================================================
+   ML-led verdicts
+   -------------------------------------------------------------------------
+   The 15-year action event study (2026-07-07) measured a hard asymmetry in
+   the hand-written rules: their bullish upgrades were ANTI-predictive
+   (fresh Accumulates lagged peers −0.7pp/20d, −1.1pp/60d, CIs exclude 0)
+   while their bearish downgrades carried real signal. The walk-forward-
+   validated ML ensemble is therefore the ONLY layer allowed to mint a
+   bullish label; the rules keep the jobs they measurably do well — exits,
+   risk warnings, and vetoes.
+   ========================================================================= */
+
+/** Percentile rank (0-100, average-rank ties) of each ticker's value within
+ * the batch. The ML model predicts a RELATIVE (~zero-centered) 20d return,
+ * so absolute thresholds are meaningless — rank within the scored batch is
+ * the honest unit (same quintile convention the backtest validated). */
+function mlBatchPercentiles(pairs: Array<[string, number]>): Map<string, number> {
+  const out = new Map<string, number>()
+  const n = pairs.length
+  if (n === 0) return out
+  if (n === 1) {
+    out.set(pairs[0][0], 50)
+    return out
+  }
+  const sorted = [...pairs].sort((a, b) => a[1] - b[1])
+  let i = 0
+  while (i < sorted.length) {
+    let j = i
+    while (j + 1 < sorted.length && sorted[j + 1][1] === sorted[i][1]) j++
+    const pct = (((i + j) / 2) / (sorted.length - 1)) * 100
+    for (let k = i; k <= j; k++) out.set(sorted[k][0], pct)
+    i = j + 1
+  }
+  return out
+}
+
+/** Below this many scored names a percentile is too noisy to gate money on. */
+const ML_MIN_RANK_BREADTH = 25
+
+/**
+ * Re-label a scored universe so every BULLISH verdict is earned by the ML
+ * ensemble and every bearish rules call survives as the exit/warning layer.
+ *
+ * Per name:
+ *  - Rules said Trim/Sell/Avoid  → kept verbatim ('rules-exit'). Measured:
+ *    the rules' bearish side is informative; the ML bottom ranks reinforce
+ *    it below anyway.
+ *  - ML scored it:
+ *      top quintile  (≥80) → Buy Now,   top tercile (≥67) → Accumulate —
+ *      but ONLY through the evidence + risk gates below; a blocked
+ *      promotion holds at Hold ('ml-veto').
+ *      bottom decile (≤10) → Avoid,  bottom quartile (≤25) → Trim ('ml').
+ *      middle → Hold ('ml').
+ *  - No ML score (outside the scored set, or model missing): a rules
+ *    bullish label is DEMOTED to Hold ('demoted-no-ml') — the measured
+ *    anti-signal never reaches the screen.
+ *  - Regime gate closed: same demotion ('demoted-gated') and no ML
+ *    promotions — the backtest showed the model has no edge there.
+ *
+ * Evidence gates for promotions (mirrors the UI's readiness tiers):
+ *   Buy Now    → dataConfidence ≥ 80 AND real SEC fundamentals
+ *   Accumulate → dataConfidence ≥ 60 AND real SEC fundamentals
+ * Risk veto: riskScore ≥ 80 blocks any promotion (upper tail of the
+ * cross-sectional risk distribution — same spirit as the rules' riskZ gate).
+ */
+export function applyMlLedVerdicts(
+  rows: DecisionSignal[],
+  predictedRelReturnByTicker: Map<string, number>,
+  options: { regimeGated?: boolean } = {},
+): DecisionSignal[] {
+  const gated = options.regimeGated === true
+  const pctByTicker = gated
+    ? new Map<string, number>()
+    : mlBatchPercentiles([...predictedRelReturnByTicker.entries()])
+  const haveBreadth = pctByTicker.size >= ML_MIN_RANK_BREADTH
+
+  return rows.map((row) => {
+    const relabel = (action: Action, verdictSource: VerdictSource): DecisionSignal =>
+      action === row.action
+        ? { ...row, verdictSource }
+        : {
+            ...row,
+            action,
+            verdictSource,
+            actionRank: actionRank(action),
+            positionPlan: positionPlan(action, row.opportunityScore, row.riskScore, row.crowding),
+            nextCheck: nextCheckFor(action, row.eventRisk, row.riskScore),
+          }
+
+    // 1. Rules' bearish side survives untouched — its measured strength.
+    if (row.action === 'Trim' || row.action === 'Sell' || row.action === 'Avoid') {
+      return relabel(row.action, 'rules-exit')
+    }
+
+    // 2. Regime gate closed: no layer has earned a bullish call here.
+    if (gated) {
+      if (row.action === 'Buy Now' || row.action === 'Accumulate') {
+        return relabel('Hold', 'demoted-gated')
+      }
+      return relabel(row.action, 'rules')
+    }
+
+    const pct = haveBreadth ? pctByTicker.get(row.ticker) : undefined
+
+    // 3. No ML coverage: rules may keep neutral labels, never bullish ones.
+    if (pct == null) {
+      if (row.action === 'Buy Now' || row.action === 'Accumulate') {
+        return relabel('Hold', 'demoted-no-ml')
+      }
+      return relabel(row.action, 'rules')
+    }
+
+    // 4. ML-ranked names: the ensemble's cross-sectional rank decides.
+    const hasRealFundamentals = row.fundamentalsSource === 'sec-edgar-xbrl'
+    const confidence = row.dataConfidence ?? 0
+    const riskVeto = row.riskScore >= 80
+
+    if (pct >= 80) {
+      if (!riskVeto && hasRealFundamentals && confidence >= 80) return relabel('Buy Now', 'ml')
+      if (!riskVeto && hasRealFundamentals && confidence >= 60) return relabel('Accumulate', 'ml')
+      return relabel('Hold', 'ml-veto')
+    }
+    if (pct >= 67) {
+      if (!riskVeto && hasRealFundamentals && confidence >= 60) return relabel('Accumulate', 'ml')
+      return relabel('Hold', 'ml-veto')
+    }
+    if (pct <= 10) return relabel('Avoid', 'ml')
+    if (pct <= 25) return relabel('Trim', 'ml')
+    return relabel('Hold', 'ml')
+  })
 }
 
 function positionPlan(action: Action, opportunity: number, risk: number, crowding: number) {
