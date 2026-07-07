@@ -39,6 +39,7 @@ class BackendCacheConfig {
     required this.port,
     required this.cacheDirectory,
     required this.webRoot,
+    this.warmup = true,
   });
 
   factory BackendCacheConfig.fromArgs(List<String> args) {
@@ -46,6 +47,7 @@ class BackendCacheConfig {
     var port = 8787;
     var cacheDirectory = Directory('.dart_tool/market_data_cache');
     var webRoot = Directory('build/web');
+    var warmup = true;
 
     for (var index = 0; index < args.length; index++) {
       final arg = args[index];
@@ -75,6 +77,15 @@ class BackendCacheConfig {
             index++;
           }
           break;
+        case '--warmup':
+          // '--warmup off' skips the boot-time universe sync. Used by the
+          // historical study server so thousands of warmup fetches don't
+          // burn the Yahoo rate budget the study's own fetches need.
+          if (next != null) {
+            warmup = next.toLowerCase() != 'off' && next != '0';
+            index++;
+          }
+          break;
         case '--help':
           stdout.writeln(_usage);
           exit(0);
@@ -86,6 +97,7 @@ class BackendCacheConfig {
       port: port,
       cacheDirectory: cacheDirectory,
       webRoot: webRoot,
+      warmup: warmup,
     );
   }
 
@@ -93,12 +105,13 @@ class BackendCacheConfig {
   final int port;
   final Directory cacheDirectory;
   final Directory webRoot;
+  final bool warmup;
 
   static const String _usage = '''
 Finance Oracle backend cache
 
 Usage:
-  dart run tool/backend_cache_server.dart [--host 127.0.0.1] [--port 8787] [--web-root build/web] [--cache-dir .dart_tool/market_data_cache]
+  dart run tool/backend_cache_server.dart [--host 127.0.0.1] [--port 8787] [--web-root build/web] [--cache-dir .dart_tool/market_data_cache] [--warmup off]
 
 Routes:
   GET /                         Serves the Flutter web build from --web-root.
@@ -132,7 +145,11 @@ class BackendCacheServer {
     );
     stdout.writeln('Cache dir: ${config.cacheDirectory.absolute.path}');
     stdout.writeln('Web root: ${config.webRoot.absolute.path}');
-    unawaited(_warmUpUniverse());
+    if (config.warmup) {
+      unawaited(_warmUpUniverse());
+    } else {
+      stdout.writeln('Universe warmup disabled (--warmup off).');
+    }
     await for (final request in server) {
       unawaited(_handleRequest(request));
     }
@@ -966,6 +983,28 @@ class DecisionUniverseService {
         ? fullUniverse.take(limit).toList()
         : fullUniverse;
 
+    // HISTORICAL STUDY MODE (?asOf=YYYY-MM-DD): rebuild the raw signals as
+    // they would have looked on a past date, through this same production
+    // signal builder, so the JS engine's action rules can be event-studied
+    // against what actually happened next. Uses full-history (range=max)
+    // series truncated at asOf; never touches the live price store, the
+    // rolling history file, or the fundamentals warm queue.
+    final asOfParam = uri.queryParameters['asOf'];
+    if (asOfParam != null && asOfParam.isNotEmpty) {
+      final parsed = DateTime.tryParse('${asOfParam}T23:59:59Z');
+      if (parsed == null) {
+        return {
+          'error': 'bad_asof',
+          'detail': 'asOf must be YYYY-MM-DD, got "$asOfParam".',
+        };
+      }
+      return _buildHistorical(
+        symbols: selectedSymbols,
+        asOf: parsed.toUtc(),
+        scenario: scenario,
+      );
+    }
+
     var priceState = await _priceStore.load();
     final syncResult = await _maybeSyncPriceHistory(
       state: priceState,
@@ -1164,18 +1203,179 @@ class DecisionUniverseService {
     }
   }
 
+  /// Full-history series for historical study mode, keyed by symbol and held
+  /// in memory for the life of the server process (the service itself is
+  /// constructed per request, so this must be static). Only SUCCESSES are
+  /// cached: a failed fetch is often transient (Yahoo rate limit while the
+  /// warmup sync is also running), so pinning a null would silently drop the
+  /// name from every study date. Failures retry on later calls, up to a cap
+  /// so a genuinely dead ticker stops burning fetches. Never persisted into
+  /// the live price store.
+  static final Map<String, DecisionPriceSeries> _studySeriesCache =
+      <String, DecisionPriceSeries>{};
+  static final Map<String, int> _studySeriesFailures = <String, int>{};
+  static const int _kStudyFetchMaxAttempts = 3;
+
+  Future<DecisionPriceSeries?> _fetchYahooMaxSeries(String symbol) async {
+    try {
+      // NOT range=max: Yahoo silently degrades range=max to coarse (monthly)
+      // bars. Explicit period1/period2 epoch bounds keep interval=1d honored
+      // over long windows — same trick the desktop's marketData.ts uses.
+      // period2 anchors to the next UTC midnight so the URL (and the proxy
+      // cache key) is stable within a day; 16 years covers a 15-year study
+      // window plus the 120-bar warmup the signal builder requires.
+      final period2 =
+          ((DateTime.now().toUtc().millisecondsSinceEpoch ~/ 86400000) + 1) *
+          86400;
+      final period1 = period2 - (16 * 365.25 * 86400).round();
+      final uri = Uri.parse(
+        'https://query1.finance.yahoo.com/v8/finance/chart/${Uri.encodeComponent(_toYahooSymbol(symbol))}?period1=$period1&period2=$period2&interval=1d&includePrePost=false&events=div%2Csplits',
+      );
+      final response = await _cache.fetch(uri);
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        stdout.writeln(
+          'study fetch for $symbol: upstream HTTP ${response.statusCode}',
+        );
+        return null;
+      }
+      final body = utf8.decode(response.body, allowMalformed: true);
+      final series = DecisionPriceSeries.fromYahooChart(
+        symbol: symbol,
+        fetchedAt: DateTime.now().toUtc(),
+        body: body,
+        maxBars: 0, // keep FULL history — the study truncates per asOf date
+      );
+      if (series.bars.length < 5) {
+        stdout.writeln(
+          'study fetch for $symbol: only ${series.bars.length} bars parsed',
+        );
+      }
+      return series;
+    } catch (error) {
+      // Surface WHY a study fetch failed — a silent null here once hid a
+      // deterministic bug behind what looked like rate limiting.
+      stdout.writeln('study fetch failed for $symbol: $error');
+      return null;
+    }
+  }
+
+  Future<void> _ensureStudySeries(List<String> symbols) async {
+    final missing = symbols
+        .where(
+          (symbol) =>
+              !_studySeriesCache.containsKey(symbol) &&
+              (_studySeriesFailures[symbol] ?? 0) < _kStudyFetchMaxAttempts,
+        )
+        .toList();
+    for (var offset = 0; offset < missing.length; offset += 8) {
+      final chunk = missing.skip(offset).take(8).toList();
+      await Future.wait(
+        chunk.map((symbol) async {
+          final series = await _fetchYahooMaxSeries(symbol);
+          if (series != null && series.bars.length >= 5) {
+            _studySeriesCache[symbol] = series;
+            _studySeriesFailures.remove(symbol);
+          } else {
+            _studySeriesFailures[symbol] =
+                (_studySeriesFailures[symbol] ?? 0) + 1;
+          }
+        }),
+      );
+    }
+  }
+
+  /// Rebuild raw signals as of a past date. Same metrics math, same
+  /// cross-sectional ranks, same freshness gates as live — just anchored at
+  /// [asOf] over series truncated at [asOf]. Fundamentals overlay is SKIPPED
+  /// (the EDGAR overlay ranks current filings — using it here would be
+  /// look-ahead), so quality/value/growth stay neutral exactly like today's
+  /// uncovered names. Price-only by design; labeled in the payload.
+  Future<Map<String, Object?>> _buildHistorical({
+    required List<String> symbols,
+    required DateTime asOf,
+    required String scenario,
+  }) async {
+    await _ensureStudySeries(symbols);
+    final truncated = <String, DecisionPriceSeries>{};
+    for (final symbol in symbols) {
+      final series = _studySeriesCache[symbol];
+      if (series == null) continue;
+      final bars = series.bars
+          .where((bar) => !bar.date.isAfter(asOf))
+          .toList();
+      if (bars.length < 5) continue;
+      truncated[symbol] = DecisionPriceSeries(
+        symbol: series.symbol,
+        source: series.source,
+        fetchedAt: asOf,
+        bars: bars,
+      );
+    }
+    final state = DecisionPriceHistoryState(
+      lastSyncAt: asOf,
+      seriesBySymbol: truncated,
+    );
+    final analytics = DecisionPriceAnalytics.build(
+      state,
+      selectedSymbols: symbols,
+      anchor: asOf,
+    );
+    final signals = <Map<String, Object?>>[];
+    for (var index = 0; index < symbols.length; index++) {
+      final profile = defaultSymbolProfileFor(symbols[index]);
+      if (profile == null) continue;
+      final rawSignal = _rawSignalFor(
+        profile,
+        analytics: analytics,
+        scenario: scenario,
+        index: index,
+        anchor: asOf,
+      );
+      if (rawSignal != null) {
+        signals.add(rawSignal);
+      }
+    }
+    final summaries = signals.map(_summaryForRawSignal).toList();
+    return {
+      'asOf': asOf.toIso8601String(),
+      'historicalMode': true,
+      'source': 'finance-oracle-backend-cache',
+      'detail':
+          'HISTORICAL STUDY MODE: signals rebuilt from bars on or before the '
+          'asOf date through the production signal builder. Fundamentals, '
+          'revisions, and options fields are neutral (price-only), matching '
+          'how uncovered names run live. Universe is the CURRENT symbol list '
+          'applied to the past, so delisted names are absent (survivorship).',
+      'universeSize': symbols.length,
+      'returned': signals.length,
+      'excludedForInsufficientData': symbols.length - signals.length,
+      'fundamentalsCoverage': 0,
+      'scenario': scenario,
+      'marketContext': _marketContextFor(summaries, analytics),
+      'rawSignals': signals,
+      'history': const <Object?>[],
+      'priceCoverage': analytics.coverage.toJson(),
+    };
+  }
+
   Map<String, Object?>? _rawSignalFor(
     DefaultSymbolProfile profile, {
     required DecisionPriceAnalytics analytics,
     required String scenario,
     required int index,
+    DateTime? anchor,
   }) {
     final symbol = profile.symbol;
     final isEtf = profile.isEtf || isCoreEtfSymbol(symbol);
     final metrics = analytics.metricsBySymbol[symbol];
+    // Freshness is judged against the anchor date (the study date in
+    // historical mode, the wall clock live) so a past bar isn't "stale".
     if (metrics == null ||
         metrics.barCount < 120 ||
-        DateTime.now().toUtc().difference(metrics.priceAsOf).inDays > 8) {
+        (anchor ?? DateTime.now().toUtc())
+                .difference(metrics.priceAsOf)
+                .inDays >
+            8) {
       return null;
     }
     final marketMetrics = analytics.marketMetrics;
@@ -1545,6 +1745,11 @@ class DecisionPriceSeries {
     required String symbol,
     required DateTime fetchedAt,
     required String body,
+    // Live sync only needs the recent window, so it keeps the trailing 320
+    // bars. Historical study mode passes 0 (unlimited): capping a 16-year
+    // fetch to the newest 320 bars would silently erase all past history —
+    // every as-of truncation before ~15 months ago would come back empty.
+    int maxBars = 320,
   }) {
     final decoded = jsonDecode(body) as Map<String, dynamic>;
     final chart = decoded['chart'] as Map<String, dynamic>?;
@@ -1593,7 +1798,9 @@ class DecisionPriceSeries {
       symbol: symbol,
       source: 'yahoo-finance',
       fetchedAt: fetchedAt,
-      bars: bars.length > 320 ? bars.sublist(bars.length - 320) : bars,
+      bars: maxBars > 0 && bars.length > maxBars
+          ? bars.sublist(bars.length - maxBars)
+          : bars,
     );
   }
 }
@@ -1711,12 +1918,16 @@ class DecisionPriceAnalytics {
   factory DecisionPriceAnalytics.build(
     DecisionPriceHistoryState state, {
     required List<String> selectedSymbols,
+    DateTime? anchor,
   }) {
     final metricsBySymbol = <String, DecisionPriceMetrics>{};
     for (final symbol in selectedSymbols) {
       final series = state.seriesBySymbol[symbol];
       if (series == null) continue;
-      final metrics = DecisionPriceMetrics.fromSeriesOrNull(series);
+      final metrics = DecisionPriceMetrics.fromSeriesOrNull(
+        series,
+        anchor: anchor,
+      );
       if (metrics != null) {
         metricsBySymbol[symbol] = metrics;
       }
@@ -1748,6 +1959,7 @@ class DecisionPriceAnalytics {
       selectedSymbols: selectedSymbols,
       usableSymbols: usableMetrics.length,
       totalBars: totalBars,
+      anchor: anchor,
     );
     final averageVolatility = usableMetrics.isEmpty
         ? 0.0
@@ -1807,8 +2019,9 @@ class DecisionPriceCoverage {
     required List<String> selectedSymbols,
     required int usableSymbols,
     required int totalBars,
+    DateTime? anchor,
   }) {
-    final now = DateTime.now().toUtc();
+    final now = anchor ?? DateTime.now().toUtc();
     final selectedSet = selectedSymbols.toSet();
     var fresh = 0;
     var stale = 0;
@@ -1907,17 +2120,28 @@ class DecisionPriceMetrics {
   final double dataConfidence;
   final List<String> warnings;
 
-  factory DecisionPriceMetrics.fromSeries(DecisionPriceSeries series) {
+  factory DecisionPriceMetrics.fromSeries(
+    DecisionPriceSeries series, {
+    DateTime? anchor,
+  }) {
     final bars = series.bars.where((bar) => bar.close > 0).toList();
     if (bars.length < 5) {
       throw const FormatException('Not enough bars for metrics.');
     }
-    return DecisionPriceMetrics._fromBars(series.symbol, series.source, bars);
+    return DecisionPriceMetrics._fromBars(
+      series.symbol,
+      series.source,
+      bars,
+      anchor: anchor,
+    );
   }
 
-  static DecisionPriceMetrics? fromSeriesOrNull(DecisionPriceSeries series) {
+  static DecisionPriceMetrics? fromSeriesOrNull(
+    DecisionPriceSeries series, {
+    DateTime? anchor,
+  }) {
     try {
-      return DecisionPriceMetrics.fromSeries(series);
+      return DecisionPriceMetrics.fromSeries(series, anchor: anchor);
     } catch (_) {
       return null;
     }
@@ -1926,8 +2150,11 @@ class DecisionPriceMetrics {
   factory DecisionPriceMetrics._fromBars(
     String symbol,
     String source,
-    List<DecisionPriceBar> bars,
-  ) {
+    List<DecisionPriceBar> bars, {
+    // Historical study mode evaluates freshness relative to the study date,
+    // not the wall clock — otherwise every past bar looks years stale.
+    DateTime? anchor,
+  }) {
     final latest = bars.last;
     final return20 = _returnOver(bars, 20);
     final return60 = _returnOver(bars, 60);
@@ -1943,7 +2170,9 @@ class DecisionPriceMetrics {
         ? 1.0
         : averageVolume20 / averageVolume60;
     final dollarVolume = averageVolume20 * latest.close;
-    final ageDays = DateTime.now().toUtc().difference(latest.date).inDays;
+    final ageDays = (anchor ?? DateTime.now().toUtc())
+        .difference(latest.date)
+        .inDays;
     final barScore = bars.length >= 180
         ? 100.0
         : bars.length >= 120

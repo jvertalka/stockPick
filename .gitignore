@@ -53,3 +53,4 @@ lib/src/data/local_secrets.dart
 # Local model backup + segment-experiment scratch inputs (regenerable)
 desktop-js/tools/ml_trained_model.json
 desktop-js/tools/seg_*.json
+desktop-js/tools/exit_study_results.json
