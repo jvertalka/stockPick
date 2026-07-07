@@ -187,8 +187,13 @@ async function main() {
   console.log('\nCAVEATS (read before trusting):')
   console.log("  - Universe is TODAY'S list applied to the past: delisted names are invisible,")
   console.log('    so exit value is likely UNDERSTATED (the best saves are the deaths we cannot see).')
-  console.log('  - Signals are price-only (fundamentals/revisions/options neutral) — the same')
-  console.log('    footing as live names without EDGAR coverage.')
+  if (fundamentalsMode === 'pit') {
+    console.log('  - Fundamentals are point-in-time SEC filings (as FILED by each date);')
+    console.log('    revisions/options fields stay neutral (no historical analyst feed).')
+  } else {
+    console.log('  - Signals are price-only (fundamentals/revisions/options neutral) — the same')
+    console.log('    footing as live names without EDGAR coverage.')
+  }
   console.log('  - Weekly sampling: a flip is seen up to 4 trading days late.')
   console.log('  - No trading costs; this measures signal timing, not strategy P&L.')
 
