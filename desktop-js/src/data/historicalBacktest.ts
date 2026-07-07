@@ -2656,18 +2656,23 @@ export function runWalkForwardBacktest(
  * visibility (listing age). Annotations are the measured mean per-date IC.
  */
 export const PRUNED_FEATURE_NAMES: string[] = [
-  'volatility_252d',             // +0.074  low-vol (Ang et al. 2006)
-  'volatility_60d',              // +0.072
-  'range_compression_20d',       // +0.069
-  'volatility_20d',              // +0.058
-  'listing_age_years',           // -0.053  survivorship visibility
+  // Refreshed 2026-07-07 from the 48-feature FDR screen (q=0.1, bagged
+  // walk-forward): 13/48 clear control. Two prior keepers FAILED the wider
+  // screen and drop (fund_revenue_growth_yoy, last_close_over_sma_20); two
+  // of the three new tail-risk candidates earn entry. Annotations are the
+  // 2026-07-07 run's measured mean per-date IC.
+  'volatility_252d',             // +0.070  low-vol (Ang et al. 2006)
+  'volatility_60d',              // +0.068
+  'range_compression_20d',       // +0.067
+  'downside_vol_60d',            // +0.059  semi-deviation (Ang-Chen-Xing 2006) — NEW
+  'volatility_20d',              // +0.055
   'momentum_252d',               // +0.050  Jegadeesh-Titman 1993
-  'fund_log_market_cap',         // -0.046  Banz 1981 size
+  'listing_age_years',           // -0.050  survivorship visibility
   'log_price_level',             // -0.046  CHS 2008
-  'price_velocity_acceleration', // -0.046
-  'amihud_illiquidity_20d',      // +0.043  Amihud 2002
-  'fund_revenue_growth_yoy',     // +0.039
-  'last_close_over_sma_20',      // -0.035
+  'fund_log_market_cap',         // -0.045  Banz 1981 size
+  'vol_of_vol_60d',              // +0.045  vol-regime instability — NEW
+  'price_velocity_acceleration', // -0.043
+  'amihud_illiquidity_20d',      // +0.042  Amihud 2002
   'fund_altman_z',               // FDR-significant (smaller |IC|)
 ]
 
