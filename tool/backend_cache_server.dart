@@ -193,9 +193,12 @@ class BackendCacheServer {
     try {
       var previousReturned = -1;
       var noProgressPasses = 0;
-      // 40 passes × 96 symbols covers the full universe even when a very
-      // stale cache (weeks offline) needs everything refetched.
-      for (var pass = 1; pass <= 40; pass++) {
+      // The pass ceiling is a runaway backstop, NOT the expected exit — the
+      // three-strike no-progress break below is what actually ends warmup.
+      // 40 proved too small in practice: a fully stale 2,500-name universe
+      // under provider throttling landed only ~35-45 names per pass and the
+      // budget ran out at 2055/2500 while still progressing.
+      for (var pass = 1; pass <= 150; pass++) {
         if (_stopping) return;
         final result =
             await DecisionUniverseService(
