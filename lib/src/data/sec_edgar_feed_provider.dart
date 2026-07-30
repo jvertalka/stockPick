@@ -14,12 +14,15 @@ class SecEdgarFeedProvider {
     this.corsProxyPrefix = '',
     this.requestTimeout = const Duration(seconds: 3),
     http.Client? client,
-  }) : _client = client ?? http.Client();
+    DateTime Function()? now,
+  }) : _client = client ?? http.Client(),
+       _now = now ?? DateTime.now;
 
   final List<String> symbols;
   final String corsProxyPrefix;
   final Duration requestTimeout;
   final http.Client _client;
+  final DateTime Function() _now;
   Future<Map<String, SecTickerEntry>>? _tickerMapFuture;
 
   Future<FeedSlice<SecEdgarUniverse>> probe({int maxSymbols = 5}) async {
@@ -34,7 +37,7 @@ class SecEdgarFeedProvider {
     return FeedSlice(
       name: 'SEC EDGAR fundamentals',
       source: 'sec-edgar',
-      asOf: DateTime.now(),
+      asOf: _now(),
       data: SecEdgarUniverse(evidenceBySymbol: loaded),
       availability: loaded.isEmpty
           ? FeedAvailability.missing
@@ -285,7 +288,7 @@ class SecEdgarFeedProvider {
     String form,
     Duration window,
   ) {
-    final cutoff = DateTime.now().subtract(window);
+    final cutoff = _now().subtract(window);
     return filings
         .where((filing) => filing.form == form && filing.filed.isAfter(cutoff))
         .length;
@@ -298,7 +301,7 @@ class SecEdgarFeedProvider {
   }) {
     final stalePenalty = latestStatementDate == null
         ? 14
-        : DateTime.now().difference(latestStatementDate).inDays > 150
+        : _now().difference(latestStatementDate).inDays > 150
         ? 12
         : 0;
     return (34 + eightKCount * 8 + form4Count * 3 + stalePenalty)
@@ -310,7 +313,7 @@ class SecEdgarFeedProvider {
     if (filed == null) {
       return 42;
     }
-    final age = DateTime.now().difference(filed).inDays;
+    final age = _now().difference(filed).inDays;
     if (age <= 75) {
       return 78;
     }

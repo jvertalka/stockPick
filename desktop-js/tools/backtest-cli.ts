@@ -11,6 +11,11 @@
  *     "--define:import.meta.env.VITE_FRED_API_KEY='\"\"'"
  *   node tools/backtest-cli.mjs
  *
+ * Persistence is fail-closed. `--persist` writes only a promotable model.
+ * Research artifacts that fail one or more gates require BOTH `--persist`
+ * and the explicit `--allow-advisory-persist` override; their metadata stays
+ * marked advisory-only.
+ *
  * Requires the backend cache server on port 8787 (it proxies Yahoo).
  */
 
@@ -24,6 +29,7 @@ async function main() {
     HISTORICAL_FEATURE_NAMES,
     PRUNED_FEATURE_NAMES,
     analyzeSurvivorship,
+    assessModelPromotion,
     buildHistoricalDataset,
     calibrationAndSizingAudit,
     computeFeatureStats,
@@ -36,12 +42,23 @@ async function main() {
   } = await import('../src/data/historicalBacktest')
   const { cachedFetchDailyBars } = await import('../src/data/marketData')
   const { sampleSkewness, sampleExcessKurtosis } = await import('../src/data/quantMath')
+  const { createServingEnsembleAudit } = await import('../src/data/mlModelService')
   const { deflatedSharpeRatio } = await import('../src/data/selectionStats')
 
   const usePruned = process.argv.includes('--pruned')
   // --persist: PUT the trained bundle to the backend's /ml/model store so
   // every app instance adopts it on next boot (newest trainedAt wins).
   const persist = process.argv.includes('--persist')
+  const allowAdvisoryPersist = process.argv.includes('--allow-advisory-persist')
+  const fdrQIndex = process.argv.indexOf('--fdr-q')
+  const fdrQ = fdrQIndex >= 0 ? Number(process.argv[fdrQIndex + 1]) : null
+  if (fdrQ != null && (!Number.isFinite(fdrQ) || fdrQ <= 0 || fdrQ >= 1)) {
+    throw new Error('--fdr-q must be an explicitly pre-registered value between 0 and 1.')
+  }
+  if (allowAdvisoryPersist && !persist) {
+    console.error('--allow-advisory-persist is valid only together with --persist.')
+    process.exit(2)
+  }
   const rangeArgIndex = process.argv.indexOf('--range')
   const range = (rangeArgIndex >= 0 ? process.argv[rangeArgIndex + 1] : '15y') as
     | '5y'
@@ -55,7 +72,11 @@ async function main() {
   let baseTickers: readonly string[] = DEFAULT_BACKTEST_TICKERS
   if (tickersFileIdx >= 0) {
     const { readFileSync } = await import('node:fs')
-    baseTickers = JSON.parse(readFileSync(process.argv[tickersFileIdx + 1], 'utf-8')) as string[]
+    const parsed: unknown = JSON.parse(readFileSync(process.argv[tickersFileIdx + 1], 'utf-8'))
+    if (!Array.isArray(parsed) || !parsed.every((ticker) => typeof ticker === 'string')) {
+      throw new Error('--tickers-file must contain a JSON array of ticker strings.')
+    }
+    baseTickers = parsed
   }
   // --limit N: train on the first N tickers (the curated bellwethers come
   // first). Used to stage a big retrain — e.g. 500 to de-risk, then 1000.
@@ -80,6 +101,28 @@ async function main() {
       ` · ${d.tickersWithFundamentals ?? 0} with point-in-time EDGAR fundamentals` +
       (d.tickersWithZeroBars ? ` · ${d.tickersWithZeroBars} fetch failures` : '') +
       (d.tickersBelowMinBars ? ` · ${d.tickersBelowMinBars} below history threshold` : ''),
+  )
+  const q = built.quality
+  console.log('Dataset evidence quality:')
+  console.log(
+    `  universe: CURRENT symbols only; PIT membership=${q.universe.pointInTimeMembership ? 'yes' : 'NO'}, ` +
+      `delisted names=${q.universe.includesDelistedSecurities ? 'yes' : 'NO'}, ` +
+      `delisting returns=${q.universe.includesDelistingReturns ? 'yes' : 'NO'}`,
+  )
+  console.log(
+    `  returns: labels use ${q.returns.labelAdjustment}; adjusted-label coverage ` +
+      `${(q.returns.adjustedReturnLabelCoverage * 100).toFixed(1)}%, total-return coverage ` +
+      `${(q.returns.totalReturnLabelCoverage * 100).toFixed(1)}% ` +
+      `(adjusted close is present on ${(q.returns.adjustedCloseAvailabilityCoverage * 100).toFixed(1)}% of received bars)`,
+  )
+  console.log(
+    `  PIT fundamentals: ${(q.fundamentals.sampleSnapshotCoverage * 100).toFixed(1)}% of samples, ` +
+      `${(q.fundamentals.observedFeatureCellCoverage * 100).toFixed(1)}% observed feature cells before imputation; ` +
+      `filed-date aligned=${q.fundamentals.alignedByFiledDate ? 'yes' : 'NO'}`,
+  )
+  console.log(
+    `  locked post-selection holdout: ${q.evaluation.lockedPostSelectionHoldout ? 'yes' : 'NO'} ` +
+      '(walk-forward folds are OOS, but they are not a never-touched final holdout)',
   )
   if (d.tickersWithZeroBars > 0) {
     const failed = d.perTickerSummary.filter((entry) => entry.bars === 0).map((entry) => entry.ticker)
@@ -122,6 +165,7 @@ async function main() {
     console.error('Walk-forward produced no usable steps.')
     process.exit(1)
   }
+  const promotion = assessModelPromotion(built.quality, result.baselineEvidence)
 
   // Regime labeling: point-in-time Markov regime on SPY at each step
   // start. 'max', not the dataset range: every step needs 60+ prior SPY
@@ -169,6 +213,17 @@ async function main() {
   if (momInSet) {
     console.log(`Edge over momentum: ${f(result.meanIC - result.meanBaselineMomentumIc)}`)
   }
+  console.log('Paired moving-block bootstrap edge (model IC minus baseline IC):')
+  for (const comparison of [result.baselineEvidence.random, result.baselineEvidence.momentum]) {
+    const ci = comparison.ci95
+    console.log(
+      `  vs ${comparison.baseline.padEnd(13)} ` +
+        (ci
+          ? `${f(ci.mean)}  CI [${f(ci.lower)}, ${f(ci.upper)}]  ` +
+            `${comparison.ciClearOfZero ? 'PASS: lower > 0' : 'ADVISORY: CI crosses 0'}`
+          : `n/a (only ${comparison.pairedStepCount} usable paired window${comparison.pairedStepCount === 1 ? '' : 's'})`),
+    )
+  }
   console.log('')
   console.log('--- Long-short quintile (20d horizon) ---')
   console.log(`Gross return: ${f(result.meanLongShortReturnGross, 2)}%`)
@@ -206,24 +261,28 @@ async function main() {
   // === Selection-inflation audit: how much of the headline is real? ===
   console.log('')
   console.log('--- Selection-inflation audit (Harvey-Liu-Zhu 2016 FDR; Bailey-López de Prado 2014 DSR) ---')
-  const fdr = featureSelectionFDR(built.samples, HISTORICAL_FEATURE_NAMES, 0.1)
-  const survivors = fdr.perFeature.filter((p) => p.significant).map((p) => p.name)
-  const keptFailing = PRUNED_FEATURE_NAMES.filter((n) => !survivors.includes(n))
-  const newSignificant = survivors.filter((n) => !PRUNED_FEATURE_NAMES.includes(n))
-  console.log(
-    `FDR feature screen (q=${fdr.q}): ${fdr.significantCount}/${HISTORICAL_FEATURE_NAMES.length} features clear multiple-testing control.`,
-  )
-  console.log(
-    `  current ${PRUNED_FEATURE_NAMES.length}-feature keeper set: ${PRUNED_FEATURE_NAMES.length - keptFailing.length} survive, ${keptFailing.length} FAIL FDR` +
-      (keptFailing.length ? ` [${keptFailing.join(', ')}]` : ''),
-  )
-  if (newSignificant.length) {
-    console.log(`  significant but NOT kept (possible dropped signal): ${newSignificant.join(', ')}`)
-  }
-  const fdrRanked = [...fdr.perFeature].sort((a, b) => Math.abs(b.meanIC) - Math.abs(a.meanIC)).slice(0, 12)
-  console.log('  top features by |IC|:   feature              meanIC    p-val   FDR')
-  for (const p of fdrRanked) {
-    console.log(`    ${p.name.padEnd(22)} ${f(p.meanIC).padStart(7)}  ${f(p.pValue).padStart(6)}   ${p.significant ? 'YES' : 'no'}`)
+  if (fdrQ == null) {
+    console.log('FDR feature screen skipped: pass a pre-registered --fdr-q value; no hidden default is applied.')
+  } else {
+    const fdr = featureSelectionFDR(built.samples, HISTORICAL_FEATURE_NAMES, fdrQ)
+    const survivors = fdr.perFeature.filter((p) => p.significant).map((p) => p.name)
+    const keptFailing = PRUNED_FEATURE_NAMES.filter((n) => !survivors.includes(n))
+    const newSignificant = survivors.filter((n) => !PRUNED_FEATURE_NAMES.includes(n))
+    console.log(
+      `FDR feature screen (pre-registered q=${fdr.q}): ${fdr.significantCount}/${HISTORICAL_FEATURE_NAMES.length} features clear multiple-testing control.`,
+    )
+    console.log(
+      `  current ${PRUNED_FEATURE_NAMES.length}-feature keeper set: ${PRUNED_FEATURE_NAMES.length - keptFailing.length} survive, ${keptFailing.length} FAIL FDR` +
+        (keptFailing.length ? ` [${keptFailing.join(', ')}]` : ''),
+    )
+    if (newSignificant.length) {
+      console.log(`  significant but NOT kept (possible dropped signal): ${newSignificant.join(', ')}`)
+    }
+    const fdrRanked = [...fdr.perFeature].sort((a, b) => Math.abs(b.meanIC) - Math.abs(a.meanIC)).slice(0, 12)
+    console.log('  top features by |IC|:   feature              meanIC    p-val   FDR')
+    for (const p of fdrRanked) {
+      console.log(`    ${p.name.padEnd(22)} ${f(p.meanIC).padStart(7)}  ${f(p.pValue).padStart(6)}   ${p.significant ? 'YES' : 'no'}`)
+    }
   }
   // Deflated Sharpe Ratio of the L/S strategy (per-step return series).
   const stepRets = result.steps.map((s) => s.longShortReturnNet)
@@ -337,7 +396,27 @@ async function main() {
     )
   }
 
+  console.log('')
+  console.log(`--- Model promotion assessment: ${promotion.status.toUpperCase()} ---`)
+  for (const reason of promotion.reasons) {
+    const tag = reason.status === 'pass' ? 'PASS' : reason.status === 'warning' ? 'WARN' : 'BLOCK'
+    console.log(`  [${tag}] ${reason.title}: ${reason.detail}`)
+  }
+
   if (persist) {
+    if (!promotion.promotable && !allowAdvisoryPersist) {
+      console.error(
+        '\nREFUSED --persist: this model is advisory-only. Resolve every BLOCK above, or use ' +
+          '--persist --allow-advisory-persist to save a clearly labeled research artifact.',
+      )
+      process.exitCode = 2
+      return
+    }
+    const persistedMode = promotion.promotable ? 'promoted' : 'advisory-only'
+    console.log(
+      `\nPersistence authorized in ${persistedMode.toUpperCase()} mode` +
+        (!promotion.promotable ? ' by --allow-advisory-persist.' : '.'),
+    )
     const stats = computeFeatureStats(samples)
     const bundle20 = result.horizonBundles.find((bundle) => bundle.horizon === 20)
     const payload = {
@@ -353,6 +432,23 @@ async function main() {
         conformalOffsetPct: bundle.conformalOffsetPct,
       })),
       conformalOffset20dPct: bundle20?.conformalOffsetPct,
+      servingEnsembleAudit: createServingEnsembleAudit({
+        model: result.trainedModel,
+        bag20: result.bag20,
+        p10Model: bundle20?.p10Model,
+        p90Model: bundle20?.p90Model,
+        horizonModels: result.horizonBundles.map((bundle) => ({
+          horizon: bundle.horizon,
+          medianModel: bundle.medianModel,
+          meanIC: bundle.meanIC,
+          icCI: bundle.icCI,
+          conformalOffsetPct: bundle.conformalOffsetPct,
+        })),
+        conformalOffset20dPct: bundle20?.conformalOffsetPct,
+        featureNames,
+        featureMeans: stats.means,
+        featureStds: stats.stds,
+      }),
       trainedAt: new Date().toISOString(),
       featureCount: result.trainedModel.numFeatures,
       featureNames,
@@ -363,6 +459,16 @@ async function main() {
       meanLongShortReturnNet: result.meanLongShortReturnNet,
       meanLongShortSharpe: result.meanLongShortSharpe,
       hyperparameters: result.hyperparameters,
+      datasetProvenance: {
+        ...built.provenance,
+        featureNames: [...featureNames],
+      },
+      datasetQuality: built.quality,
+      promotion: {
+        ...promotion,
+        persistedMode,
+        advisoryOverrideUsed: !promotion.promotable && allowAdvisoryPersist,
+      },
     }
     const base = import.meta.env.VITE_ORACLE_BACKEND_URL ?? 'http://127.0.0.1:8787'
     const json = JSON.stringify(payload)
@@ -371,6 +477,12 @@ async function main() {
     // retrain — the file can be PUT to /ml/model separately.
     const fs = await import('node:fs/promises')
     await fs.writeFile('tools/ml_trained_model.json', json)
+    if (!promotion.promotable) {
+      console.log(
+        'Advisory artifact saved to tools/ml_trained_model.json only; it was not uploaded to the canonical /ml/model slot and cannot displace a promoted model.',
+      )
+      return
+    }
     let persisted = false
     for (let attempt = 0; attempt < 4 && !persisted; attempt++) {
       if (attempt > 0) await new Promise((r) => setTimeout(r, 1500))

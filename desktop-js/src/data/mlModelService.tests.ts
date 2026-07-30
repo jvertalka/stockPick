@@ -13,14 +13,160 @@
  */
 import {
   computeLiveScorecard,
+  createServingEnsembleAudit,
   crossSectionalNormalizeServingBatch,
+  modelDecisionAuthority,
   type LoggedPrediction,
+  type StoredMlModel,
 } from './mlModelService'
+import {
+  assessModelPromotion,
+  HISTORICAL_FEATURE_PIPELINE_VERSION,
+  type BacktestDatasetQuality,
+  type BaselineEvidence,
+} from './historicalBacktest'
 
 type TestResult = { name: string; passed: boolean; detail?: string }
 
 function approx(a: number, b: number, tol = 1e-7): boolean {
   return Math.abs(a - b) < tol
+}
+
+function auditedModel(
+  persistedMode: 'promoted' | 'advisory-only' = 'promoted',
+): StoredMlModel {
+  const quality: BacktestDatasetQuality = {
+    schemaVersion: 1,
+    universe: {
+      pointInTimeMembership: true,
+      includesDelistedSecurities: true,
+      includesDelistingReturns: true,
+      survivorshipBiasControlled: true,
+      intendedMemberCount: 2,
+      membersWithUsablePriceHistory: 2,
+      membersWithExplicitNoHistoryOutcome: 0,
+      memberOutcomeCoverage: 1,
+      limitation: 'none',
+    },
+    returns: {
+      labelPriceField: 'close',
+      labelAdjustment: 'total-return',
+      barsObserved: 1000,
+      sourceRowsObserved: 1000,
+      sourceInvalidRawBars: 0,
+      sourceRowAcceptanceCoverage: 1,
+      sourceEligibleRawBars: 1000,
+      sourceMissingAdjustedBars: 0,
+      sourceAdjustmentCoverage: 1,
+      barsWithAdjustedCloseAvailable: 1000,
+      adjustedCloseAvailabilityCoverage: 1,
+      adjustedReturnLabelCoverage: 1,
+      totalReturnLabelCoverage: 1,
+      dividendsIncludedInLabels: true,
+      limitation: 'none',
+    },
+    fundamentals: {
+      source: 'SEC EDGAR XBRL companyfacts',
+      alignedByFiledDate: true,
+      tickersWithTimeline: 2,
+      usableTickers: 2,
+      tickerTimelineCoverage: 1,
+      samplesWithPointInTimeSnapshot: 1000,
+      totalSamples: 1000,
+      sampleSnapshotCoverage: 1,
+      observedFeatureCells: 3000,
+      totalFeatureCells: 3000,
+      observedFeatureCellCoverage: 1,
+      limitation: 'none',
+    },
+    evaluation: {
+      purgedWalkForwardSupported: true,
+      embargoSupported: true,
+      foldLocalPreprocessing: true,
+      lockedPostSelectionHoldout: true,
+      limitation: 'none',
+    },
+  }
+  const comparison = (baseline: 'random' | 'momentum_252d') => ({
+    baseline,
+    metric: 'information-coefficient' as const,
+    pairedStepCount: 20,
+    meanDifference: 0.08,
+    bootstrapIterations: 2000,
+    blockLength: 4,
+    ci95: { lower: 0.02, mean: 0.08, upper: 0.13 },
+    ciClearOfZero: true,
+  })
+  const evidence: BaselineEvidence = {
+    method: 'paired moving-block bootstrap (Kunsch 1989; Politis-Romano 1994)',
+    confidenceLevel: 0.95,
+    random: comparison('random'),
+    momentum: comparison('momentum_252d'),
+  }
+  const assessment = assessModelPromotion(quality, evidence)
+  const executableModel = {
+    trees: [{ root: { isLeaf: true as const, value: 0 } }],
+    learningRate: 0.05,
+    baseValue: 0,
+    numFeatures: 1,
+  }
+  const bag20 = Array.from({ length: 5 }, () => executableModel)
+  const horizonModels = [5, 20, 60, 120].map((horizon) => ({
+    horizon,
+    medianModel: executableModel,
+    meanIC: 0.08,
+    icCI: { lower: 0.02, mean: 0.08, upper: 0.13 },
+    conformalOffsetPct: 0.25,
+  }))
+  const stored: StoredMlModel = {
+    model: executableModel,
+    bag20,
+    p10Model: executableModel,
+    p90Model: executableModel,
+    horizonModels,
+    conformalOffset20dPct: 0.25,
+    trainedAt: '2026-07-09T00:00:00.000Z',
+    featureCount: 1,
+    featureNames: ['momentum_252d'],
+    featureMeans: [0],
+    featureStds: [1],
+    meanIC: 0.08,
+    meanLongShortReturnNet: 0.4,
+    meanLongShortSharpe: 1.2,
+    hyperparameters: { numTrees: 1, depth: 1, learningRate: 0.05 },
+    datasetProvenance: {
+      schemaVersion: 2,
+      builtAt: '2026-07-09T00:00:00.000Z',
+      featurePipelineVersion: HISTORICAL_FEATURE_PIPELINE_VERSION,
+      priceSource: 'Yahoo Finance chart via local cache proxy',
+      fundamentalsSource: 'SEC EDGAR XBRL companyfacts via local backend',
+      universeTickers: ['AAA', 'BBB'],
+      universeConstruction: 'point-in-time security master with delistings',
+      universeEvidence: {
+        kind: 'point-in-time-with-delistings',
+        membershipSource: 'test point-in-time security master',
+        constituentEffectiveDateField: 'effective_date',
+        delistedSecuritySource: 'test dead-security file',
+        delistingReturnSource: 'test delisting-return file',
+      },
+      requestedRange: '15y',
+      fetchedRange: 'max',
+      cadenceTradingDays: 20,
+      minimumBarsPerTicker: 280,
+      featureNames: ['momentum_252d'],
+      labelHorizonsTradingDays: [5, 20, 60, 120],
+      sampleCount: 1000,
+      sampleDateRange: { start: '2010-01-01', end: '2025-12-31' },
+    },
+    datasetQuality: quality,
+    promotion: {
+      ...assessment,
+      persistedMode,
+      advisoryOverrideUsed: persistedMode === 'advisory-only',
+    },
+  }
+  stored.servingEnsembleAudit = createServingEnsembleAudit(stored)
+  return stored
 }
 
 export function runServingNormTests(): TestResult[] {
@@ -135,6 +281,110 @@ export function runServingNormTests(): TestResult[] {
       name: 'F: Infinity treated as missing (no column poisoning)',
       passed: ok,
       detail: ok ? undefined : `noNaN=${noNaN} C=${out.get('C')![0]}`,
+    })
+  }
+
+  // G — a legacy artifact without an evidence audit must fail closed.
+  {
+    const authority = modelDecisionAuthority({} as StoredMlModel)
+    results.push({
+      name: 'G: legacy model cannot lead decisions',
+      passed:
+        authority.canLeadDecisions === false &&
+        authority.status === 'legacy-unverified' &&
+        authority.blockerCodes.includes('MISSING_PROMOTION_AUDIT'),
+      detail: `${authority.status}: ${authority.detail}`,
+    })
+  }
+
+  // H — advisory persistence never grants action-label authority, even when
+  // the statistical assessment itself is otherwise marked promotable.
+  {
+    const authority = modelDecisionAuthority(auditedModel('advisory-only'))
+    results.push({
+      name: 'H: advisory persistence cannot lead decisions',
+      passed: authority.canLeadDecisions === false && authority.status === 'advisory-only',
+      detail: `${authority.status}: ${authority.detail}`,
+    })
+  }
+
+  // I — both the evidence assessment and persistence mode must authorize use.
+  {
+    const authority = modelDecisionAuthority(auditedModel('promoted'))
+    results.push({
+      name: 'I: audited promoted model may lead decisions',
+      passed: authority.canLeadDecisions === true && authority.status === 'promoted',
+      detail: `${authority.status}: ${authority.detail}`,
+    })
+  }
+
+  // J — a forged/stale promotion claim cannot override the embedded dataset
+  // quality. Authority recomputes the policy and detects the mismatch.
+  {
+    const model = auditedModel('promoted')
+    model.datasetQuality = {
+      ...model.datasetQuality!,
+      universe: {
+        ...model.datasetQuality!.universe,
+        pointInTimeMembership: false,
+        limitation: 'current-survivor list',
+      },
+    }
+    const authority = modelDecisionAuthority(model)
+    results.push({
+      name: 'J: inconsistent embedded promotion claim fails closed',
+      passed:
+        authority.canLeadDecisions === false &&
+        authority.blockerCodes.includes('INCONSISTENT_DATASET_AUDIT'),
+      detail: `${authority.status}: ${authority.detail}`,
+    })
+  }
+
+  // K — runtime validation rejects a malformed remote audit without throwing.
+  {
+    const model = auditedModel('promoted')
+    ;(model.promotion as unknown as { reasons: unknown }).reasons = null
+    const authority = modelDecisionAuthority(model)
+    results.push({
+      name: 'K: malformed promotion JSON fails closed safely',
+      passed:
+        authority.canLeadDecisions === false &&
+        authority.blockerCodes.includes('INCONSISTENT_PROMOTION_AUDIT'),
+      detail: `${authority.status}: ${authority.detail}`,
+    })
+  }
+
+  // L — duplicate horizon votes cannot bias conviction even if a corrupted
+  // payload recomputes its own non-cryptographic state fingerprint.
+  {
+    const model = auditedModel('promoted')
+    model.horizonModels![1] = { ...model.horizonModels![0] }
+    model.servingEnsembleAudit = createServingEnsembleAudit(model)
+    const authority = modelDecisionAuthority(model)
+    results.push({
+      name: 'L: duplicate promoted horizon set fails closed',
+      passed:
+        authority.canLeadDecisions === false &&
+        authority.blockerCodes.includes('INVALID_MODEL_ARTIFACT'),
+      detail: `${authority.status}: ${authority.detail}`,
+    })
+  }
+
+  // M — dataset provenance must name the exact feature order the executable
+  // model serves, including a pruned selection.
+  {
+    const model = auditedModel('promoted')
+    model.datasetProvenance = {
+      ...model.datasetProvenance!,
+      featureNames: ['momentum_20d'],
+    }
+    const authority = modelDecisionAuthority(model)
+    results.push({
+      name: 'M: provenance/model feature mismatch fails closed',
+      passed:
+        authority.canLeadDecisions === false &&
+        authority.blockerCodes.includes('INCONSISTENT_DATASET_AUDIT'),
+      detail: `${authority.status}: ${authority.detail}`,
     })
   }
 
@@ -349,6 +599,23 @@ export function runScorecardTests(): TestResult[] {
       name: 'S9: rank IC with ties (average ranks)',
       passed: ok,
       detail: ok ? undefined : `rank=${card.meanRankIc}`,
+    })
+  }
+
+  // S10 — decay evidence is attributed only to the current executable model;
+  // an older inverse-skill cohort cannot contaminate its scorecard.
+  {
+    const log: LoggedPrediction[] = []
+    ;[1, 2, 3, 4, 5].forEach((p, i) => {
+      log.push({ ...entry(`J${i}`, '2026-03-10', p, p), modelFingerprint: 'current' })
+      log.push({ ...entry(`J${i}`, '2026-03-10', p, 6 - p), modelFingerprint: 'old' })
+    })
+    const card = computeLiveScorecard(log, { modelFingerprint: 'current' })
+    const ok = card.realizedTotal === 5 && card.meanIc != null && approx(card.meanIc, 1)
+    results.push({
+      name: 'S10: scorecard isolates the current model fingerprint',
+      passed: ok,
+      detail: ok ? undefined : `n=${card.realizedTotal} ic=${card.meanIc}`,
     })
   }
 

@@ -1,0 +1,45 @@
+name: Evidence quality
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: evidence-quality-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  workstation:
+    name: TypeScript evidence gate
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: desktop-js
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: desktop-js/.nvmrc
+          cache: npm
+          cache-dependency-path: desktop-js/package-lock.json
+      - run: npm ci
+      - run: npm run quality
+
+  dart-sidecar:
+    name: Dart sidecar and legacy contracts (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.41.2'
+          channel: stable
+          cache: true
+      - run: flutter pub get --enforce-lockfile
+      - run: dart format --output=none --set-exit-if-changed tool/backend_cache_server.dart lib/src/data/sec_edgar_feed_provider.dart test/backend_cache_server_test.dart test/price_adjustment_test.dart test/free_layer_providers_test.dart
+      - run: flutter analyze
+      - run: flutter test

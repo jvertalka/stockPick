@@ -1,202 +1,117 @@
-import { useEffect, useState } from 'react'
-import { CheckCircle2, Circle, GraduationCap } from 'lucide-react'
-import { kvGet, kvSet } from '../data/storage'
+import { AlertTriangle, CheckCircle2, Circle, GraduationCap } from 'lucide-react'
 import type { DecisionUniverseResponse } from '../data/decisionApi'
 import type { DecisionSignal } from '../data/decisionEngine'
+import {
+  modelDecisionAuthority,
+  type StoredMlModel,
+} from '../data/mlModelService'
 
 /**
- * Surfaces the path from rules to trained ML.
- *
- * Five gates (mirroring the Flutter ValidationEngine.modelReadiness):
- *   1. Snapshot accumulation - point-in-time evidence days collected
- *   2. Universe size        - number of tickers being scored
- *   3. Validation windows   - distinct labeled forward-return windows
- *   4. Labeled outcomes     - % of past predictions that have a real
- *                              forward return now available
- *   5. Integrity            - cross-validation didn't show leakage
- *
- * The first counter accumulates client-side: every successful refresh
- * stamps a date into IndexedDB. Once 6 months of distinct dates land,
- * gate 1 turns green.
+ * The promotion audit shown here is the same structured evidence object that
+ * the CLI and in-app trainer persist with the model. This panel does not infer
+ * readiness from time elapsed or browser refresh counts.
  */
-
-const SNAPSHOT_TARGET = 180
-const UNIVERSE_TARGET = 100
-const WINDOW_TARGET = 30
-const LABEL_TARGET_PCT = 80
-
-type Gate = {
-  id: string
-  label: string
-  current: number
-  target: number
-  unit: string
-  done: boolean
-  detail: string
-}
-
 export function ModelReadinessPanel({
   feed,
   universe,
+  model,
 }: {
   feed: DecisionUniverseResponse | null
   universe: DecisionSignal[]
+  model: StoredMlModel | null
 }) {
-  const [snapshotDays, setSnapshotDays] = useState<number>(0)
+  const authority = modelDecisionAuthority(model)
+  const reasons = model?.promotion?.reasons ?? []
+  const passed = reasons.filter((reason) => reason.status === 'pass').length
+  const total = reasons.length
+  const liveNames = feed?.returned ?? universe.length
+  const requestedNames = feed?.universeSize ?? universe.length
+  const fundamentalsCoverage = feed?.fundamentalsCoverage ?? 0
+  const sampleRange = model?.datasetProvenance?.sampleDateRange
 
-  useEffect(() => {
-    let cancelled = false
-    void recordTodaySnapshot().then(async () => {
-      const days = await countSnapshotDays()
-      if (!cancelled) setSnapshotDays(days)
-    })
-    return () => {
-      cancelled = true
-    }
-  }, [feed?.asOf])
-
-  const universeSize = feed?.universeSize ?? universe.length
-  const historyLength = feed?.history?.length ?? 0
-  // Forward-return labels require N+20 calendar days of history per
-  // recorded ranking. Until we have at least 20 days of accumulation,
-  // labeled-outcome % stays at 0.
-  const labelablePct =
-    snapshotDays > 20
-      ? Math.min(100, Math.round((Math.max(0, snapshotDays - 20) / SNAPSHOT_TARGET) * 100))
-      : 0
-
-  const gates: Gate[] = [
-    {
-      id: 'snapshots',
-      label: 'Snapshot accumulation',
-      current: snapshotDays,
-      target: SNAPSHOT_TARGET,
-      unit: 'days',
-      done: snapshotDays >= SNAPSHOT_TARGET,
-      detail:
-        snapshotDays === 0
-          ? 'No snapshots persisted yet — they accumulate one per successful refresh.'
-          : `Roughly ${Math.max(0, SNAPSHOT_TARGET - snapshotDays)} more trading days needed.`,
-    },
-    {
-      id: 'universe',
-      label: 'Universe size',
-      current: universeSize,
-      target: UNIVERSE_TARGET,
-      unit: 'names',
-      done: universeSize >= UNIVERSE_TARGET,
-      detail: `Currently scoring ${universeSize} tickers.`,
-    },
-    {
-      id: 'windows',
-      label: 'Validation windows',
-      current: historyLength,
-      target: WINDOW_TARGET,
-      unit: 'windows',
-      done: historyLength >= WINDOW_TARGET,
-      detail: `${historyLength} historical windows kept in the rolling history buffer.`,
-    },
-    {
-      id: 'labels',
-      label: 'Labeled outcomes',
-      current: labelablePct,
-      target: LABEL_TARGET_PCT,
-      unit: '%',
-      done: labelablePct >= LABEL_TARGET_PCT,
-      detail:
-        labelablePct === 0
-          ? 'No predictions have aged into the +20d label window yet.'
-          : `${labelablePct}% of past predictions now have a measurable forward return.`,
-    },
-    {
-      id: 'integrity',
-      label: 'Leakage / integrity check',
-      current: 0,
-      target: 1,
-      unit: 'pass',
-      done: false,
-      detail: 'Runs after gates 1–4 clear. Cross-validates that no future-information leaks into ranking inputs.',
-    },
-  ]
-
-  const cleared = gates.filter((gate) => gate.done).length
-  const nextActionable = estimateNextActionable(snapshotDays)
+  const statusLabel =
+    authority.status === 'promoted'
+      ? 'Promoted for decisions'
+      : authority.status === 'advisory-only'
+        ? 'Research only'
+        : 'Unverified legacy model'
 
   return (
     <section className="panel readiness-panel-large" data-testid="model-readiness">
       <header className="panel-header">
         <div>
-          <p>Path to trained models</p>
+          <p>Model evidence contract</p>
           <h2>
-            {cleared}/{gates.length} readiness gates cleared
+            {total > 0 ? `${passed}/${total} promotion checks passed` : statusLabel}
           </h2>
         </div>
-        <span className="pill neutral">
-          <GraduationCap size={12} /> Rules-only today
+        <span className={`pill ${authority.canLeadDecisions ? 'positive' : 'caution'}`}>
+          <GraduationCap size={12} /> {statusLabel}
         </span>
       </header>
+
       <p className="readiness-lede">
-        Until every gate clears, the engine runs hand-set weights and thresholds. Trained models are
-        worth shipping only after we have enough labeled history for honest backtests.
+        {authority.canLeadDecisions
+          ? 'This artifact passed the recorded data-provenance and paired-baseline checks and may set live action labels.'
+          : model
+            ? 'Forecasts remain visible for research, but this artifact cannot mint Buy, Accumulate, Trim, or Avoid labels. Rules exits remain independent risk warnings.'
+            : 'No audited model is loaded, so bullish actions are paused. Rules exits remain visible as independent risk warnings.'}
       </p>
-      <ol className="gate-list">
-        {gates.map((gate) => (
-          <li className={gate.done ? 'done' : ''} key={gate.id}>
-            <span className="gate-icon">
-              {gate.done ? <CheckCircle2 size={16} /> : <Circle size={16} />}
-            </span>
-            <div className="gate-body">
-              <div className="gate-row">
-                <strong>{gate.label}</strong>
-                <span className="gate-progress">
-                  {gate.current.toLocaleString()} / {gate.target.toLocaleString()} {gate.unit}
+
+      {reasons.length > 0 ? (
+        <ol className="gate-list">
+          {reasons.map((reason) => {
+            const done = reason.status === 'pass'
+            return (
+              <li className={done ? 'done' : ''} key={reason.code}>
+                <span className="gate-icon">
+                  {done ? (
+                    <CheckCircle2 size={16} />
+                  ) : reason.status === 'warning' ? (
+                    <AlertTriangle size={16} />
+                  ) : (
+                    <Circle size={16} />
+                  )}
                 </span>
-              </div>
-              <div className="gate-bar">
-                <span
-                  style={{
-                    width: `${Math.min(100, (gate.current / Math.max(1, gate.target)) * 100)}%`,
-                  }}
-                />
-              </div>
-              <span className="gate-detail">{gate.detail}</span>
-            </div>
-          </li>
-        ))}
-      </ol>
+                <div className="gate-body">
+                  <div className="gate-row">
+                    <strong>{reason.title}</strong>
+                    <span className="gate-progress">{reason.status}</span>
+                  </div>
+                  <span className="gate-detail">{reason.detail}</span>
+                </div>
+              </li>
+            )
+          })}
+        </ol>
+      ) : (
+        <div className="empty-state compact">
+          <strong>Promotion metadata unavailable</strong>
+          <span>{authority.detail}</span>
+        </div>
+      )}
+
       <footer className="readiness-footer">
-        <strong>Estimated earliest training date</strong>
-        <span>{nextActionable}</span>
+        <div>
+          <strong>Live evidence</strong>
+          <span>
+            {liveNames.toLocaleString()}/{requestedNames.toLocaleString()} names scoreable ·{' '}
+            {fundamentalsCoverage.toLocaleString()} with SEC fundamentals
+          </span>
+        </div>
+        <div>
+          <strong>Training evidence</strong>
+          <span>
+            {model?.datasetProvenance
+              ? `${model.datasetProvenance.sampleCount.toLocaleString()} samples${
+                  sampleRange?.start && sampleRange.end
+                    ? ` · ${sampleRange.start} to ${sampleRange.end}`
+                    : ''
+                }`
+              : 'No auditable dataset provenance attached'}
+          </span>
+        </div>
       </footer>
     </section>
   )
-}
-
-const SNAPSHOT_KEY = 'model-readiness:dates'
-
-async function recordTodaySnapshot() {
-  const today = new Date().toISOString().slice(0, 10)
-  const stored = (await kvGet<string[]>(SNAPSHOT_KEY)) ?? []
-  if (stored.includes(today)) return
-  stored.push(today)
-  // Cap at 5 years of dates
-  const trimmed = stored.slice(-1825)
-  await kvSet(SNAPSHOT_KEY, trimmed)
-}
-
-async function countSnapshotDays() {
-  const stored = (await kvGet<string[]>(SNAPSHOT_KEY)) ?? []
-  return stored.length
-}
-
-function estimateNextActionable(snapshotDays: number) {
-  if (snapshotDays >= SNAPSHOT_TARGET) {
-    return 'All accumulation gates met — ready to begin shadow training.'
-  }
-  const remaining = SNAPSHOT_TARGET - snapshotDays
-  // Trading-day estimate: 21 per month
-  const months = Math.ceil(remaining / 21)
-  const target = new Date()
-  target.setMonth(target.getMonth() + months)
-  return `~${target.toLocaleDateString('en-US', { month: 'long', year: 'numeric' })} (${remaining} more trading days)`
 }

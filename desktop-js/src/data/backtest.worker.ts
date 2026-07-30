@@ -2,12 +2,14 @@
 
 import {
   PRUNED_FEATURE_NAMES,
+  assessModelPromotion,
   buildHistoricalDataset,
   computeFeatureStats,
   pruneSampleFeatures,
   runWalkForwardBacktest,
   type DatasetBuildResult,
   type FullBacktestResult,
+  type ModelPromotionAssessment,
 } from './historicalBacktest'
 
 /**
@@ -44,6 +46,9 @@ type WorkerOutbound =
   | {
       type: 'done'
       result: FullBacktestResult
+      provenance: DatasetBuildResult['provenance']
+      quality: DatasetBuildResult['quality']
+      promotion: ModelPromotionAssessment
       /** Raw-feature mean/std for the pruned columns — what live
        * predictions must normalize against (NOT 0/1). */
       featureStats: { means: number[]; stds: number[] }
@@ -105,6 +110,9 @@ ctx.onmessage = async (event: MessageEvent<RunMessage>) => {
     const done: WorkerOutbound = {
       type: 'done',
       result,
+      provenance: built.provenance,
+      quality: built.quality,
+      promotion: assessModelPromotion(built.quality, result.baselineEvidence),
       featureStats: computeFeatureStats(pruned.samples),
     }
     ctx.postMessage(done)

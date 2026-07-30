@@ -31,6 +31,7 @@ void main() {
     final provider = SecEdgarFeedProvider(
       symbols: const ['AAPL'],
       client: client,
+      now: () => DateTime.utc(2026, 5, 1),
     );
     final evidence = await provider.loadCompanyEvidence('AAPL');
 

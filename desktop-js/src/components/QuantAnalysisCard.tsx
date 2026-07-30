@@ -68,7 +68,12 @@ export function QuantAnalysisCard({ signal }: { signal: DecisionSignal }) {
         <Sigma size={14} />
         <strong>Quantitative analysis</strong>
         <span className="quant-source">
-          {analysis.barsAvailable}d bars · {analysis.hasOptionsData ? 'BSM live' : 'BSM unavailable'}
+          {analysis.barsAvailable}d bars · {analysis.hasOptionsData ? 'BSM live' : 'BSM unavailable'} ·{' '}
+          {analysis.riskFreeRateSource === 'fred-dgs1mo'
+            ? `FRED DGS1MO ${analysis.riskFreeRateObservationDate ?? 'date unavailable'}`
+            : analysis.riskFreeRateSource === 'longrun-fallback-fred-stale'
+              ? `long-run Rf fallback (FRED ${analysis.riskFreeRateObservationDate ?? 'date unavailable'}; proxy ${analysis.riskFreeRateCacheState ?? 'state unavailable'})`
+              : 'long-run Rf fallback'}
         </span>
       </header>
 

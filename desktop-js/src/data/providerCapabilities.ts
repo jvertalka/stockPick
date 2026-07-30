@@ -36,7 +36,7 @@ let snapshot: ProviderCapabilities = EMPTY
 let loaded = false
 
 function backendUrl(): string {
-  return import.meta.env.VITE_ORACLE_BACKEND_URL ?? 'http://127.0.0.1:8787'
+  return import.meta.env?.VITE_ORACLE_BACKEND_URL ?? 'http://127.0.0.1:8787'
 }
 
 /** Fetch the capability map from the backend and cache it. Safe to call more

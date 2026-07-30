@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { cachedFetchDailyBars, type DailyBar } from '../data/marketData'
+import { priceChartCurrencyDisplay } from '../data/priceDisplay'
 
 /**
  * Real 90-day price chart (line) with 50-day moving average overlay,
@@ -99,7 +100,8 @@ function buildChart(bars: DailyBar[]) {
   const last = bars[bars.length - 1]
   const first = bars[0]
   const change = ((last.close - first.close) / first.close) * 100
-  return { bars, closes, sma50, yMin, yMax, high60, low60, last, first, change }
+  const currencyDisplay = priceChartCurrencyDisplay(bars)
+  return { bars, closes, sma50, yMin, yMax, high60, low60, last, first, change, currencyDisplay }
 }
 
 function ChartView({ chart, ticker }: { chart: NonNullable<ChartData>; ticker: string }) {
@@ -187,8 +189,8 @@ function ChartView({ chart, ticker }: { chart: NonNullable<ChartData>; ticker: s
       </svg>
       <figcaption>
         <div>
-          <span>Close</span>
-          <strong>{formatCurrency(chart.last.close)}</strong>
+          <span>Spot close</span>
+          <strong>{formatCurrency(chart.currencyDisplay.lastClose ?? chart.last.close)}</strong>
         </div>
         <div>
           <span>{chart.bars.length}d Δ</span>
@@ -200,7 +202,8 @@ function ChartView({ chart, ticker }: { chart: NonNullable<ChartData>; ticker: s
         <div>
           <span>60d range</span>
           <strong>
-            {chart.low60 ? formatCurrency(chart.low60) : '–'} → {chart.high60 ? formatCurrency(chart.high60) : '–'}
+            {chart.currencyDisplay.low60 ? formatCurrency(chart.currencyDisplay.low60) : '–'} →{' '}
+            {chart.currencyDisplay.high60 ? formatCurrency(chart.currencyDisplay.high60) : '–'}
           </strong>
         </div>
       </figcaption>

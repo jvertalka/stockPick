@@ -2,9 +2,13 @@ import { useEffect, useState } from 'react'
 import { Activity, Play } from 'lucide-react'
 import {
   DEFAULT_BACKTEST_TICKERS,
+  HISTORICAL_FEATURE_NAMES,
   PRUNED_FEATURE_NAMES,
+  type BacktestDatasetProvenance,
+  type BacktestDatasetQuality,
   type DatasetBuildResult,
   type FullBacktestResult,
+  type ModelPromotionAssessment,
 } from '../data/historicalBacktest'
 import { kvGet, kvSet } from '../data/storage'
 import { persistModel } from '../data/mlModelService'
@@ -24,7 +28,14 @@ const BACKTEST_TICKERS = DEFAULT_BACKTEST_TICKERS
 // builds don't crash the panel when fields rename or get added.
 // Schema bump: v8 adds servingConsistentIC20d + out-of-fold per-horizon
 // IC (was in-sample); v7 added size-tiered costs.
-const CACHE_KEY = 'backtest:last-result:v8'
+const CACHE_KEY = 'backtest:last-result:v10'
+
+type CachedBacktestArtifact = {
+  result: FullBacktestResult
+  provenance: BacktestDatasetProvenance
+  quality: BacktestDatasetQuality
+  promotion: ModelPromotionAssessment
+}
 
 export function BacktestPanel() {
   const [running, setRunning] = useState(false)
@@ -32,12 +43,15 @@ export function BacktestPanel() {
   const [result, setResult] = useState<FullBacktestResult | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [diagnostics, setDiagnostics] = useState<DatasetBuildResult['diagnostics'] | null>(null)
+  const [datasetQuality, setDatasetQuality] = useState<BacktestDatasetQuality | null>(null)
+  const [promotion, setPromotion] = useState<ModelPromotionAssessment | null>(null)
 
   useEffect(() => {
-    void kvGet<FullBacktestResult>(CACHE_KEY).then((cached) => {
+    void kvGet<CachedBacktestArtifact>(CACHE_KEY).then((cached) => {
       // Validate: required fields must be present and finite. Drop the
       // cached entry on any schema mismatch so we don't crash on render.
-      if (!cached) return
+      if (!cached?.result) return
+      const result = cached.result
       const requiredKeys: Array<keyof FullBacktestResult> = [
         'meanIC',
         'meanSpearmanIC',
@@ -52,9 +66,13 @@ export function BacktestPanel() {
         'steps',
       ]
       const hasAll = requiredKeys.every(
-        (key) => cached[key] !== undefined && cached[key] !== null,
+        (key) => result[key] !== undefined && result[key] !== null,
       )
-      if (hasAll) setResult(cached)
+      if (hasAll) {
+        setResult(result)
+        setDatasetQuality(cached.quality)
+        setPromotion(cached.promotion)
+      }
     })
   }, [])
 
@@ -76,6 +94,9 @@ export function BacktestPanel() {
           | {
               type: 'done'
               result: FullBacktestResult
+              provenance: BacktestDatasetProvenance
+              quality: BacktestDatasetQuality
+              promotion: ModelPromotionAssessment
               featureStats: { means: number[]; stds: number[] }
             }
           | { type: 'error'; message: string }
@@ -98,12 +119,18 @@ export function BacktestPanel() {
         if (data.type === 'done') {
           const backtestResult = data.result
           setResult(backtestResult)
-          const { trainedModel, ...cacheable } = backtestResult
-          await kvSet(CACHE_KEY, { ...cacheable, trainedModel })
+          setDatasetQuality(data.quality)
+          setPromotion(data.promotion)
+          await kvSet(CACHE_KEY, {
+            result: backtestResult,
+            provenance: data.provenance,
+            quality: data.quality,
+            promotion: data.promotion,
+          } satisfies CachedBacktestArtifact)
 
           // Find the 20-day horizon bundle so we can persist p10/p90 too
           const bundle20 = backtestResult.horizonBundles?.find((entry) => entry.horizon === 20)
-          await persistModel(trainedModel, {
+          await persistModel(backtestResult.trainedModel, {
             // Raw-feature stats from the training dataset — live
             // single-name predictions Z-score against these (training
             // itself Z-scores cross-sectionally per date).
@@ -130,6 +157,19 @@ export function BacktestPanel() {
             // The worker trains on the pruned feature set; live predictions
             // must slice the same columns.
             featureNames: PRUNED_FEATURE_NAMES,
+            datasetProvenance: {
+              ...data.provenance,
+              featureNames: [...PRUNED_FEATURE_NAMES],
+            },
+            datasetQuality: data.quality,
+            promotion: {
+              ...data.promotion,
+              persistedMode: data.promotion.promotable ? 'promoted' : 'advisory-only',
+              advisoryOverrideUsed: false,
+            },
+            // A failed experiment remains available locally for research but
+            // cannot replace a previously promoted shared artifact.
+            mirrorToBackend: data.promotion.promotable,
           })
           setRunning(false)
           setProgress(null)
@@ -173,7 +213,7 @@ export function BacktestPanel() {
 
       <p className="backtest-lede">
         Trains a Gradient Boosted Trees model on the importance-pruned feature set
-        ({PRUNED_FEATURE_NAMES.length} of 45 features incl. point-in-time EDGAR fundamentals,
+        ({PRUNED_FEATURE_NAMES.length} of {HISTORICAL_FEATURE_NAMES.length} features incl. point-in-time EDGAR fundamentals,
         15 years of bars) → 20-day forward returns across {BACKTEST_TICKERS.length} liquid names. Hyperparameters
         chosen by <strong>nested walk-forward CV</strong>{' '}
         {result ? `(picked: ${result.hyperparameters.numTrees} trees, depth ${result.hyperparameters.depth}, lr ${result.hyperparameters.learningRate})` : ''}.{' '}
@@ -234,6 +274,34 @@ export function BacktestPanel() {
         </details>
       ) : null}
 
+      {promotion && datasetQuality ? (
+        <details className="backtest-diagnostics" open={!promotion.promotable}>
+          <summary>
+            Model artifact: {promotion.promotable ? 'promotable' : 'advisory only'} ·{' '}
+            {promotion.reasons.filter((reason) => reason.status === 'pass').length}/
+            {promotion.reasons.length} evidence checks passed
+          </summary>
+          <p className="backtest-section-note">
+            Return labels: {datasetQuality.returns.labelAdjustment} · adjusted-label coverage{' '}
+            {(datasetQuality.returns.adjustedReturnLabelCoverage * 100).toFixed(1)}% · point-in-time
+            universe {datasetQuality.universe.pointInTimeMembership ? 'yes' : 'no'} · fold-local
+            preprocessing {datasetQuality.evaluation.foldLocalPreprocessing ? 'yes' : 'no'} · locked
+            post-selection holdout {datasetQuality.evaluation.lockedPostSelectionHoldout ? 'yes' : 'no'}.
+          </p>
+          <ul>
+            {promotion.reasons.map((reason) => (
+              <li
+                className={reason.status === 'pass' ? 'positive' : reason.status === 'warning' ? 'caution' : 'danger'}
+                key={reason.code}
+              >
+                <strong>{reason.status === 'pass' ? 'PASS' : reason.status === 'warning' ? 'WARNING' : 'BLOCK'} — {reason.title}:</strong>{' '}
+                {reason.detail}
+              </li>
+            ))}
+          </ul>
+        </details>
+      ) : null}
+
       {result ? (
         <div className="backtest-results">
           <div className="backtest-summary">
@@ -258,13 +326,13 @@ export function BacktestPanel() {
             </div>
             {result.servingConsistentIC20d != null && Number.isFinite(result.servingConsistentIC20d) ? (
               <div>
-                <span title="Held-out IC measured under the SAME global normalization that live single-ticker serving uses — not the per-date cross-sectional Z the validated IC is measured under. This is what live predictions actually realize, usually below the validated IC.">
-                  Mean IC, live-applicable
+                <span title="Held-out IC measured under frozen/global normalization. This is the small-batch or single-name fallback path, not the normal live cross-sectional universe path.">
+                  Single-name frozen-normalization IC
                 </span>
                 <strong className={tone(result.servingConsistentIC20d, 0.02)}>
                   {result.servingConsistentIC20d.toFixed(3)}
                 </strong>
-                <small style={{ fontSize: 10, color: 'var(--muted)' }}>serving-normalized</small>
+                <small style={{ fontSize: 10, color: 'var(--muted)' }}>fallback-path metric</small>
               </div>
             ) : null}
             <div>
@@ -353,18 +421,26 @@ export function BacktestPanel() {
             <div>
               <span>Random (sanity check)</span>
               <strong>{result.meanBaselineRandomIc.toFixed(3)}</strong>
+              <small style={{ fontSize: 10, color: 'var(--muted)' }}>
+                model edge CI [{result.baselineEvidence.random.ci95?.lower.toFixed(3) ?? 'n/a'}, {' '}
+                {result.baselineEvidence.random.ci95?.upper.toFixed(3) ?? 'n/a'}]
+              </small>
             </div>
             <div>
               <span>12-month momentum</span>
               <strong className={tone(result.meanBaselineMomentumIc, 0.02)}>
                 {result.meanBaselineMomentumIc.toFixed(3)}
               </strong>
+              <small style={{ fontSize: 10, color: 'var(--muted)' }}>
+                model edge CI [{result.baselineEvidence.momentum.ci95?.lower.toFixed(3) ?? 'n/a'}, {' '}
+                {result.baselineEvidence.momentum.ci95?.upper.toFixed(3) ?? 'n/a'}]
+              </small>
             </div>
             <div>
               <span>Edge over momentum</span>
-              <strong className={tone(result.meanIC - result.meanBaselineMomentumIc, 0.01)}>
-                {sign(result.meanIC - result.meanBaselineMomentumIc)}
-                {(result.meanIC - result.meanBaselineMomentumIc).toFixed(3)}
+              <strong className={result.baselineEvidence.momentum.ciClearOfZero ? 'positive' : 'danger'}>
+                {sign(result.baselineEvidence.momentum.meanDifference ?? 0)}
+                {(result.baselineEvidence.momentum.meanDifference ?? 0).toFixed(3)}
               </strong>
             </div>
           </div>
@@ -448,16 +524,16 @@ export function BacktestPanel() {
             2016, D'Avolio 2002 — avg {result.meanRealizedCostBps != null ? `${result.meanRealizedCostBps.toFixed(0)}bps` : 'n/a'}/window, not a flat rate);
             {result.embargoDaysUsed}-day embargo between train and test.
             <br /><br />
-            <strong>Survivorship is measured, not removed:</strong> the universe is today's
-            surviving tickers, so absolute returns are inflated. The 15-year run instruments
-            this directly — a distress canary (Campbell-Hilscher-Szilagyi 2008), cohort and
-            era splits, and a delisting-haircut bound — and the canary fires, so trust the
-            rankings and relative comparisons but treat absolute return levels as upper bounds.
+            <strong>Survivorship is measured and blocks promotion:</strong> the universe is today's
+            surviving tickers, so absolute returns are inflated. The offline CLI can additionally
+            instrument a distress canary (Campbell-Hilscher-Szilagyi 2008), cohort/era splits,
+            and a delisting-haircut bound; this in-app run does not claim those diagnostics.
+            None removes the bias. Until membership and delistings are point-in-time, the artifact stays advisory.
             <br /><br />
-            <strong>Still not modeled:</strong> shorting borrow costs on the L/S short leg;
-            a true point-in-time universe (would need paid index-constituent data). Treat
-            IC &gt; 0.03 with its CI clear of zero and net L/S Sharpe &gt; 0.5 as meaningful —
-            below that, the model isn't adding value over passive momentum.
+            <strong>Promotion rule:</strong> the paired moving-block-bootstrap 95% confidence
+            intervals for model-minus-random and model-minus-momentum must both clear zero,
+            and every provenance gate above must pass. Size-tiered trading and short-borrow
+            costs are included; no headline score or hand-tuned cutoff can override a blocker.
           </p>
         </div>
       ) : null}

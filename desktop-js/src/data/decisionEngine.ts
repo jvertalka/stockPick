@@ -52,6 +52,10 @@ export type RawSignal = {
   dataSource?: string
   dataWarnings?: string[]
   priceAsOf?: string | null
+  /** Per-name analytical price basis emitted only after the backend's exact
+   * current-window completeness gate passes. */
+  priceBasis?: 'adjusted-total-return' | 'unadjusted-or-unavailable'
+  priceAdjustmentCoveragePct?: number
   historyBars?: number
   lastPrice?: number
   priceChange20d?: number
@@ -81,13 +85,19 @@ export type RawSignal = {
  *  - 'rules-exit'    the rules' bearish call (their measured strength) kept it
  *  - 'demoted-no-ml' rules said bullish but no ML coverage — held at Hold
  *  - 'demoted-gated' regime gate closed; unearned bullish held at Hold
+ *  - 'demoted-evidence' model artifact failed/omitted promotion evidence
+ *  - 'demoted-evidence-bearish' research-only model ranked the name bearish
+ *  - 'ml-veto-bearish' ML ranked it bearish but current per-name evidence failed
  *  - 'rules'         untouched rules label (legacy mode, or neutral) */
 export type VerdictSource =
   | 'ml'
   | 'ml-veto'
+  | 'ml-veto-bearish'
   | 'rules-exit'
   | 'demoted-no-ml'
   | 'demoted-gated'
+  | 'demoted-evidence'
+  | 'demoted-evidence-bearish'
   | 'rules'
 
 export type DecisionSignal = RawSignal & {
@@ -1293,6 +1303,148 @@ function mlBatchPercentiles(pairs: Array<[string, number]>): Map<string, number>
 /** Below this many scored names a percentile is too noisy to gate money on. */
 const ML_MIN_RANK_BREADTH = 25
 
+/** Existing engine evidence tier for an unqualified Buy Now label. Exported
+ * so the Executive Brief cannot silently drift to a different standard. */
+export const ML_DECISION_GRADE_DATA_CONFIDENCE = 80
+
+export type MlDirectionalEvidencePrediction = {
+  asOf: string
+  predictedReturn20d: number
+  p10Return20d?: number
+  p90Return20d?: number
+  normalizationMode: 'cross-sectional-live' | 'frozen-fallback'
+}
+
+export type MlDirectionalEvidenceAssessment = {
+  decisionGrade: boolean
+  blockers: string[]
+  evidenceSource: string
+  uncertainty: string
+  dataCaveats: string[]
+}
+
+type MlDirectionalEvidenceSignal = Pick<
+  DecisionSignal,
+  | 'dataConfidence'
+  | 'dataSource'
+  | 'dataWarnings'
+  | 'fundamentalsAsOf'
+  | 'fundamentalsSource'
+  | 'priceAsOf'
+  | 'priceBasis'
+  | 'verdictSource'
+>
+
+function evidenceIsoDay(value: string | null | undefined): string | null {
+  if (!value) return null
+  const match = /^(\d{4}-\d{2}-\d{2})/.exec(value)
+  if (!match) return null
+  const date = new Date(`${match[1]}T00:00:00Z`)
+  return Number.isFinite(date.getTime()) && date.toISOString().slice(0, 10) === match[1]
+    ? match[1]
+    : null
+}
+
+function signedEvidencePct(value: number): string {
+  return `${value >= 0 ? '+' : ''}${value.toFixed(1)}%`
+}
+
+/**
+ * Canonical per-name evidence gate for every directional ML action. Keeping
+ * it beside verdict creation means the Brief, Desk, notifications, exports,
+ * and history all consume the same fail-closed DecisionSignal.
+ *
+ * The interval boundary is the model's natural no-relative-edge boundary:
+ * bullish calls require the whole calibrated 80% interval above zero;
+ * bearish calls require the whole interval below zero.
+ */
+export function assessMlDirectionalEvidence(
+  signal: MlDirectionalEvidenceSignal,
+  prediction: MlDirectionalEvidencePrediction | null,
+  direction: 'bullish' | 'bearish',
+  scenario: ScenarioId = 'base',
+): MlDirectionalEvidenceAssessment {
+  const blockers: string[] = []
+  const dataCaveats = signal.dataWarnings?.filter((warning) => warning.trim().length > 0) ?? []
+  const priceDay = evidenceIsoDay(signal.priceAsOf)
+  const fundamentalsDay = evidenceIsoDay(signal.fundamentalsAsOf)
+
+  if (scenario !== 'base') blockers.push('hypothetical scenario, not a live action')
+  if (signal.verdictSource !== 'ml') blockers.push('verdict is not ML-led')
+  if ((signal.dataConfidence ?? 0) < ML_DECISION_GRADE_DATA_CONFIDENCE) {
+    blockers.push(
+      `data confidence ${Math.round(signal.dataConfidence ?? 0)} is below the existing decision-grade gate (${ML_DECISION_GRADE_DATA_CONFIDENCE})`,
+    )
+  }
+  if (signal.fundamentalsSource !== 'sec-edgar-xbrl') {
+    blockers.push('SEC XBRL fundamentals are unavailable')
+  } else if (fundamentalsDay == null) {
+    blockers.push('SEC filing as-of date is unavailable')
+  }
+  if (priceDay == null) blockers.push('price as-of date is unavailable')
+  if (signal.priceBasis !== 'adjusted-total-return') {
+    blockers.push('current analytical price window is not proven adjusted-total-return')
+  }
+  if (priceDay != null && fundamentalsDay != null && fundamentalsDay > priceDay) {
+    blockers.push(`SEC filing date ${fundamentalsDay} is later than price date ${priceDay}`)
+  }
+  if (dataCaveats.some((warning) => /\bstale\b/i.test(warning))) {
+    blockers.push('price feed reports stale data')
+  }
+
+  let uncertainty = '80% ML interval unavailable'
+  if (prediction == null) {
+    blockers.push('live ML forecast is unavailable')
+  } else {
+    if (prediction.normalizationMode !== 'cross-sectional-live') {
+      blockers.push('ML forecast used unvalidated frozen-normalization fallback')
+    }
+    const predictionDay = evidenceIsoDay(prediction.asOf)
+    if (predictionDay == null) {
+      blockers.push('ML forecast as-of date is unavailable')
+    } else if (priceDay != null && predictionDay !== priceDay) {
+      blockers.push(`ML forecast date ${predictionDay} does not match price date ${priceDay}`)
+    }
+
+    const lower = prediction.p10Return20d
+    const upper = prediction.p90Return20d
+    const median = prediction.predictedReturn20d
+    const validInterval =
+      lower != null &&
+      upper != null &&
+      Number.isFinite(lower) &&
+      Number.isFinite(upper) &&
+      Number.isFinite(median) &&
+      lower <= median &&
+      median <= upper
+    if (!validInterval) {
+      blockers.push('calibrated 80% ML interval is unavailable or malformed')
+    } else {
+      uncertainty =
+        `80% relative-return interval ${signedEvidencePct(lower)} to ${signedEvidencePct(upper)}`
+      if (direction === 'bullish' && lower <= 0) {
+        blockers.push('80% ML interval includes no peer outperformance')
+      }
+      if (direction === 'bearish' && upper >= 0) {
+        blockers.push('80% ML interval includes no peer underperformance')
+      }
+    }
+  }
+
+  const evidenceSources = [
+    signal.dataSource?.trim() || null,
+    signal.fundamentalsSource === 'sec-edgar-xbrl' ? 'SEC EDGAR XBRL' : null,
+  ].filter((source): source is string => source != null)
+
+  return {
+    decisionGrade: blockers.length === 0,
+    blockers,
+    evidenceSource: evidenceSources.join(' + ') || 'source not reported',
+    uncertainty,
+    dataCaveats,
+  }
+}
+
 /**
  * Re-label a scored universe so every BULLISH verdict is earned by the ML
  * ensemble and every bearish rules call survives as the exit/warning layer.
@@ -1313,21 +1465,28 @@ const ML_MIN_RANK_BREADTH = 25
  *  - Regime gate closed: same demotion ('demoted-gated') and no ML
  *    promotions — the backtest showed the model has no edge there.
  *
- * Evidence gates for promotions (mirrors the UI's readiness tiers):
- *   Buy Now    → dataConfidence ≥ 80 AND real SEC fundamentals
- *   Accumulate → dataConfidence ≥ 60 AND real SEC fundamentals
+ * Evidence gates for every directional ML label (mirrors the Brief):
+ *   dataConfidence ≥ 80, real dated SEC fundamentals, synchronized price
+ *   and prediction dates, and a calibrated interval entirely on the claimed
+ *   side of zero. Bearish labels use the same clock and quality standard.
  * Risk veto: riskScore ≥ 80 blocks any promotion (upper tail of the
  * cross-sectional risk distribution — same spirit as the rules' riskZ gate).
  */
 export function applyMlLedVerdicts(
   rows: DecisionSignal[],
   predictedRelReturnByTicker: Map<string, number>,
-  options: { regimeGated?: boolean } = {},
+  options: {
+    regimeGated?: boolean
+    evidenceGated?: boolean
+    predictionEvidenceByTicker?: ReadonlyMap<string, MlDirectionalEvidencePrediction>
+    scenario?: ScenarioId
+  } = {},
 ): DecisionSignal[] {
-  const gated = options.regimeGated === true
-  const pctByTicker = gated
-    ? new Map<string, number>()
-    : mlBatchPercentiles([...predictedRelReturnByTicker.entries()])
+  const regimeGated = options.regimeGated === true
+  const evidenceGated = options.evidenceGated === true
+  // Research-only and regime-gated artifacts still retain their measured ML
+  // ranks for inspection. The gates suppress actions, not the evidence itself.
+  const pctByTicker = mlBatchPercentiles([...predictedRelReturnByTicker.entries()])
   const haveBreadth = pctByTicker.size >= ML_MIN_RANK_BREADTH
 
   return rows.map((row) => {
@@ -1348,17 +1507,26 @@ export function applyMlLedVerdicts(
       return relabel(row.action, 'rules-exit')
     }
 
-    // 2. Regime gate closed: no layer has earned a bullish call here.
-    if (gated) {
+    const pct = haveBreadth ? pctByTicker.get(row.ticker) : undefined
+
+    // 2. Evidence gate closed: retain the model's actual directional ranks as
+    // research leads, but never let them alter an action label.
+    if (evidenceGated) {
+      if (pct != null && pct >= 67) return relabel('Hold', 'demoted-evidence')
+      if (pct != null && pct <= 25) return relabel('Hold', 'demoted-evidence-bearish')
+      if (row.action === 'Buy Now' || row.action === 'Accumulate') return relabel('Hold', 'demoted-no-ml')
+      return relabel(row.action, 'rules')
+    }
+
+    // 3. Regime gate closed: no layer has earned a bullish call here.
+    if (regimeGated) {
       if (row.action === 'Buy Now' || row.action === 'Accumulate') {
         return relabel('Hold', 'demoted-gated')
       }
       return relabel(row.action, 'rules')
     }
 
-    const pct = haveBreadth ? pctByTicker.get(row.ticker) : undefined
-
-    // 3. No ML coverage: rules may keep neutral labels, never bullish ones.
+    // 4. No ML coverage: rules may keep neutral labels, never bullish ones.
     if (pct == null) {
       if (row.action === 'Buy Now' || row.action === 'Accumulate') {
         return relabel('Hold', 'demoted-no-ml')
@@ -1366,22 +1534,46 @@ export function applyMlLedVerdicts(
       return relabel(row.action, 'rules')
     }
 
-    // 4. ML-ranked names: the ensemble's cross-sectional rank decides.
+    // 5. ML-ranked names: the ensemble's cross-sectional rank decides.
     const hasRealFundamentals = row.fundamentalsSource === 'sec-edgar-xbrl'
     const confidence = row.dataConfidence ?? 0
     const riskVeto = row.riskScore >= 80
+    const directionalEvidence = (direction: 'bullish' | 'bearish') =>
+      assessMlDirectionalEvidence(
+        { ...row, verdictSource: 'ml' },
+        options.predictionEvidenceByTicker?.get(row.ticker) ?? null,
+        direction,
+        options.scenario ?? 'base',
+      ).decisionGrade
 
     if (pct >= 80) {
-      if (!riskVeto && hasRealFundamentals && confidence >= 80) return relabel('Buy Now', 'ml')
-      if (!riskVeto && hasRealFundamentals && confidence >= 60) return relabel('Accumulate', 'ml')
+      if (
+        !riskVeto &&
+        hasRealFundamentals &&
+        confidence >= ML_DECISION_GRADE_DATA_CONFIDENCE &&
+        directionalEvidence('bullish')
+      ) return relabel('Buy Now', 'ml')
       return relabel('Hold', 'ml-veto')
     }
     if (pct >= 67) {
-      if (!riskVeto && hasRealFundamentals && confidence >= 60) return relabel('Accumulate', 'ml')
+      if (
+        !riskVeto &&
+        hasRealFundamentals &&
+        confidence >= ML_DECISION_GRADE_DATA_CONFIDENCE &&
+        directionalEvidence('bullish')
+      ) return relabel('Accumulate', 'ml')
       return relabel('Hold', 'ml-veto')
     }
-    if (pct <= 10) return relabel('Avoid', 'ml')
-    if (pct <= 25) return relabel('Trim', 'ml')
+    if (pct <= 10) {
+      return directionalEvidence('bearish')
+        ? relabel('Avoid', 'ml')
+        : relabel('Hold', 'ml-veto-bearish')
+    }
+    if (pct <= 25) {
+      return directionalEvidence('bearish')
+        ? relabel('Trim', 'ml')
+        : relabel('Hold', 'ml-veto-bearish')
+    }
     return relabel('Hold', 'ml')
   })
 }

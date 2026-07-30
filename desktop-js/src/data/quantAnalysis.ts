@@ -3,6 +3,7 @@ import {
   cachedFetchDailyBars,
   cachedFetchRiskFreeRate,
   cachedFetchStockFundamentals,
+  type DailyBar,
 } from './marketData'
 import { fetchOptionsSnapshot, type OptionsSnapshot } from './optionsAdapter'
 import {
@@ -75,7 +76,10 @@ export type QuantAnalysis = {
 
   // Risk-free rate used (FRED-fetched if available, fallback if not)
   riskFreeRate: number
-  riskFreeRateSource: 'fred-dgs1mo' | 'longrun-fallback'
+  riskFreeRateSource: 'fred-dgs1mo' | 'longrun-fallback' | 'longrun-fallback-fred-stale'
+  riskFreeRateObservationDate?: string
+  riskFreeRateObservationAgeDays?: number
+  riskFreeRateCacheState?: string
 
   // Dividend yield used (Yahoo-fetched if available, 0 if not)
   dividendYield: number
@@ -154,17 +158,45 @@ export type QuantAnalysis = {
   hasOptionsData: boolean
 }
 
+/**
+ * Resolve the executable dollar spot independently from the adjusted series.
+ * Adjusted closes remain the only input to returns and volatility, but option
+ * strikes, BSM and Monte Carlo price paths must start at an observable raw
+ * market price. A signal price is a valid fallback when the latest bar does
+ * not expose its raw quote; an adjusted close is deliberately not.
+ */
+export function resolveTradableSpot(
+  bars: readonly DailyBar[],
+  signalLastPrice?: number,
+): number | null {
+  const latestRawClose = bars[bars.length - 1]?.rawClose
+  if (latestRawClose != null && Number.isFinite(latestRawClose) && latestRawClose > 0) {
+    return latestRawClose
+  }
+  if (signalLastPrice != null && Number.isFinite(signalLastPrice) && signalLastPrice > 0) {
+    return signalLastPrice
+  }
+  return null
+}
+
 export async function computeQuantAnalysis(
   signal: DecisionSignal,
 ): Promise<QuantAnalysis | null> {
   const ticker = signal.ticker
   const bars = await cachedFetchDailyBars(ticker, '1y')
-  if (bars.length < 30) {
+  if (
+    bars.length < 30 ||
+    bars.adjustment.rejectedBars > 0 ||
+    bars.adjustment.adjustedBars !== bars.adjustment.sourceRows
+  ) {
     return null
   }
   const closes = bars.map((bar) => bar.close)
   const returns = logReturns(closes)
-  const lastPrice = closes[closes.length - 1]
+  const tradableSpot = resolveTradableSpot(bars, signal.lastPrice)
+  if (tradableSpot == null) {
+    return null
+  }
 
   // Real market series for the Kalman beta: SPY closes date-aligned to
   // this ticker's bars (a beta needs the SAME dates on both sides). The
@@ -182,9 +214,13 @@ export async function computeQuantAnalysis(
   }
 
   // 1. Fetch risk-free rate from FRED — or fall back to long-run avg.
-  let riskFreeRate = await cachedFetchRiskFreeRate()
+  const riskFreeEvidence = await cachedFetchRiskFreeRate()
+  let riskFreeRate = riskFreeEvidence?.rate ?? null
   let riskFreeRateSource: QuantAnalysis['riskFreeRateSource'] = 'fred-dgs1mo'
-  if (riskFreeRate == null) {
+  if (riskFreeEvidence?.stale) {
+    riskFreeRate = LONGRUN_FALLBACK_RFR
+    riskFreeRateSource = 'longrun-fallback-fred-stale'
+  } else if (riskFreeRate == null) {
     riskFreeRate = LONGRUN_FALLBACK_RFR
     riskFreeRateSource = 'longrun-fallback'
   }
@@ -256,7 +292,7 @@ export async function computeQuantAnalysis(
 
   const volForMc = optionsImpliedVol ?? garchVol
   const monteCarlo = monteCarloForecast({
-    spot: lastPrice,
+    spot: tradableSpot,
     drift: factorImpliedDrift,
     volatility: volForMc,
     horizonDays: 20,
@@ -275,16 +311,16 @@ export async function computeQuantAnalysis(
     const v = optionsImpliedVol
     riskNeutral = {
       probUp: riskNeutralProbAbove({
-        spot: lastPrice,
-        strike: lastPrice,
+        spot: tradableSpot,
+        strike: tradableSpot,
         timeToExpiry: T,
         riskFreeRate,
         dividendYield,
         volatility: v,
       }),
       probUp5pct: riskNeutralProbAbove({
-        spot: lastPrice,
-        strike: lastPrice * 1.05,
+        spot: tradableSpot,
+        strike: tradableSpot * 1.05,
         timeToExpiry: T,
         riskFreeRate,
         dividendYield,
@@ -292,8 +328,8 @@ export async function computeQuantAnalysis(
       }),
       probDown5pct: 1 -
         riskNeutralProbAbove({
-          spot: lastPrice,
-          strike: lastPrice * 0.95,
+          spot: tradableSpot,
+          strike: tradableSpot * 0.95,
           timeToExpiry: T,
           riskFreeRate,
           dividendYield,
@@ -301,8 +337,8 @@ export async function computeQuantAnalysis(
         }),
       probDown8pct: 1 -
         riskNeutralProbAbove({
-          spot: lastPrice,
-          strike: lastPrice * 0.92,
+          spot: tradableSpot,
+          strike: tradableSpot * 0.92,
           timeToExpiry: T,
           riskFreeRate,
           dividendYield,
@@ -310,7 +346,7 @@ export async function computeQuantAnalysis(
         }),
       quantiles: (() => {
         const q = riskNeutralReturnDistribution(
-          lastPrice,
+          tradableSpot,
           riskFreeRate,
           dividendYield,
           v,
@@ -326,8 +362,8 @@ export async function computeQuantAnalysis(
       })(),
     }
     greeksATM = callGreeks({
-      spot: lastPrice,
-      strike: lastPrice,
+      spot: tradableSpot,
+      strike: tradableSpot,
       timeToExpiry: T,
       riskFreeRate,
       dividendYield,
@@ -416,6 +452,9 @@ export async function computeQuantAnalysis(
     dataSource: optionsSnapshot ? 'live' : 'partial',
     riskFreeRate,
     riskFreeRateSource,
+    riskFreeRateObservationDate: riskFreeEvidence?.observationDate,
+    riskFreeRateObservationAgeDays: riskFreeEvidence?.ageDays,
+    riskFreeRateCacheState: riskFreeEvidence?.cacheState,
     dividendYield,
     dividendYieldSource,
     marketBeta,

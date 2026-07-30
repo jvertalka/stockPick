@@ -13,11 +13,12 @@ export type ExportRow = {
   opportunityScore: number
   riskScore: number
   forecast20d: number
+  forecastBasis: 'Monte Carlo' | 'Factor proxy'
   lastPrice?: number
 }
 
 export function rowsToCsv(rows: ExportRow[]): string {
-  const header = ['Ticker', 'Name', 'Action', 'Reason', 'Opportunity', 'Risk', '20d Forecast %', 'Last Price']
+  const header = ['Ticker', 'Name', 'Action', 'Reason', 'Opportunity', 'Risk', '20d Estimate %', 'Estimate Basis', 'Last Price']
   const body = rows.map((row) => [
     row.ticker,
     row.name,
@@ -26,6 +27,7 @@ export function rowsToCsv(rows: ExportRow[]): string {
     String(row.opportunityScore),
     String(row.riskScore),
     row.forecast20d.toFixed(2),
+    row.forecastBasis,
     row.lastPrice != null ? row.lastPrice.toFixed(2) : '',
   ])
   return [header, ...body].map(encodeRow).join('\n')

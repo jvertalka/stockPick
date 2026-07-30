@@ -33,6 +33,18 @@ export type PriceCoverage = {
   freshSymbolCount: number
   staleSymbolCount: number
   totalBarCount: number
+  analyticalBarCount: number
+  adjustedInventoryBarCount: number
+  unadjustedBarCount: number
+  incompleteProviderBarCount: number
+  adjustedSeriesCount: number
+  unadjustedOnlySeriesCount: number
+  structurallyUsableSeriesCount: number
+  currentAnalyticsGapSeriesCount: number
+  analyticsWindowSize: number
+  priceBasis: 'adjusted-total-return' | 'mixed-adjusted-and-unadjusted' | 'unadjusted-or-unavailable'
+  adjustmentSource: string
+  adjustmentCoveragePct: number
   latestPriceDate?: string | null
   oldestPriceDate?: string | null
 }
@@ -90,7 +102,12 @@ export async function loadDecisionUniverse({
   watchTickers = [],
   syncMode = 'off',
   syncLimit = syncMode === 'force' ? 96 : 24,
-  timeoutMs = syncMode === 'force' ? 20000 : 9000,
+  // Local fetches, so a generous ceiling costs nothing — but a tight one
+  // hurts: the boot-time universe build (2,400+ names + an auto price sync
+  // + a ~14MB payload) was measured taking 8s+ under load, so the old 9s
+  // ceiling could time out a perfectly healthy backend and strand the app
+  // on the "not reachable" banner.
+  timeoutMs = syncMode === 'force' ? 45000 : 30000,
 }: LoadUniverseOptions = {}): Promise<DecisionUniverseResponse> {
   try {
     const url = new URL('/decision/universe', backendBaseUrl())
@@ -219,6 +236,23 @@ function normalizeCoverage(value: PriceCoverage | undefined): PriceCoverage {
     freshSymbolCount: numberOr(value.freshSymbolCount, 0),
     staleSymbolCount: numberOr(value.staleSymbolCount, 0),
     totalBarCount: numberOr(value.totalBarCount, 0),
+    analyticalBarCount: numberOr(value.analyticalBarCount, 0),
+    adjustedInventoryBarCount: numberOr(value.adjustedInventoryBarCount, 0),
+    unadjustedBarCount: numberOr(value.unadjustedBarCount, 0),
+    incompleteProviderBarCount: numberOr(value.incompleteProviderBarCount, 0),
+    adjustedSeriesCount: numberOr(value.adjustedSeriesCount, 0),
+    unadjustedOnlySeriesCount: numberOr(value.unadjustedOnlySeriesCount, 0),
+    structurallyUsableSeriesCount: numberOr(value.structurallyUsableSeriesCount, 0),
+    currentAnalyticsGapSeriesCount: numberOr(value.currentAnalyticsGapSeriesCount, 0),
+    analyticsWindowSize: numberOr(value.analyticsWindowSize, 200),
+    priceBasis:
+      value.priceBasis === 'adjusted-total-return' ||
+      value.priceBasis === 'mixed-adjusted-and-unadjusted'
+        ? value.priceBasis
+        : 'unadjusted-or-unavailable',
+    adjustmentSource:
+      typeof value.adjustmentSource === 'string' ? value.adjustmentSource : 'none',
+    adjustmentCoveragePct: numberOr(value.adjustmentCoveragePct, 0),
     latestPriceDate: typeof value.latestPriceDate === 'string' ? value.latestPriceDate : null,
     oldestPriceDate: typeof value.oldestPriceDate === 'string' ? value.oldestPriceDate : null,
   }
@@ -244,6 +278,18 @@ function emptyCoverage(): PriceCoverage {
     freshSymbolCount: 0,
     staleSymbolCount: 0,
     totalBarCount: 0,
+    analyticalBarCount: 0,
+    adjustedInventoryBarCount: 0,
+    unadjustedBarCount: 0,
+    incompleteProviderBarCount: 0,
+    adjustedSeriesCount: 0,
+    unadjustedOnlySeriesCount: 0,
+    structurallyUsableSeriesCount: 0,
+    currentAnalyticsGapSeriesCount: 0,
+    analyticsWindowSize: 200,
+    priceBasis: 'unadjusted-or-unavailable',
+    adjustmentSource: 'none',
+    adjustmentCoveragePct: 0,
     latestPriceDate: null,
     oldestPriceDate: null,
   }
