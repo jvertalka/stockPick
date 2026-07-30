@@ -192,9 +192,10 @@ class BackendCacheServer {
   Future<void> _warmUpUniverse() async {
     try {
       var previousReturned = -1;
-      // 24 passes × 96 symbols comfortably covers the full universe even
-      // with per-symbol failures; the no-progress break exits earlier.
-      for (var pass = 1; pass <= 24; pass++) {
+      var noProgressPasses = 0;
+      // 40 passes × 96 symbols covers the full universe even when a very
+      // stale cache (weeks offline) needs everything refetched.
+      for (var pass = 1; pass <= 40; pass++) {
         if (_stopping) return;
         final result =
             await DecisionUniverseService(
@@ -211,9 +212,27 @@ class BackendCacheServer {
         stdout.writeln(
           'Universe warmup pass $pass: $returned/$universe symbols scoreable',
         );
-        if (returned >= universe || returned == previousReturned) {
+        if (returned >= universe) {
           stdout.writeln('Universe warmup complete.');
           break;
+        }
+        // A single zero-progress pass is NOT proof of completion: after a
+        // 3-week-offline restart, one provider-throttled pass (all fetches
+        // 429ing) read as "no progress" and the warmup quit at 736/2500,
+        // leaving the rest of the universe stale until manual syncs.
+        // Require THREE consecutive empty passes, with a cool-down between
+        // them so a throttle window can pass.
+        if (returned == previousReturned) {
+          noProgressPasses++;
+          if (noProgressPasses >= 3) {
+            stdout.writeln(
+              'Universe warmup complete ($returned/$universe reachable).',
+            );
+            break;
+          }
+          await Future<void>.delayed(const Duration(seconds: 30));
+        } else {
+          noProgressPasses = 0;
         }
         previousReturned = returned;
       }
