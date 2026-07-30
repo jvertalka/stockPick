@@ -8,18 +8,39 @@ import { runQuantSelfTests } from './data/quantMath.tests'
 // Note: useToast is exported separately from ./components/useToast so the
 // Toast.tsx file can be hot-reloaded without breaking React Refresh.
 
-// Run quant-math self-tests in dev so silent numerical bugs surface in
-// the browser console at every reload. Results print as one info line
-// when all pass, or detailed errors when any fail.
-if (import.meta.env.DEV) {
-  runQuantSelfTests()
-}
+// The packaged workstation is the primary runtime, so the same deterministic
+// textbook checks run in every build. A numerical failure pauses the decision
+// surface instead of allowing corrupted recommendations to reach the user.
+const quantTestFailures = runQuantSelfTests().filter((result) => !result.passed)
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
     <ErrorBoundary>
       <ToastProvider>
-        <App />
+        {quantTestFailures.length === 0 ? (
+          <App />
+        ) : (
+          <div className="error-boundary" role="alert">
+            <h1>Quantitative self-check failed.</h1>
+            <p>
+              Recommendations are paused because a textbook numerical check did not match its
+              reference value. Reload after repairing the quantitative engine.
+            </p>
+            <ul>
+              {quantTestFailures.map((failure) => (
+                <li key={failure.name}>
+                  <strong>{failure.name}</strong>
+                  {failure.detail ? ` — ${failure.detail}` : ''}
+                </li>
+              ))}
+            </ul>
+            <div className="error-boundary-actions">
+              <button className="primary" onClick={() => window.location.reload()} type="button">
+                Re-run self-checks
+              </button>
+            </div>
+          </div>
+        )}
       </ToastProvider>
     </ErrorBoundary>
   </StrictMode>,

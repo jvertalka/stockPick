@@ -18,13 +18,22 @@ String _resolveSecret(String envKey, String compiledFallback) {
   return compiledFallback.trim();
 }
 
-final String kServerFinnhubToken = _resolveSecret('FINNHUB_TOKEN', kFinnhubApiKey);
-final String kServerTradierToken = _resolveSecret('TRADIER_TOKEN', kTradierToken);
+final String kServerFinnhubToken = _resolveSecret(
+  'FINNHUB_TOKEN',
+  kFinnhubApiKey,
+);
+final String kServerTradierToken = _resolveSecret(
+  'TRADIER_TOKEN',
+  kTradierToken,
+);
 final String kServerTradierEnv =
     _resolveSecret('TRADIER_ENV', kTradierEnv) == 'production'
-        ? 'production'
-        : 'sandbox';
-final String kServerPolygonToken = _resolveSecret('POLYGON_TOKEN', kPolygonToken);
+    ? 'production'
+    : 'sandbox';
+final String kServerPolygonToken = _resolveSecret(
+  'POLYGON_TOKEN',
+  kPolygonToken,
+);
 final String kServerFredToken = _resolveSecret('FRED_API_KEY', kFredApiKey);
 
 Future<void> main(List<String> args) async {
@@ -132,8 +141,13 @@ class BackendCacheServer {
   final HttpClient _client;
   late final MarketDataCache _cache;
   HttpServer? _server;
+  Future<void>? _warmupFuture;
+  Future<void>? _stopFuture;
+  final Set<Future<void>> _inFlightRequests = <Future<void>>{};
+  bool _stopping = false;
 
   Future<void> start() async {
+    _stopping = false;
     await config.cacheDirectory.create(recursive: true);
     final server = await HttpServer.bind(config.host, config.port);
     _server = server;
@@ -146,13 +160,28 @@ class BackendCacheServer {
     stdout.writeln('Cache dir: ${config.cacheDirectory.absolute.path}');
     stdout.writeln('Web root: ${config.webRoot.absolute.path}');
     if (config.warmup) {
-      unawaited(_warmUpUniverse());
+      final warmup = _warmUpUniverse();
+      _warmupFuture = warmup;
+      unawaited(warmup);
     } else {
       stdout.writeln('Universe warmup disabled (--warmup off).');
     }
     await for (final request in server) {
-      unawaited(_handleRequest(request));
+      _trackRequest(request);
     }
+  }
+
+  void _trackRequest(HttpRequest request) {
+    late final Future<void> tracked;
+    tracked = _handleRequest(request)
+        .catchError((Object _, StackTrace _) {
+          // _handleRequest normally turns errors into JSON responses. Socket
+          // teardown can still throw while stop() force-closes connections;
+          // that is an expected shutdown condition, not an unhandled future.
+        })
+        .whenComplete(() => _inFlightRequests.remove(tracked));
+    _inFlightRequests.add(tracked);
+    unawaited(tracked);
   }
 
   /// Warms the decision universe in the background so a freshly started
@@ -166,14 +195,17 @@ class BackendCacheServer {
       // 24 passes × 96 symbols comfortably covers the full universe even
       // with per-symbol failures; the no-progress break exits earlier.
       for (var pass = 1; pass <= 24; pass++) {
-        final result = await DecisionUniverseService(
-          config.cacheDirectory,
-          cache: _cache,
-        ).build(
-          Uri.parse(
-            '/decision/universe?limit=0&historyLimit=0&sync=force&syncLimit=96',
-          ),
-        );
+        if (_stopping) return;
+        final result =
+            await DecisionUniverseService(
+              config.cacheDirectory,
+              cache: _cache,
+            ).build(
+              Uri.parse(
+                '/decision/universe?limit=0&historyLimit=0&sync=force&syncLimit=96',
+              ),
+            );
+        if (_stopping) return;
         final returned = (result['returned'] as num?)?.toInt() ?? 0;
         final universe = (result['universeSize'] as num?)?.toInt() ?? 0;
         stdout.writeln(
@@ -187,6 +219,7 @@ class BackendCacheServer {
       }
       // Each pass above queued EDGAR fundamentals for its scoreable stocks;
       // wait for that queue to drain so boot ends with fundamentals ready.
+      if (_stopping) return;
       final fundamentals = SecFundamentalsService.instance(_cache);
       await fundamentals.ensureWarm(const []);
       stdout.writeln(
@@ -199,12 +232,43 @@ class BackendCacheServer {
     }
   }
 
-  Future<void> stop() async {
+  Future<void> stop() => _stopFuture ??= _stop();
+
+  Future<void> _stop() async {
+    _stopping = true;
+    // Mark every data service stopped before aborting sockets. Work that was
+    // already awaiting I/O can then observe the lifecycle boundary and must
+    // not enqueue another drain or start a cache/history write.
+    _cache.stop();
+    final fundamentals = SecFundamentalsService.instance(_cache);
+    final fundamentalsStop = fundamentals.stop(resetSingleton: false);
     await _server?.close(force: true);
     _client.close(force: true);
+
+    // Joining handler futures is essential on Windows: closing the listener
+    // only closes sockets; request bodies and service futures can otherwise
+    // keep cache files open after stop() returns.
+    while (_inFlightRequests.isNotEmpty) {
+      await Future.wait(_inFlightRequests.toList());
+    }
+    final warmup = _warmupFuture;
+    if (warmup != null) await warmup;
+    await fundamentalsStop;
+    // Keep the stopped singleton installed until every request and warmup has
+    // joined, so a late continuation cannot create a fresh SEC drain. It is
+    // safe to release only now for a future server instance in the same VM.
+    await fundamentals.stop();
   }
 
   Future<void> _handleRequest(HttpRequest request) async {
+    if (_stopping) {
+      request.response.statusCode = HttpStatus.serviceUnavailable;
+      await _writeJson(request.response, {
+        'error': 'backend_stopping',
+        'detail': 'The local cache is shutting down; retry after restart.',
+      });
+      return;
+    }
     // DNS-rebinding defense: a malicious website can re-resolve its own
     // domain to 127.0.0.1 and then fetch this server SAME-ORIGIN (no CORS
     // involved). The tell is the Host header, which still names the
@@ -215,6 +279,17 @@ class BackendCacheServer {
         'error': 'host_not_allowed',
         'detail':
             'This cache only serves local host names (DNS-rebinding guard).',
+      });
+      return;
+    }
+    if (_requiresTrustedBrowserContext(request) &&
+        !_hasTrustedBrowserContext(request)) {
+      request.response.statusCode = HttpStatus.forbidden;
+      await _writeJson(request.response, {
+        'error': 'browser_context_not_allowed',
+        'detail':
+            'Network-backed and credential-bearing routes only accept local '
+            'app origins or native requests without browser fetch metadata.',
       });
       return;
     }
@@ -304,6 +379,14 @@ class BackendCacheServer {
             });
             return;
           }
+          if (_stopping || _cache.isStopped) {
+            request.response.statusCode = HttpStatus.serviceUnavailable;
+            await _writeJson(request.response, {
+              'error': 'backend_stopping',
+              'detail': 'Model persistence was cancelled during shutdown.',
+            });
+            return;
+          }
           await modelFile.writeAsString(body, flush: true);
           await _writeJson(request.response, {
             'ok': true,
@@ -335,9 +418,7 @@ class BackendCacheServer {
             request.uri.queryParameters['symbol']?.trim().toUpperCase() ?? '';
         final payload = symbol.isEmpty
             ? null
-            : await SecFundamentalsService.instance(
-                _cache,
-              ).historyFor(symbol);
+            : await SecFundamentalsService.instance(_cache).historyFor(symbol);
         if (payload == null) {
           request.response.statusCode = HttpStatus.notFound;
           await _writeJson(request.response, {
@@ -404,7 +485,9 @@ class BackendCacheServer {
     request.response.headers.set('X-Finance-Oracle-Cache', entry.cacheState);
     request.response.headers.set(
       HttpHeaders.cacheControlHeader,
-      'public, max-age=${entry.remainingTtlSeconds}',
+      entry.cacheState == 'BYPASS' || entry.cacheState == 'ERROR'
+          ? 'no-store'
+          : 'public, max-age=${entry.remainingTtlSeconds}',
     );
     request.response.add(entry.body);
     await request.response.close();
@@ -530,6 +613,10 @@ class BackendCacheServer {
       HttpHeaders.accessControlAllowHeadersHeader,
       'Accept, Authorization, Content-Type, X-Finnhub-Token, X-Oracle-Write',
     );
+    // The frontend uses cache provenance to fail closed on stale FRED and
+    // market-data responses. Custom response headers are unreadable to
+    // cross-origin JavaScript unless explicitly exposed.
+    headers.set('Access-Control-Expose-Headers', 'X-Finance-Oracle-Cache');
     // Private Network Access: if a Chromium/WebView2 build preflights a
     // private-network request (public/local origin -> 127.0.0.1), echo
     // approval so PNA enforcement can't silently block the packaged app's
@@ -547,9 +634,10 @@ class BackendCacheServer {
   /// remote attacker can never present a local origin.
   bool _isLocalOrigin(String origin) {
     final lower = origin.toLowerCase();
-    if (lower.startsWith('tauri://')) return true;
     final uri = Uri.tryParse(lower);
-    if (uri == null || (uri.scheme != 'http' && uri.scheme != 'https')) {
+    if (uri == null) return false;
+    if (uri.scheme == 'tauri') return uri.host == 'localhost';
+    if (uri.scheme != 'http' && uri.scheme != 'https') {
       return false;
     }
     final host = uri.host;
@@ -557,6 +645,29 @@ class BackendCacheServer {
         host == '127.0.0.1' ||
         host == '::1' ||
         host == 'tauri.localhost';
+  }
+
+  /// Routes that can spend upstream quota, expose a provider credential, or
+  /// mutate recommendation authority require more than passive CORS. CORS
+  /// prevents a hostile page from reading a response, but a no-cors request
+  /// can still execute and burn quota. Native callers (CLI/curl/Tauri sidecar)
+  /// normally send neither Origin nor Sec-Fetch-Site and remain supported.
+  bool _requiresTrustedBrowserContext(HttpRequest request) {
+    final path = request.uri.path;
+    return path == '/proxy' ||
+        path == '/decision/universe' ||
+        path == '/fundamentals/history' ||
+        (path == '/ml/model' && request.method == 'PUT');
+  }
+
+  bool _hasTrustedBrowserContext(HttpRequest request) {
+    final origin = request.headers.value('origin');
+    // Chromium/WebView2 can label localhost -> 127.0.0.1 as cross-site even
+    // though both are trusted loopback app origins. An explicit Origin is the
+    // stronger signal; use Sec-Fetch-Site only when Origin is absent.
+    if (origin != null && origin.isNotEmpty) return _isLocalOrigin(origin);
+    final fetchSite = request.headers.value('sec-fetch-site')?.toLowerCase();
+    return fetchSite != 'cross-site';
   }
 
   Future<void> _writeJson(HttpResponse response, Object value) async {
@@ -575,6 +686,14 @@ class MarketDataCache {
 
   final Directory directory;
   final HttpClient _client;
+  final Map<String, Future<void>> _writesByPartition = <String, Future<void>>{};
+  bool _stopped = false;
+
+  bool get isStopped => _stopped;
+
+  void stop() {
+    _stopped = true;
+  }
 
   static const _allowedHosts = {
     'www.alphavantage.co',
@@ -593,7 +712,12 @@ class MarketDataCache {
 
   bool isAllowed(Uri uri) {
     final host = uri.host.toLowerCase();
-    return (uri.scheme == 'https' || uri.scheme == 'http') &&
+    // Every allowlisted host is external. HTTP, embedded user-info, and
+    // nonstandard ports would either expose injected provider credentials or
+    // turn an allowlisted DNS name into an SSRF/token-exfiltration primitive.
+    return uri.scheme.toLowerCase() == 'https' &&
+        uri.userInfo.isEmpty &&
+        (!uri.hasPort || uri.port == 443) &&
         _allowedHosts.contains(host);
   }
 
@@ -603,13 +727,25 @@ class MarketDataCache {
     String? acceptHeader,
     String? finnhubToken,
   }) async {
-    final key = _stableHash(uri.toString());
+    if (_stopped) {
+      throw StateError('Market-data cache is stopped.');
+    }
+    if (!isAllowed(uri)) {
+      throw ArgumentError.value(uri, 'uri', 'Upstream URL is not allowed.');
+    }
+    final cacheable = isCacheable(uri, authHeader: authHeader);
+    final key = cachePartitionKey(
+      uri,
+      authHeader: authHeader,
+      acceptHeader: acceptHeader,
+      finnhubToken: finnhubToken,
+    );
     final paths = _CachePaths(
       metadata: File('${directory.path}${Platform.pathSeparator}$key.json'),
       body: File('${directory.path}${Platform.pathSeparator}$key.body'),
     );
     final policy = _CachePolicy.forUri(uri);
-    final cached = await _read(paths);
+    final cached = cacheable ? await _read(paths) : null;
     if (cached != null && !cached.isExpired) {
       return cached.toResponse(cacheState: 'HIT');
     }
@@ -623,7 +759,13 @@ class MarketDataCache {
         finnhubToken: finnhubToken,
       );
       if (fresh.statusCode >= 200 && fresh.statusCode < 300) {
-        await _write(paths, fresh);
+        if (!cacheable) {
+          return fresh.toResponse(cacheState: 'BYPASS');
+        }
+        if (_stopped) {
+          throw StateError('Market-data cache stopped before persistence.');
+        }
+        await _writeSerialized(key, paths, fresh);
         return fresh.toResponse(cacheState: 'MISS');
       }
       if (cached != null) {
@@ -646,7 +788,79 @@ class MarketDataCache {
     }
   }
 
+  /// Account/user routes and requests carrying a caller-supplied Bearer are
+  /// never persisted. Tradier market-data requests using the workstation's
+  /// server-held credential remain cacheable, but are credential-partitioned
+  /// below so a token/entitlement change cannot reuse another response.
+  bool isCacheable(Uri uri, {String? authHeader}) {
+    if (authHeader != null && authHeader.trim().isNotEmpty) return false;
+    final host = uri.host.toLowerCase();
+    if (host != 'sandbox.tradier.com' && host != 'api.tradier.com') {
+      return true;
+    }
+    final path = uri.path.toLowerCase();
+    return !(path == '/v1/user' ||
+        path.startsWith('/v1/user/') ||
+        path == '/v1/accounts' ||
+        path.startsWith('/v1/accounts/') ||
+        path == '/v1/watchlists' ||
+        path.startsWith('/v1/watchlists/') ||
+        path == '/v1/orders' ||
+        path.startsWith('/v1/orders/'));
+  }
+
+  /// A URL alone is not an HTTP cache identity. Accept can select XML vs JSON
+  /// (notably on Tradier), while provider credentials can select entitlement
+  /// variants. Only a hash-of-a-hash reaches the filename; token text is never
+  /// written to cache metadata, paths, or logs.
+  String cachePartitionKey(
+    Uri uri, {
+    String? authHeader,
+    String? acceptHeader,
+    String? finnhubToken,
+  }) {
+    final canonicalAccept = _canonicalAccept(acceptHeader);
+    final credential = _effectiveCredentialIdentity(
+      uri,
+      authHeader: authHeader,
+      finnhubToken: finnhubToken,
+    );
+    final credentialFingerprint = credential.isEmpty
+        ? 'none'
+        : _stableHash('credential:$credential');
+    return _stableHash(
+      'cache-key-v2\n${uri.toString()}\naccept:$canonicalAccept\n'
+      'credential:$credentialFingerprint',
+    );
+  }
+
+  String _canonicalAccept(String? value) {
+    final trimmed = value?.trim().toLowerCase() ?? '';
+    return trimmed.isEmpty ? '*/*' : trimmed.replaceAll(RegExp(r'\s+'), ' ');
+  }
+
+  String _effectiveCredentialIdentity(
+    Uri uri, {
+    String? authHeader,
+    String? finnhubToken,
+  }) {
+    final host = uri.host.toLowerCase();
+    if (host == 'sandbox.tradier.com' || host == 'api.tradier.com') {
+      final caller = authHeader?.trim() ?? '';
+      if (caller.isNotEmpty) return caller;
+      return kServerTradierToken.isEmpty ? '' : 'Bearer $kServerTradierToken';
+    }
+    if (host == 'finnhub.io') {
+      final caller = finnhubToken?.trim() ?? '';
+      return caller.isNotEmpty ? caller : kServerFinnhubToken;
+    }
+    return '';
+  }
+
   Future<Map<String, Object>> status() async {
+    if (_stopped) {
+      throw StateError('Market-data cache is stopped.');
+    }
     await directory.create(recursive: true);
     final files = await directory
         .list()
@@ -669,13 +883,19 @@ class MarketDataCache {
               as Map<String, dynamic>;
       final fetchedAt = DateTime.parse(decoded['fetchedAt'] as String);
       final ttlSeconds = decoded['ttlSeconds'] as int;
+      final body = await paths.body.readAsBytes();
+      final expectedBodyHash = decoded['bodyHash'];
+      if (expectedBodyHash is String &&
+          expectedBodyHash != _stableHashBytes(body)) {
+        return null;
+      }
       return _StoredCacheEntry(
         statusCode: decoded['statusCode'] as int,
         contentType:
             decoded['contentType'] as String? ?? 'application/octet-stream',
         fetchedAt: fetchedAt,
         ttl: Duration(seconds: ttlSeconds),
-        body: await paths.body.readAsBytes(),
+        body: body,
       );
     } catch (_) {
       return null;
@@ -698,16 +918,36 @@ class MarketDataCache {
     // both: secrets are re-attached per hop against THIS hop's host, and an
     // off-allowlist Location is refused rather than fetched.
     var current = uri;
+    final originalHost = uri.host.toLowerCase();
     for (var hop = 0; hop < 6; hop++) {
-      final request = await _client.getUrl(current).timeout(policy.timeout);
-      request.followRedirects = false;
+      if (_stopped) {
+        throw StateError('Market-data cache stopped during fetch.');
+      }
       final host = current.host.toLowerCase();
+      var upstream = current;
+      if (host == 'api.stlouisfed.org' &&
+          originalHost == 'api.stlouisfed.org' &&
+          kServerFredToken.isNotEmpty) {
+        // FRED authenticates with a query parameter. Add it only at the last
+        // possible moment so the secret is absent from browser URLs, cache
+        // keys/metadata, and every non-FRED request (including redirects).
+        upstream = current.replace(
+          queryParameters: {
+            ...current.queryParameters,
+            'api_key': kServerFredToken,
+          },
+        );
+      }
+      final request = await _client.getUrl(upstream).timeout(policy.timeout);
+      request.followRedirects = false;
       // Finnhub token: an inbound header wins (back-compat / the CLI); else the
       // server-held token is injected — and only ever toward finnhub.io.
       final effectiveFinnhub = (finnhubToken != null && finnhubToken.isNotEmpty)
           ? finnhubToken
           : kServerFinnhubToken;
-      if (effectiveFinnhub.isNotEmpty && host == 'finnhub.io') {
+      if (effectiveFinnhub.isNotEmpty &&
+          host == 'finnhub.io' &&
+          originalHost == 'finnhub.io') {
         request.headers.set('X-Finnhub-Token', effectiveFinnhub);
       }
       request.headers.set(
@@ -734,17 +974,25 @@ class MarketDataCache {
       final isTradierHost =
           host == 'sandbox.tradier.com' || host == 'api.tradier.com';
       String? effectiveAuth;
-      if (authHeader != null &&
+      if (isTradierHost &&
+          authHeader != null &&
           authHeader.isNotEmpty &&
           host == uri.host.toLowerCase()) {
         effectiveAuth = authHeader;
-      } else if (isTradierHost && kServerTradierToken.isNotEmpty) {
+      } else if (isTradierHost &&
+          (originalHost == 'sandbox.tradier.com' ||
+              originalHost == 'api.tradier.com') &&
+          kServerTradierToken.isNotEmpty) {
         effectiveAuth = 'Bearer $kServerTradierToken';
       }
       if (effectiveAuth != null && effectiveAuth.isNotEmpty) {
         request.headers.set(HttpHeaders.authorizationHeader, effectiveAuth);
       }
       final response = await request.close().timeout(policy.timeout);
+      if (_stopped) {
+        await response.drain<void>();
+        throw StateError('Market-data cache stopped during fetch.');
+      }
       final location = response.headers.value(HttpHeaders.locationHeader);
       if (response.statusCode >= 300 &&
           response.statusCode < 400 &&
@@ -762,6 +1010,24 @@ class MarketDataCache {
                 'error': 'redirect_not_allowed',
                 'detail':
                     'Upstream redirected to a non-allowlisted host; not followed.',
+                'host': next.host,
+              }),
+            ),
+          );
+        }
+        if (isCacheable(current, authHeader: authHeader) &&
+            !isCacheable(next, authHeader: authHeader)) {
+          return _StoredCacheEntry(
+            statusCode: HttpStatus.forbidden,
+            contentType: 'application/json; charset=utf-8',
+            fetchedAt: DateTime.now().toUtc(),
+            ttl: Duration.zero,
+            body: utf8.encode(
+              jsonEncode({
+                'error': 'redirect_not_cache_safe',
+                'detail':
+                    'A cacheable upstream route redirected to an account or '
+                    'caller-authenticated route; not followed.',
                 'host': next.host,
               }),
             ),
@@ -791,17 +1057,70 @@ class MarketDataCache {
   }
 
   Future<void> _write(_CachePaths paths, _StoredCacheEntry entry) async {
+    if (_stopped) return;
     await directory.create(recursive: true);
-    await paths.body.writeAsBytes(entry.body, flush: true);
-    await paths.metadata.writeAsString(
-      jsonEncode({
-        'statusCode': entry.statusCode,
-        'contentType': entry.contentType,
-        'fetchedAt': entry.fetchedAt.toIso8601String(),
-        'ttlSeconds': entry.ttl.inSeconds,
-      }),
-      flush: true,
-    );
+    if (_stopped) return;
+    final suffix = '$pid-${DateTime.now().microsecondsSinceEpoch}';
+    final bodyTemp = File('${paths.body.path}.$suffix.tmp');
+    final metadataTemp = File('${paths.metadata.path}.$suffix.tmp');
+    try {
+      await bodyTemp.writeAsBytes(entry.body, flush: true);
+      await metadataTemp.writeAsString(
+        jsonEncode({
+          'statusCode': entry.statusCode,
+          'contentType': entry.contentType,
+          'fetchedAt': entry.fetchedAt.toIso8601String(),
+          'ttlSeconds': entry.ttl.inSeconds,
+          // A two-file cache cannot commit body+metadata in one filesystem
+          // operation. The checksum makes an interrupted midpoint fail closed
+          // as a cache miss instead of pairing stale metadata with new bytes.
+          'bodyHash': _stableHashBytes(entry.body),
+        }),
+        flush: true,
+      );
+      if (_stopped) return;
+      await _replaceFile(bodyTemp, paths.body);
+      if (_stopped) return;
+      await _replaceFile(metadataTemp, paths.metadata);
+    } finally {
+      if (await bodyTemp.exists()) await bodyTemp.delete();
+      if (await metadataTemp.exists()) await metadataTemp.delete();
+    }
+  }
+
+  Future<void> _writeSerialized(
+    String partition,
+    _CachePaths paths,
+    _StoredCacheEntry entry,
+  ) {
+    Future<void> write() => _write(paths, entry);
+
+    final previous = _writesByPartition[partition];
+    final started = previous == null
+        ? write()
+        : previous.then<void>(
+            (_) => write(),
+            onError: (Object _, StackTrace _) => write(),
+          );
+    late final Future<void> tracked;
+    tracked = started.whenComplete(() {
+      if (identical(_writesByPartition[partition], tracked)) {
+        _writesByPartition.remove(partition);
+      }
+    });
+    _writesByPartition[partition] = tracked;
+    return tracked;
+  }
+
+  Future<void> _replaceFile(File source, File target) async {
+    try {
+      await source.rename(target.path);
+    } on FileSystemException {
+      // Windows does not consistently replace an existing destination. A
+      // missing target is safe: readers treat it as a miss and refetch.
+      if (await target.exists()) await target.delete();
+      await source.rename(target.path);
+    }
   }
 
   Future<Uint8List> _readAll(HttpClientResponse response) async {
@@ -813,11 +1132,15 @@ class MarketDataCache {
   }
 
   String _stableHash(String input) {
+    return _stableHashBytes(utf8.encode(input));
+  }
+
+  String _stableHashBytes(List<int> input) {
     const offset = 0xcbf29ce484222325;
     const prime = 0x100000001b3;
     const mask = 0xffffffffffffffff;
     var hash = offset;
-    for (final byte in utf8.encode(input)) {
+    for (final byte in input) {
       hash ^= byte;
       hash = (hash * prime) & mask;
     }
@@ -966,6 +1289,9 @@ class DecisionUniverseService {
   final DecisionPriceHistoryStore _priceStore;
 
   Future<Map<String, Object?>> build(Uri uri) async {
+    if (_cache.isStopped) {
+      throw StateError('Decision-universe service is stopped.');
+    }
     await cacheDirectory.create(recursive: true);
     final asOf = DateTime.now().toUtc();
     final scenario = uri.queryParameters['scenario'] ?? 'base';
@@ -1079,7 +1405,7 @@ class DecisionUniverseService {
       'asOf': asOf.toIso8601String(),
       'source': 'finance-oracle-backend-cache',
       'detail': signals.isNotEmpty
-          ? 'Decision signals use cached OHLCV for trend, volatility, liquidity, breadth, drawdown, and relative strength. SEC EDGAR XBRL fundamentals cover $fundamentalsCoverage of ${signals.length} names (quality, margin trend, free cash flow, revenue acceleration, valuation — ranked cross-sectionally with sector adjustment). Estimate revisions and listed-options feeds are not connected, so those fields stay neutral/proxied instead of simulated.'
+          ? 'Decision signals use Yahoo adjusted-total-return OHLCV for trend, volatility, liquidity, breadth, drawdown, and relative strength; raw closes are retained separately for live-price display. SEC EDGAR XBRL fundamentals cover $fundamentalsCoverage of ${signals.length} names (quality, margin trend, free cash flow, revenue acceleration, valuation — ranked cross-sectionally with sector adjustment). Estimate revisions and listed-options feeds are not connected, so those fields stay neutral/proxied instead of simulated.'
           : 'Recommendations paused: no symbols have enough fresh cached OHLCV to support Buy/Hold/Sell decisions. Run Sync prices and wait for usable price coverage.',
       'universeSize': fullUniverse.length,
       'returned': signals.length,
@@ -1117,7 +1443,13 @@ class DecisionUniverseService {
       if (series == null) {
         return true;
       }
-      return force || series.fetchedAt.isBefore(staleBefore);
+      // Pre-v3 cache rows either stored only raw close or could not prove that
+      // Yahoo supplied every OHLCV field. They remain explicitly unverified
+      // and must refresh before supporting return analytics; a fresh fetch
+      // timestamp never makes legacy evidence look usable.
+      return force ||
+          !series.hasAdjustedTotalReturnPrices ||
+          series.fetchedAt.isBefore(staleBefore);
     }).toList();
 
     final order = <String, int>{
@@ -1125,6 +1457,13 @@ class DecisionUniverseService {
         symbols[index]: index,
     };
     candidates.sort((left, right) {
+      final leftNeedsAdjustment =
+          !(state.seriesBySymbol[left]?.hasAdjustedTotalReturnPrices ?? false);
+      final rightNeedsAdjustment =
+          !(state.seriesBySymbol[right]?.hasAdjustedTotalReturnPrices ?? false);
+      if (leftNeedsAdjustment != rightNeedsAdjustment) {
+        return leftNeedsAdjustment ? -1 : 1;
+      }
       final leftDate = state.seriesBySymbol[left]?.fetchedAt;
       final rightDate = state.seriesBySymbol[right]?.fetchedAt;
       if (leftDate == null && rightDate == null) {
@@ -1150,6 +1489,9 @@ class DecisionUniverseService {
     );
 
     for (var offset = 0; offset < requested.length; offset += 8) {
+      if (_cache.isStopped) {
+        return DecisionPriceSyncResult.skipped(state: state, mode: syncMode);
+      }
       final chunk = requested.skip(offset).take(8).toList();
       final results = await Future.wait(
         chunk.map((symbol) async {
@@ -1158,6 +1500,9 @@ class DecisionUniverseService {
         }),
       );
       for (final result in results) {
+        if (_cache.isStopped) {
+          return DecisionPriceSyncResult.skipped(state: state, mode: syncMode);
+        }
         if (result.value == null) {
           failed.add(result.key);
         } else {
@@ -1171,6 +1516,9 @@ class DecisionUniverseService {
       lastSyncAt: DateTime.now().toUtc(),
       seriesBySymbol: nextSeries,
     );
+    if (_cache.isStopped) {
+      return DecisionPriceSyncResult.skipped(state: state, mode: syncMode);
+    }
     await _priceStore.save(nextState);
     return DecisionPriceSyncResult(
       state: nextState,
@@ -1190,7 +1538,7 @@ class DecisionUniverseService {
   ) async {
     try {
       final uri = Uri.parse(
-        'https://query1.finance.yahoo.com/v8/finance/chart/${Uri.encodeComponent(_toYahooSymbol(symbol))}?interval=1d&range=18mo',
+        'https://query1.finance.yahoo.com/v8/finance/chart/${Uri.encodeComponent(_toYahooSymbol(symbol))}?interval=1d&range=18mo&includeAdjustedClose=true',
       );
       final response = await _cache.fetch(uri);
       if (response.statusCode < 200 || response.statusCode >= 300) {
@@ -1227,13 +1575,14 @@ class DecisionUniverseService {
       // over long windows — same trick the desktop's marketData.ts uses.
       // period2 anchors to the next UTC midnight so the URL (and the proxy
       // cache key) is stable within a day; 16 years covers a 15-year study
-      // window plus the 120-bar warmup the signal builder requires.
+      // window plus the 200-row structural analytics window the signal
+      // builder requires.
       final period2 =
           ((DateTime.now().toUtc().millisecondsSinceEpoch ~/ 86400000) + 1) *
           86400;
       final period1 = period2 - (16 * 365.25 * 86400).round();
       final uri = Uri.parse(
-        'https://query1.finance.yahoo.com/v8/finance/chart/${Uri.encodeComponent(_toYahooSymbol(symbol))}?period1=$period1&period2=$period2&interval=1d&includePrePost=false&events=div%2Csplits',
+        'https://query1.finance.yahoo.com/v8/finance/chart/${Uri.encodeComponent(_toYahooSymbol(symbol))}?period1=$period1&period2=$period2&interval=1d&includePrePost=false&includeAdjustedClose=true&events=div%2Csplits',
       );
       final response = await _cache.fetch(uri);
       if (response.statusCode < 200 || response.statusCode >= 300) {
@@ -1305,9 +1654,7 @@ class DecisionUniverseService {
     for (final symbol in symbols) {
       final series = _studySeriesCache[symbol];
       if (series == null) continue;
-      final bars = series.bars
-          .where((bar) => !bar.date.isAfter(asOf))
-          .toList();
+      final bars = series.bars.where((bar) => !bar.date.isAfter(asOf)).toList();
       if (bars.length < 5) continue;
       truncated[symbol] = DecisionPriceSeries(
         symbol: series.symbol,
@@ -1365,12 +1712,12 @@ class DecisionUniverseService {
       'source': 'finance-oracle-backend-cache',
       'detail': pointInTimeFundamentals
           ? 'HISTORICAL STUDY MODE with POINT-IN-TIME fundamentals: signals '
-                'rebuilt from bars on or before the asOf date; quality/value/'
+                'rebuilt from Yahoo adjusted-total-return bars on or before the asOf date; quality/value/'
                 'growth filled from SEC filings as FILED by that date (no '
                 'look-ahead), covering $fundamentalsCoverage names. Revisions '
                 'and options fields stay neutral. Universe is the CURRENT '
                 'symbol list applied to the past (survivorship).'
-          : 'HISTORICAL STUDY MODE: signals rebuilt from bars on or before '
+          : 'HISTORICAL STUDY MODE: signals rebuilt from Yahoo adjusted-total-return bars on or before '
                 'the asOf date through the production signal builder. '
                 'Fundamentals, revisions, and options fields are neutral '
                 '(price-only), matching how uncovered names run live. '
@@ -1467,7 +1814,9 @@ class DecisionUniverseService {
       'defensiveScore': neutral,
       'universeRankSeed': index,
       'dataConfidence': math.min(metrics.dataConfidence, 78),
-      'dataSource': '${metrics.source}-ohlcv',
+      'dataSource': '${metrics.source}-adjusted-total-return-ohlcv',
+      'priceBasis': metrics.priceBasis,
+      'priceAdjustmentCoveragePct': metrics.adjustmentCoveragePct,
       'dataWarnings': dataWarnings,
       'priceAsOf': metrics.priceAsOf.toIso8601String(),
       'historyBars': metrics.barCount,
@@ -1539,9 +1888,9 @@ class DecisionUniverseService {
       'volatilityPressure': volatilityPressure,
       'creditStress': (riskCount / summaries.length * 100).round(),
       'leadership':
-          'OHLCV coverage ${analytics.coverage.usableSymbolCount}/${summaries.length}; top buy/risk signals are regime-scored after price-history replacement.',
+          'Adjusted-total-return OHLCV coverage ${analytics.coverage.usableSymbolCount}/${summaries.length}; top buy/risk signals are regime-scored after price-history replacement.',
       'liquidity': analytics.coverage.usableSymbolCount > 0
-          ? 'Using cached Yahoo Finance daily history through ${analytics.coverage.latestPriceDateLabel}. Fundamentals/options remain proxy fields.'
+          ? 'Using cached Yahoo Finance adjusted daily history through ${analytics.coverage.latestPriceDateLabel}. Fundamentals/options remain proxy fields.'
           : 'Backend cache is reachable; price-history sync has not produced usable coverage yet.',
       'updatedAt': DateTime.now().toUtc().toIso8601String(),
     };
@@ -1551,6 +1900,7 @@ class DecisionUniverseService {
     Map<String, Object?> snapshot, {
     required int limit,
   }) async {
+    if (_cache.isStopped) return const <Object?>[];
     final file = File(
       '${cacheDirectory.path}${Platform.pathSeparator}decision_history.json',
     );
@@ -1569,6 +1919,7 @@ class DecisionUniverseService {
     final trimmed = entries.length > 48
         ? entries.sublist(entries.length - 48)
         : entries;
+    if (_cache.isStopped) return const <Object?>[];
     await file.writeAsString(jsonEncode(trimmed), flush: true);
     final requested = limit.clamp(1, 48);
     return trimmed.reversed.take(requested).toList();
@@ -1680,6 +2031,9 @@ class DecisionPriceHistoryState {
 }
 
 class DecisionPriceSeries {
+  static const int currentSchemaVersion = 3;
+  static const int analyticsWindowSize = 200;
+
   const DecisionPriceSeries({
     required this.symbol,
     required this.source,
@@ -1692,22 +2046,96 @@ class DecisionPriceSeries {
   final DateTime fetchedAt;
   final List<DecisionPriceBar> bars;
 
+  int get adjustedBarCount =>
+      bars.where((bar) => bar.isAdjustedTotalReturn).length;
+
+  int get unadjustedBarCount => bars.length - adjustedBarCount;
+
+  int get incompleteProviderBarCount =>
+      bars.where((bar) => !bar.isProviderRowComplete).length;
+
+  double get adjustmentCoveragePct =>
+      bars.isEmpty ? 0 : adjustedBarCount / bars.length * 100;
+
+  List<DecisionPriceBar> get currentAnalyticsWindow =>
+      bars.length < analyticsWindowSize
+      ? const <DecisionPriceBar>[]
+      : bars.sublist(bars.length - analyticsWindowSize);
+
+  int get currentAnalyticsGapCount {
+    final window = currentAnalyticsWindow;
+    if (window.isEmpty) return analyticsWindowSize;
+    var gaps = window.where((bar) => !bar.isAdjustedTotalReturn).length;
+    for (var index = 1; index < window.length; index++) {
+      if (!window[index].date.isAfter(window[index - 1].date)) gaps++;
+    }
+    return gaps;
+  }
+
+  bool get hasOlderAnalyticalGaps {
+    final olderCount = bars.length - analyticsWindowSize;
+    if (olderCount <= 0) return false;
+    return bars.take(olderCount).any((bar) => !bar.isAdjustedTotalReturn);
+  }
+
+  // A count anywhere in the series is not sufficient: filtering through an
+  // internal provider gap silently changes 20/60/120-day horizons. Decision
+  // metrics require the exact latest 200 provider rows to be complete,
+  // adjusted, and strictly ordered. Any tail gap forces a source refresh.
+  bool get hasAdjustedTotalReturnPrices =>
+      bars.length >= analyticsWindowSize && currentAnalyticsGapCount == 0;
+
+  String get priceBasis {
+    if (adjustedBarCount == bars.length && bars.isNotEmpty) {
+      return 'adjusted-total-return';
+    }
+    if (adjustedBarCount > 0) {
+      return 'mixed-adjusted-and-unadjusted';
+    }
+    return 'unadjusted-close';
+  }
+
+  String get adjustmentSource {
+    if (adjustedBarCount > 0) return 'yahoo-chart-adjclose';
+    if (bars.isEmpty) return 'unknown';
+    final sources = bars.map((bar) => bar.adjustmentSource).toSet();
+    return sources.length == 1 ? sources.first : 'mixed-unadjusted-sources';
+  }
+
   Map<String, Object?> toJson() {
     return {
+      'schemaVersion': currentSchemaVersion,
       'symbol': symbol,
       'source': source,
       'fetchedAt': fetchedAt.toIso8601String(),
+      'priceBasis': priceBasis,
+      'adjustmentSource': adjustmentSource,
+      'adjustedBarCount': adjustedBarCount,
+      'unadjustedBarCount': unadjustedBarCount,
+      'incompleteProviderBarCount': incompleteProviderBarCount,
+      'adjustmentCoveragePct': adjustmentCoveragePct,
+      'analyticsWindowSize': analyticsWindowSize,
+      'currentAnalyticsGapCount': currentAnalyticsGapCount,
+      'hasOlderAnalyticalGaps': hasOlderAnalyticalGaps,
       'bars': bars.map((bar) => bar.toJson()).toList(),
     };
   }
 
   factory DecisionPriceSeries.fromJson(Map<String, dynamic> json) {
-    final bars =
-        (json['bars'] as List<dynamic>? ?? const [])
-            .whereType<Map<String, dynamic>>()
-            .map(DecisionPriceBar.fromJson)
-            .toList()
-          ..sort((left, right) => left.date.compareTo(right.date));
+    final rawBars = json['bars'];
+    if (rawBars is! List<dynamic>) {
+      throw const FormatException('Cached price series had no bar list.');
+    }
+    final bars = <DecisionPriceBar>[];
+    for (var index = 0; index < rawBars.length; index++) {
+      final rawBar = rawBars[index];
+      if (rawBar is! Map<String, dynamic>) {
+        throw FormatException(
+          'Cached price row at provider index $index was malformed.',
+        );
+      }
+      bars.add(DecisionPriceBar.fromJson(rawBar));
+    }
     return DecisionPriceSeries(
       symbol: json['symbol'] as String? ?? '',
       source: json['source'] as String? ?? 'yahoo-finance',
@@ -1756,6 +2184,12 @@ class DecisionPriceSeries {
           low: low,
           close: close,
           volume: volume,
+          rawOpen: open,
+          rawHigh: high,
+          rawLow: low,
+          rawClose: close,
+          adjustmentFactor: 1,
+          adjustmentSource: 'stooq-unadjusted-close',
         ),
       );
     }
@@ -1788,10 +2222,10 @@ class DecisionPriceSeries {
       throw const FormatException('Yahoo chart response had no result rows.');
     }
     final entry = result.first as Map<String, dynamic>;
-    final timestamps = (entry['timestamp'] as List<dynamic>? ?? const [])
-        .whereType<num>()
-        .map((value) => value.toInt())
-        .toList();
+    // Preserve provider indexes. Filtering null timestamps before reading
+    // quote/adjclose arrays would shift every subsequent price onto the
+    // wrong date.
+    final timestamps = entry['timestamp'] as List<dynamic>? ?? const [];
     final indicators = entry['indicators'] as Map<String, dynamic>?;
     final quoteList = indicators?['quote'];
     if (timestamps.isEmpty ||
@@ -1800,27 +2234,102 @@ class DecisionPriceSeries {
       throw const FormatException('Yahoo chart response had no OHLCV rows.');
     }
     final quote = quoteList.first as Map<String, dynamic>;
+    final adjustedList = indicators?['adjclose'];
+    if (adjustedList is! List<dynamic> ||
+        adjustedList.isEmpty ||
+        adjustedList.first is! Map<String, dynamic>) {
+      // Never silently fall back to raw close: historical returns must use
+      // Yahoo's split/distribution-adjusted total-return series.
+      throw const FormatException(
+        'Yahoo chart response had no adjusted-close rows.',
+      );
+    }
+    final adjusted = adjustedList.first as Map<String, dynamic>;
     final bars = <DecisionPriceBar>[];
+    int? previousTimestampMs;
     for (var index = 0; index < timestamps.length; index++) {
-      final close = _numberAt(quote['close'], index);
-      if (close == null || close <= 0) {
-        continue;
+      final timestamp = timestamps[index];
+      if (timestamp is! num || !timestamp.toDouble().isFinite) {
+        throw FormatException(
+          'Yahoo chart timestamp at provider index $index was invalid.',
+        );
       }
+      final timestampMsValue = timestamp.toDouble() * 1000;
+      if (!timestampMsValue.isFinite) {
+        throw FormatException(
+          'Yahoo chart timestamp at provider index $index was non-finite.',
+        );
+      }
+      final timestampMs = timestampMsValue.round();
+      if (previousTimestampMs != null && timestampMs <= previousTimestampMs) {
+        throw FormatException(
+          'Yahoo chart timestamps were not strictly increasing at provider '
+          'index $index.',
+        );
+      }
+      final DateTime date;
+      try {
+        date = DateTime.fromMillisecondsSinceEpoch(timestampMs, isUtc: true);
+      } on ArgumentError {
+        throw FormatException(
+          'Yahoo chart timestamp at provider index $index was out of range.',
+        );
+      }
+      previousTimestampMs = timestampMs;
+      final rawClose = _numberAt(quote['close'], index);
+      final rawOpen = _numberAt(quote['open'], index);
+      final rawHigh = _numberAt(quote['high'], index);
+      final rawLow = _numberAt(quote['low'], index);
+      final rawVolume = _numberAt(quote['volume'], index);
+      final adjustedClose = _numberAt(adjusted['adjclose'], index);
+      final hasRawClose = rawClose != null && rawClose > 0;
+      final hasAdjustment = adjustedClose != null && adjustedClose > 0;
+      var providerRowComplete = false;
+      if (rawClose != null &&
+          rawClose > 0 &&
+          rawOpen != null &&
+          rawOpen > 0 &&
+          rawHigh != null &&
+          rawHigh > 0 &&
+          rawLow != null &&
+          rawLow > 0 &&
+          rawVolume != null &&
+          rawVolume >= 0) {
+        // A provider row is not complete merely because every field parses.
+        // Impossible OHLC bounds are data corruption and stay display-only.
+        providerRowComplete =
+            rawHigh >= math.max(math.max(rawOpen, rawClose), rawLow) &&
+            rawLow <= math.min(math.min(rawOpen, rawClose), rawHigh);
+      }
+      final factor = hasAdjustment && hasRawClose
+          ? adjustedClose / rawClose
+          : 1.0;
       bars.add(
         DecisionPriceBar(
-          date: DateTime.fromMillisecondsSinceEpoch(
-            timestamps[index] * 1000,
-            isUtc: true,
-          ),
-          open: _numberAt(quote['open'], index) ?? close,
-          high: _numberAt(quote['high'], index) ?? close,
-          low: _numberAt(quote['low'], index) ?? close,
-          close: close,
-          volume: _numberAt(quote['volume'], index) ?? 0,
+          date: date,
+          // Missing values remain explicit zero placeholders only so the
+          // timestamp/provider row survives serialization. providerRowStatus
+          // makes the row categorically ineligible for analytical use; no
+          // flat OHLC or zero-volume bar is ever synthesized into metrics.
+          open: rawOpen == null ? 0 : rawOpen * factor,
+          high: rawHigh == null ? 0 : rawHigh * factor,
+          low: rawLow == null ? 0 : rawLow * factor,
+          close: hasAdjustment ? adjustedClose : (rawClose ?? 0),
+          volume: rawVolume ?? 0,
+          rawOpen: rawOpen,
+          rawHigh: rawHigh,
+          rawLow: rawLow,
+          rawClose: rawClose,
+          adjustmentFactor: factor,
+          adjustmentSource: hasAdjustment
+              ? 'yahoo-chart-adjclose'
+              : 'yahoo-close-missing-adjclose',
+          providerRowStatus: providerRowComplete
+              ? 'complete'
+              : 'invalid-or-incomplete-yahoo-ohlcv',
         ),
       );
     }
-    bars.sort((left, right) => left.date.compareTo(right.date));
     if (bars.length < 5) {
       throw const FormatException('Yahoo chart response had too few bars.');
     }
@@ -1843,6 +2352,13 @@ class DecisionPriceBar {
     required this.low,
     required this.close,
     required this.volume,
+    this.rawOpen,
+    this.rawHigh,
+    this.rawLow,
+    this.rawClose,
+    this.adjustmentFactor = 1,
+    this.adjustmentSource = 'unadjusted-provider-close',
+    this.providerRowStatus = 'complete',
   });
 
   final DateTime date;
@@ -1851,6 +2367,49 @@ class DecisionPriceBar {
   final double low;
   final double close;
   final double volume;
+  final double? rawOpen;
+  final double? rawHigh;
+  final double? rawLow;
+  final double? rawClose;
+  final double adjustmentFactor;
+  final String adjustmentSource;
+  final String providerRowStatus;
+
+  bool get isProviderRowComplete => providerRowStatus == 'complete';
+
+  bool get isAdjustedTotalReturn =>
+      adjustmentSource == 'yahoo-chart-adjclose' &&
+      isProviderRowComplete &&
+      open.isFinite &&
+      open > 0 &&
+      high.isFinite &&
+      high > 0 &&
+      low.isFinite &&
+      low > 0 &&
+      close.isFinite &&
+      close > 0 &&
+      high >= math.max(math.max(open, close), low) &&
+      low <= math.min(math.min(open, close), high) &&
+      volume.isFinite &&
+      volume >= 0 &&
+      rawOpen != null &&
+      rawOpen!.isFinite &&
+      rawOpen! > 0 &&
+      rawHigh != null &&
+      rawHigh!.isFinite &&
+      rawHigh! > 0 &&
+      rawLow != null &&
+      rawLow!.isFinite &&
+      rawLow! > 0 &&
+      rawClose != null &&
+      rawClose!.isFinite &&
+      rawClose! > 0 &&
+      rawHigh! >= math.max(math.max(rawOpen!, rawClose!), rawLow!) &&
+      rawLow! <= math.min(math.min(rawOpen!, rawClose!), rawHigh!) &&
+      adjustmentFactor.isFinite &&
+      adjustmentFactor > 0;
+
+  double get liveClose => rawClose ?? close;
 
   Map<String, Object?> toJson() {
     return {
@@ -1860,19 +2419,44 @@ class DecisionPriceBar {
       'low': low,
       'close': close,
       'volume': volume,
+      'rawOpen': rawOpen,
+      'rawHigh': rawHigh,
+      'rawLow': rawLow,
+      'rawClose': rawClose,
+      'adjustmentFactor': adjustmentFactor,
+      'adjustmentSource': adjustmentSource,
+      'providerRowStatus': providerRowStatus,
     };
   }
 
   factory DecisionPriceBar.fromJson(Map<String, dynamic> json) {
+    final rawDate = json['date'];
+    final parsedDate = rawDate is String ? DateTime.tryParse(rawDate) : null;
     return DecisionPriceBar(
-      date:
-          DateTime.tryParse(json['date'] as String? ?? '') ??
-          DateTime.fromMillisecondsSinceEpoch(0, isUtc: true),
+      date: parsedDate ?? DateTime.fromMillisecondsSinceEpoch(0, isUtc: true),
       open: _num(json['open']),
       high: _num(json['high']),
       low: _num(json['low']),
       close: _num(json['close']),
       volume: _num(json['volume']),
+      rawOpen: json['rawOpen'] is num ? _num(json['rawOpen']) : null,
+      rawHigh: json['rawHigh'] is num ? _num(json['rawHigh']) : null,
+      rawLow: json['rawLow'] is num ? _num(json['rawLow']) : null,
+      rawClose: json['rawClose'] is num ? _num(json['rawClose']) : null,
+      adjustmentFactor: json['adjustmentFactor'] is num
+          ? _num(json['adjustmentFactor'])
+          : 1,
+      // Absence means this is a schema-v1 cache row. Keep it explicitly
+      // raw and ineligible for analytics until the sync refreshes it.
+      adjustmentSource:
+          json['adjustmentSource'] as String? ?? 'legacy-unadjusted-close',
+      // Missing status can never be inferred as complete: schema v2 could not
+      // distinguish real Yahoo OHLCV from parser-filled flat/zero values, and
+      // a damaged v3 row must also fail closed. A fresh v3 parser persists the
+      // explicit status on every provider row.
+      providerRowStatus: parsedDate == null
+          ? 'invalid-cached-timestamp'
+          : json['providerRowStatus'] as String? ?? 'legacy-unverified',
     );
   }
 }
@@ -1980,15 +2564,10 @@ class DecisionPriceAnalytics {
     final usableMetrics = metricsBySymbol.values
         .where((metrics) => metrics.dataConfidence >= 45)
         .toList();
-    final totalBars = state.seriesBySymbol.values.fold<int>(
-      0,
-      (sum, series) => sum + series.bars.length,
-    );
     final coverage = DecisionPriceCoverage.fromState(
       state,
       selectedSymbols: selectedSymbols,
       usableSymbols: usableMetrics.length,
-      totalBars: totalBars,
       anchor: anchor,
     );
     final averageVolatility = usableMetrics.isEmpty
@@ -2029,6 +2608,14 @@ class DecisionPriceCoverage {
     required this.freshSymbolCount,
     required this.staleSymbolCount,
     required this.totalBarCount,
+    required this.analyticalBarCount,
+    required this.adjustedInventoryBarCount,
+    required this.unadjustedBarCount,
+    required this.incompleteProviderBarCount,
+    required this.adjustedSeriesCount,
+    required this.unadjustedOnlySeriesCount,
+    required this.structurallyUsableSeriesCount,
+    required this.currentAnalyticsGapSeriesCount,
     required this.latestPriceDate,
     required this.oldestPriceDate,
   });
@@ -2038,8 +2625,29 @@ class DecisionPriceCoverage {
   final int freshSymbolCount;
   final int staleSymbolCount;
   final int totalBarCount;
+  final int analyticalBarCount;
+  final int adjustedInventoryBarCount;
+  final int unadjustedBarCount;
+  final int incompleteProviderBarCount;
+  final int adjustedSeriesCount;
+  final int unadjustedOnlySeriesCount;
+  final int structurallyUsableSeriesCount;
+  final int currentAnalyticsGapSeriesCount;
   final DateTime? latestPriceDate;
   final DateTime? oldestPriceDate;
+
+  double get adjustmentCoveragePct =>
+      totalBarCount <= 0 ? 0 : adjustedInventoryBarCount / totalBarCount * 100;
+
+  String get priceBasis {
+    if (adjustedInventoryBarCount > 0 && unadjustedBarCount == 0) {
+      return 'adjusted-total-return';
+    }
+    if (adjustedInventoryBarCount > 0) {
+      return 'mixed-adjusted-and-unadjusted';
+    }
+    return 'unadjusted-or-unavailable';
+  }
 
   String get latestPriceDateLabel =>
       latestPriceDate == null ? 'unknown' : _dateLabel(latestPriceDate!);
@@ -2048,27 +2656,53 @@ class DecisionPriceCoverage {
     DecisionPriceHistoryState state, {
     required List<String> selectedSymbols,
     required int usableSymbols,
-    required int totalBars,
     DateTime? anchor,
   }) {
     final now = anchor ?? DateTime.now().toUtc();
     final selectedSet = selectedSymbols.toSet();
     var fresh = 0;
     var stale = 0;
+    var totalBars = 0;
+    var analyticalBars = 0;
+    var adjustedInventoryBars = 0;
+    var unadjustedBars = 0;
+    var incompleteProviderBars = 0;
+    var adjustedSeries = 0;
+    var unadjustedOnlySeries = 0;
+    var structurallyUsableSeries = 0;
+    var currentAnalyticsGapSeries = 0;
     DateTime? latest;
     DateTime? oldest;
     for (final entry in state.seriesBySymbol.entries) {
       if (!selectedSet.contains(entry.key) || entry.value.bars.isEmpty) {
         continue;
       }
-      final date = entry.value.bars.last.date;
+      final series = entry.value;
+      totalBars += series.bars.length;
+      adjustedInventoryBars += series.adjustedBarCount;
+      unadjustedBars += series.unadjustedBarCount;
+      incompleteProviderBars += series.incompleteProviderBarCount;
+      if (series.adjustedBarCount > 0) adjustedSeries++;
+      if (series.adjustedBarCount == 0) unadjustedOnlySeries++;
+      // Fresh/stale coverage is meaningful only for a structurally usable
+      // current window. Selecting adjusted rows from around a gap would make
+      // an ineligible series look current.
+      if (!series.hasAdjustedTotalReturnPrices) {
+        currentAnalyticsGapSeries++;
+        continue;
+      }
+      structurallyUsableSeries++;
+      final currentWindow = series.currentAnalyticsWindow;
+      analyticalBars += currentWindow.length;
+      final date = currentWindow.last.date;
+      final firstDate = currentWindow.first.date;
       if (now.difference(date).inDays <= 10) {
         fresh++;
       } else {
         stale++;
       }
       if (latest == null || date.isAfter(latest)) latest = date;
-      if (oldest == null || date.isBefore(oldest)) oldest = date;
+      if (oldest == null || firstDate.isBefore(oldest)) oldest = firstDate;
     }
     final cached = state.seriesBySymbol.keys
         .where((symbol) => selectedSet.contains(symbol))
@@ -2079,6 +2713,14 @@ class DecisionPriceCoverage {
       freshSymbolCount: fresh,
       staleSymbolCount: stale,
       totalBarCount: totalBars,
+      analyticalBarCount: analyticalBars,
+      adjustedInventoryBarCount: adjustedInventoryBars,
+      unadjustedBarCount: unadjustedBars,
+      incompleteProviderBarCount: incompleteProviderBars,
+      adjustedSeriesCount: adjustedSeries,
+      unadjustedOnlySeriesCount: unadjustedOnlySeries,
+      structurallyUsableSeriesCount: structurallyUsableSeries,
+      currentAnalyticsGapSeriesCount: currentAnalyticsGapSeries,
       latestPriceDate: latest,
       oldestPriceDate: oldest,
     );
@@ -2091,6 +2733,20 @@ class DecisionPriceCoverage {
       'freshSymbolCount': freshSymbolCount,
       'staleSymbolCount': staleSymbolCount,
       'totalBarCount': totalBarCount,
+      'analyticalBarCount': analyticalBarCount,
+      'adjustedInventoryBarCount': adjustedInventoryBarCount,
+      'unadjustedBarCount': unadjustedBarCount,
+      'incompleteProviderBarCount': incompleteProviderBarCount,
+      'adjustedSeriesCount': adjustedSeriesCount,
+      'unadjustedOnlySeriesCount': unadjustedOnlySeriesCount,
+      'structurallyUsableSeriesCount': structurallyUsableSeriesCount,
+      'currentAnalyticsGapSeriesCount': currentAnalyticsGapSeriesCount,
+      'analyticsWindowSize': DecisionPriceSeries.analyticsWindowSize,
+      'priceBasis': priceBasis,
+      'adjustmentSource': adjustedInventoryBarCount > 0
+          ? 'yahoo-chart-adjclose'
+          : 'none',
+      'adjustmentCoveragePct': adjustmentCoveragePct,
       'latestPriceDate': latestPriceDate?.toIso8601String(),
       'oldestPriceDate': oldestPriceDate?.toIso8601String(),
     };
@@ -2101,6 +2757,8 @@ class DecisionPriceMetrics {
   const DecisionPriceMetrics({
     required this.symbol,
     required this.source,
+    required this.priceBasis,
+    required this.adjustmentCoveragePct,
     required this.priceAsOf,
     required this.barCount,
     required this.lastPrice,
@@ -2127,6 +2785,8 @@ class DecisionPriceMetrics {
 
   final String symbol;
   final String source;
+  final String priceBasis;
+  final double adjustmentCoveragePct;
   final DateTime priceAsOf;
   final int barCount;
   final double lastPrice;
@@ -2154,14 +2814,21 @@ class DecisionPriceMetrics {
     DecisionPriceSeries series, {
     DateTime? anchor,
   }) {
-    final bars = series.bars.where((bar) => bar.close > 0).toList();
-    if (bars.length < 5) {
-      throw const FormatException('Not enough bars for metrics.');
+    // Never filter bad rows and compress a horizon. The exact latest 200
+    // provider rows must be complete adjusted bars; one internal gap rejects
+    // the series and puts it back in the refresh queue.
+    if (!series.hasAdjustedTotalReturnPrices) {
+      throw const FormatException(
+        'Current 200-row analytics window is incomplete or unadjusted.',
+      );
     }
+    final bars = series.currentAnalyticsWindow;
     return DecisionPriceMetrics._fromBars(
       series.symbol,
       series.source,
       bars,
+      adjustmentCoveragePct: series.adjustmentCoveragePct,
+      hasOlderAnalyticalGaps: series.hasOlderAnalyticalGaps,
       anchor: anchor,
     );
   }
@@ -2181,6 +2848,8 @@ class DecisionPriceMetrics {
     String symbol,
     String source,
     List<DecisionPriceBar> bars, {
+    required double adjustmentCoveragePct,
+    bool hasOlderAnalyticalGaps = false,
     // Historical study mode evaluates freshness relative to the study date,
     // not the wall clock — otherwise every past bar looks years stale.
     DateTime? anchor,
@@ -2199,7 +2868,7 @@ class DecisionPriceMetrics {
     final volumeRatio = averageVolume60 <= 0
         ? 1.0
         : averageVolume20 / averageVolume60;
-    final dollarVolume = averageVolume20 * latest.close;
+    final dollarVolume = averageVolume20 * latest.liveClose;
     final ageDays = (anchor ?? DateTime.now().toUtc())
         .difference(latest.date)
         .inDays;
@@ -2225,14 +2894,24 @@ class DecisionPriceMetrics {
         ? 30.0
         : 15.0;
     final warnings = <String>[];
-    if (bars.length < 120) {
-      warnings.add('Short price history lowers model confidence.');
-    }
     if (ageDays > 4) {
-      warnings.add('Latest daily bar is $ageDays days old — stale for a live decision.');
+      warnings.add(
+        'Latest daily bar is $ageDays days old — stale for a live decision.',
+      );
     }
     if (dollarVolume < 10000000) {
       warnings.add('Liquidity proxy is thin.');
+    }
+    warnings.add(
+      'Return features use Yahoo adjusted close '
+      '(${adjustmentCoveragePct.toStringAsFixed(1)}% of cached rows); '
+      'raw close is retained separately for live-price display.',
+    );
+    if (hasOlderAnalyticalGaps) {
+      warnings.add(
+        'Provider gaps exist before the current 200-row analytics window; '
+        'metrics use only the contiguous adjusted tail.',
+      );
     }
     // Staleness is a HARD ceiling on confidence, not just a 35%-weighted score:
     // a name with great history but a multi-day-old last bar is not a fresh
@@ -2247,9 +2926,11 @@ class DecisionPriceMetrics {
     return DecisionPriceMetrics(
       symbol: symbol,
       source: source,
+      priceBasis: 'adjusted-total-return',
+      adjustmentCoveragePct: adjustmentCoveragePct,
       priceAsOf: latest.date,
       barCount: bars.length,
-      lastPrice: latest.close,
+      lastPrice: latest.liveClose,
       return20d: return20,
       return60d: return60,
       return120d: return120,
@@ -2268,9 +2949,7 @@ class DecisionPriceMetrics {
       downsideVolumePressure: _downsideVolumePressure(bars, 20),
       breakoutQualityScore: _breakoutQuality(bars, 60),
       dataConfidence: dataConfidenceScore,
-      warnings: warnings.isEmpty
-          ? const <String>['Price-derived signals are backed by cached OHLCV.']
-          : warnings,
+      warnings: warnings,
     );
   }
 
@@ -2441,7 +3120,8 @@ double? _numberAt(Object? values, int index) {
   }
   final value = values[index];
   if (value is num) {
-    return value.toDouble();
+    final number = value.toDouble();
+    return number.isFinite ? number : null;
   }
   return null;
 }
@@ -2645,6 +3325,7 @@ class SecFundamentalsService {
   Future<void>? _drain;
   Map<String, String>? _cikByTicker;
   bool _lastFetchTouchedNetwork = false;
+  bool _stopped = false;
 
   /// Companyfacts changes only when a company files (10-Q cadence is ~90
   /// days), so re-parsing daily is plenty; the network TTL is governed by
@@ -2679,15 +3360,11 @@ class SecFundamentalsService {
   ];
   // Distress-model inputs (Altman 1983 Z''; Bharath-Shumway 2008 naive DD)
   static const List<String> _currentAssetConcepts = ['AssetsCurrent'];
-  static const List<String> _currentLiabilityConcepts = [
-    'LiabilitiesCurrent',
-  ];
+  static const List<String> _currentLiabilityConcepts = ['LiabilitiesCurrent'];
   static const List<String> _retainedEarningsConcepts = [
     'RetainedEarningsAccumulatedDeficit',
   ];
-  static const List<String> _operatingIncomeConcepts = [
-    'OperatingIncomeLoss',
-  ];
+  static const List<String> _operatingIncomeConcepts = ['OperatingIncomeLoss'];
   // Bharath-Shumway's F is DEBT (Compustat DLC + 0.5·DLTT), NOT total
   // liabilities — accounts payable, deposits, and policy reserves don't
   // belong in the default barrier.
@@ -2708,10 +3385,24 @@ class SecFundamentalsService {
   int get coveredCount => _bySymbol.values.where((f) => f != null).length;
   int get attemptedCount => _computedAt.length;
 
+  /// Stop accepting queued work and join the current SEC request. This makes
+  /// BackendCacheServer.stop a real lifecycle boundary and releases cache
+  /// handles before tests, updates, or app shutdown remove the directory.
+  Future<void> stop({bool resetSingleton = true}) async {
+    _stopped = true;
+    _queue.clear();
+    try {
+      await _drain;
+    } finally {
+      if (resetSingleton && identical(_singleton, this)) _singleton = null;
+    }
+  }
+
   /// Queue stale/missing symbols and return a future that completes when
   /// the queue is drained. Safe to call repeatedly: symbols queued while a
   /// drain is running are handled by that same drain.
   Future<void> ensureWarm(Iterable<String> symbols) {
+    if (_stopped) return Future<void>.value();
     final now = DateTime.now().toUtc();
     for (final symbol in symbols) {
       final at = _computedAt[symbol];
@@ -2722,18 +3413,20 @@ class SecFundamentalsService {
     if (_queue.isEmpty) {
       return _drain ?? Future<void>.value();
     }
+    if (_stopped) return Future<void>.value();
     return _drain ??= _drainQueue().whenComplete(() => _drain = null);
   }
 
   Future<void> _drainQueue() async {
     var attempted = 0;
     var computed = 0;
-    while (_queue.isNotEmpty) {
+    while (!_stopped && _queue.isNotEmpty) {
       final symbol = _queue.first;
       _queue.remove(symbol);
       attempted++;
       try {
         final fundamentals = await _compute(symbol);
+        if (_stopped) break;
         _bySymbol[symbol] = fundamentals;
         if (fundamentals != null) {
           computed++;
@@ -2742,6 +3435,7 @@ class SecFundamentalsService {
         // Best-effort: leave the symbol uncovered (fields stay neutral);
         // it is retried after _recomputeAfter.
       }
+      if (_stopped) break;
       _computedAt[symbol] = DateTime.now().toUtc();
       if (_lastFetchTouchedNetwork) {
         await Future<void>.delayed(_politePause);
@@ -2770,6 +3464,7 @@ class SecFundamentalsService {
 
   /// Warm the study fact bundles for [symbols] (SEC-paced, progress-logged).
   Future<void> ensureStudyFacts(Iterable<String> symbols) async {
+    if (_stopped) return;
     final missing = [
       for (final symbol in symbols)
         if (!_studyBundles.containsKey(symbol) &&
@@ -2781,8 +3476,10 @@ class SecFundamentalsService {
     }
     var processed = 0;
     for (final symbol in missing) {
+      if (_stopped) break;
       try {
         final bundle = await _loadFactBundle(symbol, dedup: false);
+        if (_stopped) break;
         if (bundle != null) {
           _studyBundles[symbol] = bundle;
         } else {
@@ -2793,7 +3490,7 @@ class SecFundamentalsService {
         _studyBundleFailures[symbol] = (_studyBundleFailures[symbol] ?? 0) + 1;
       }
       processed++;
-      if (_lastFetchTouchedNetwork) {
+      if (!_stopped && _lastFetchTouchedNetwork) {
         await Future<void>.delayed(_politePause);
       }
       if (processed % 50 == 0) {
@@ -3076,8 +3773,7 @@ class SecFundamentalsService {
           (signal['dataWarnings'] as List?)?.cast<String>() ?? <String>[];
       signal['dataWarnings'] = [
         for (final warning in warnings)
-          if (!warning.startsWith('Fundamental and estimate-revision'))
-            warning,
+          if (!warning.startsWith('Fundamental and estimate-revision')) warning,
         'Fundamentals from SEC EDGAR XBRL filings (filed through '
             '${filedThrough ?? 'n/a'}). Estimate-revision fields remain '
             'neutral: no analyst feed is connected.',
@@ -3143,7 +3839,9 @@ class SecFundamentalsService {
   /// Every row carries both the period `end` and the `filed` date; ML must
   /// key features by `filed` to stay look-ahead safe.
   Future<Map<String, Object?>?> historyFor(String symbol) async {
+    if (_stopped) return null;
     final cik = (await _loadCikMap())[_normalizeTicker(symbol)];
+    if (_stopped) return null;
     if (cik == null) {
       return null;
     }
@@ -3177,9 +3875,13 @@ class SecFundamentalsService {
     // dedup: false — keep every filing occurrence (originals AND
     // restatements) so point-in-time consumers can use only what was
     // filed on or before their sample date.
-    var shares = _series(facts, 'dei', const [
-      'EntityCommonStockSharesOutstanding',
-    ], 'shares', dedup: false);
+    var shares = _series(
+      facts,
+      'dei',
+      const ['EntityCommonStockSharesOutstanding'],
+      'shares',
+      dedup: false,
+    );
     if (shares.isEmpty) {
       shares = _series(
         facts,
@@ -3222,13 +3924,7 @@ class SecFundamentalsService {
           _series(facts, 'us-gaap', const ['Assets'], 'USD', dedup: false),
         ),
         'liabilities': rows(
-          _series(
-            facts,
-            'us-gaap',
-            const ['Liabilities'],
-            'USD',
-            dedup: false,
-          ),
+          _series(facts, 'us-gaap', const ['Liabilities'], 'USD', dedup: false),
         ),
         'equity': rows(
           _series(facts, 'us-gaap', _equityConcepts, 'USD', dedup: false),
@@ -3237,28 +3933,46 @@ class SecFundamentalsService {
         // retained earnings, and operating income; Bharath-Shumway (2008)
         // naive distance-to-default needs the liability split.
         'currentAssets': rows(
-          _series(facts, 'us-gaap', _currentAssetConcepts, 'USD',
-              dedup: false),
+          _series(facts, 'us-gaap', _currentAssetConcepts, 'USD', dedup: false),
         ),
         'currentLiabilities': rows(
-          _series(facts, 'us-gaap', _currentLiabilityConcepts, 'USD',
-              dedup: false),
+          _series(
+            facts,
+            'us-gaap',
+            _currentLiabilityConcepts,
+            'USD',
+            dedup: false,
+          ),
         ),
         'retainedEarnings': rows(
-          _series(facts, 'us-gaap', _retainedEarningsConcepts, 'USD',
-              dedup: false),
+          _series(
+            facts,
+            'us-gaap',
+            _retainedEarningsConcepts,
+            'USD',
+            dedup: false,
+          ),
         ),
         'operatingIncome': rows(
-          _series(facts, 'us-gaap', _operatingIncomeConcepts, 'USD',
-              dedup: false),
+          _series(
+            facts,
+            'us-gaap',
+            _operatingIncomeConcepts,
+            'USD',
+            dedup: false,
+          ),
         ),
         'shortTermDebt': rows(
-          _series(facts, 'us-gaap', _shortTermDebtConcepts, 'USD',
-              dedup: false),
+          _series(
+            facts,
+            'us-gaap',
+            _shortTermDebtConcepts,
+            'USD',
+            dedup: false,
+          ),
         ),
         'longTermDebt': rows(
-          _series(facts, 'us-gaap', _longTermDebtConcepts, 'USD',
-              dedup: false),
+          _series(facts, 'us-gaap', _longTermDebtConcepts, 'USD', dedup: false),
         ),
         'shares': rows(shares),
       },
@@ -3291,9 +4005,13 @@ class SecFundamentalsService {
     if (facts is! Map) {
       return null;
     }
-    var shares = _series(facts, 'dei', const [
-      'EntityCommonStockSharesOutstanding',
-    ], 'shares', dedup: dedup);
+    var shares = _series(
+      facts,
+      'dei',
+      const ['EntityCommonStockSharesOutstanding'],
+      'shares',
+      dedup: dedup,
+    );
     if (shares.isEmpty) {
       shares = _series(
         facts,
@@ -3321,9 +4039,13 @@ class SecFundamentalsService {
       ),
       capex: _series(facts, 'us-gaap', _capexConcepts, 'USD', dedup: dedup),
       assets: _series(facts, 'us-gaap', const ['Assets'], 'USD', dedup: dedup),
-      liabilities: _series(facts, 'us-gaap', const [
-        'Liabilities',
-      ], 'USD', dedup: dedup),
+      liabilities: _series(
+        facts,
+        'us-gaap',
+        const ['Liabilities'],
+        'USD',
+        dedup: dedup,
+      ),
       equity: _series(facts, 'us-gaap', _equityConcepts, 'USD', dedup: dedup),
       shares: shares,
     );
@@ -3351,10 +4073,7 @@ class SecFundamentalsService {
   /// Knowledge filter: drop rows filed after [knowledge], then keep the
   /// latest-filed restatement per (start,end) period — the same collapse
   /// _series does with dedup:true, but bounded by what was filed in time.
-  static List<_FactRow> _knowledgeCut(
-    List<_FactRow> rows,
-    DateTime knowledge,
-  ) {
+  static List<_FactRow> _knowledgeCut(List<_FactRow> rows, DateTime knowledge) {
     final deduped = <String, _FactRow>{};
     for (final row in rows) {
       if (row.filed.isAfter(knowledge)) {
@@ -3367,11 +4086,10 @@ class SecFundamentalsService {
         deduped[key] = row;
       }
     }
-    return deduped.values.toList()
-      ..sort((a, b) {
-        final byEnd = a.end.compareTo(b.end);
-        return byEnd != 0 ? byEnd : a.filed.compareTo(b.filed);
-      });
+    return deduped.values.toList()..sort((a, b) {
+      final byEnd = a.end.compareTo(b.end);
+      return byEnd != 0 ? byEnd : a.filed.compareTo(b.filed);
+    });
   }
 
   /// Derive the metric snapshot from fact series. Shared verbatim by the
@@ -3414,8 +4132,7 @@ class SecFundamentalsService {
           asOf: DateTime(lagEnd.year - 1, lagEnd.month, lagEnd.day),
         );
         if (lagTtm != null && lagPriorTtm != null && lagPriorTtm > 0) {
-          revenueAccelPp =
-              revenueGrowthYoY - (lagTtm / lagPriorTtm - 1) * 100;
+          revenueAccelPp = revenueGrowthYoY - (lagTtm / lagPriorTtm - 1) * 100;
         }
       }
     }
@@ -3448,9 +4165,7 @@ class SecFundamentalsService {
     }
 
     double? leveragePct;
-    if (assets.isNotEmpty &&
-        liabilities.isNotEmpty &&
-        assets.last.value > 0) {
+    if (assets.isNotEmpty && liabilities.isNotEmpty && assets.last.value > 0) {
       leveragePct = liabilities.last.value / assets.last.value * 100;
     }
 
@@ -3673,6 +4388,7 @@ class SecFundamentalsService {
       form == '10-K/A';
 
   Future<Map<String, String>> _loadCikMap() async {
+    if (_stopped) return const <String, String>{};
     final cached = _cikByTicker;
     if (cached != null) {
       return cached;
@@ -3680,6 +4396,7 @@ class SecFundamentalsService {
     final json = await _fetchJson(
       Uri.parse('https://www.sec.gov/files/company_tickers.json'),
     );
+    if (_stopped) return const <String, String>{};
     final map = <String, String>{};
     if (json != null) {
       for (final row in json.values) {
@@ -3691,10 +4408,7 @@ class SecFundamentalsService {
         if (ticker == null || cik is! num) {
           continue;
         }
-        map[_normalizeTicker(ticker)] = cik
-            .toInt()
-            .toString()
-            .padLeft(10, '0');
+        map[_normalizeTicker(ticker)] = cik.toInt().toString().padLeft(10, '0');
       }
     }
     // Keep even an empty map only for this call; retry next time on failure.
@@ -3710,8 +4424,10 @@ class SecFundamentalsService {
       symbol.trim().toUpperCase().replaceAll('.', '-').replaceAll('/', '-');
 
   Future<Map?> _fetchJson(Uri uri) async {
+    if (_stopped) return null;
     try {
       final entry = await _cache.fetch(uri);
+      if (_stopped) return null;
       _lastFetchTouchedNetwork = entry.cacheState != 'HIT';
       if (entry.statusCode != 200) {
         return null;
@@ -3743,10 +4459,8 @@ class _FactRow {
   final String form;
 
   int get spanDays => start == null ? 0 : end.difference(start!).inDays;
-  bool get isQuarterFlow =>
-      start != null && spanDays >= 70 && spanDays <= 110;
-  bool get isAnnualFlow =>
-      start != null && spanDays >= 330 && spanDays <= 400;
+  bool get isQuarterFlow => start != null && spanDays >= 70 && spanDays <= 110;
+  bool get isAnnualFlow => start != null && spanDays >= 330 && spanDays <= 400;
 }
 
 /// Computed trailing metrics for one symbol; all fields nullable because

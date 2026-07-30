@@ -290,8 +290,3 @@ export const SIZE_TIERED_BORROW_FEE_ANNUAL = [
   { minMarketCapUsd: 2e9, annualBps: 100 },
   { minMarketCapUsd: 0, annualBps: 350 },     // small / hard-to-borrow
 ] as const
-
-/** Cost tier used when a name has no market-cap data (ETFs, ADR/IFRS
- * filers, pre-coverage history): treat as liquid large-cap rather than
- * penalizing — the backtest's tradeable universe is liquid by design. */
-export const MISSING_CAP_FALLBACK_USD = 15e9

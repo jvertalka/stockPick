@@ -88,6 +88,7 @@ import {
   getRegimeGate,
   loadModel,
   logLivePredictions,
+  modelDecisionAuthority,
   predictForUniverse,
   reconcilePredictions,
   type LivePrediction,
@@ -408,9 +409,12 @@ function verdictSourceLabel(source: NonNullable<DecisionSignal['verdictSource']>
   switch (source) {
     case 'ml': return 'ML verdict'
     case 'ml-veto': return 'ML liked it — evidence held it'
+    case 'ml-veto-bearish': return 'ML risk rank — evidence held it'
     case 'rules-exit': return 'Rules exit'
     case 'demoted-no-ml': return 'No ML coverage — held'
     case 'demoted-gated': return 'Regime-gated — held'
+    case 'demoted-evidence': return 'Evidence-gated — held'
+    case 'demoted-evidence-bearish': return 'Research-only risk rank'
     case 'rules': return 'Rules'
   }
 }
@@ -420,13 +424,19 @@ function verdictSourceDetail(source: NonNullable<DecisionSignal['verdictSource']
     case 'ml':
       return 'Set by the walk-forward-validated ML ensemble from its rank across all scored names.'
     case 'ml-veto':
-      return 'The model ranked this near the top, but the evidence or risk gates (data confidence, real SEC fundamentals, risk score) blocked a confident label.'
+      return 'The model ranked this near the top, but synchronized price/filing dates, calibrated interval, data confidence, or risk gates blocked a bullish label.'
+    case 'ml-veto-bearish':
+      return 'The model ranked this near the bottom, but synchronized price/filing dates, data confidence, or an entirely-negative calibrated interval was unavailable, so it cannot mint a bearish action.'
     case 'rules-exit':
       return 'The rules engine flagged this bearish — its measured strength. Treat as a risk warning and review; deep-red names statistically bounce.'
     case 'demoted-no-ml':
       return 'The rules wanted a bullish label, but rule-made buys measured anti-predictive over 15 years — without ML backing this stays at Hold.'
     case 'demoted-gated':
       return 'The market regime gate is closed (the model shows no edge in this regime), so no bullish labels are minted right now.'
+    case 'demoted-evidence':
+      return 'The model is research-only because its dataset or baseline-evidence promotion audit did not pass. Its forecast is visible, but it cannot mint a bullish action.'
+    case 'demoted-evidence-bearish':
+      return 'The research-only model ranked this near the bottom, but it has no authority to mint a Trim or Avoid action.'
     case 'rules':
       return 'Untouched rules label (neutral zone, or legacy Rules mode).'
   }
@@ -611,7 +621,9 @@ function LeadDecisionCard({
         <span>Opp {signal.opportunityScore}</span>
         <span>Conf {signal.confidence}</span>
         <span>Risk {signal.riskScore}</span>
-        <span>{formatSignedPercent(signal.forecast20d)} 20d</span>
+        <span>
+          {formatSignedPercent(signal.forecast20d)} {signal.quantConfirmed ? 'MC 20d' : 'factor proxy'}
+        </span>
       </div>
       <div className="hero-action-row">
         <span className="hero-plan">{signal.positionPlan}</span>
@@ -643,6 +655,9 @@ function StatusStrip({
   const universeSize = feed?.universeSize ?? rows.length
   const excluded = feed?.excludedForInsufficientData ?? Math.max(0, universeSize - qualified)
   const fundamentals = feed?.fundamentalsCoverage ?? 0
+  const adjustedCoverage = feed?.priceCoverage.adjustmentCoveragePct ?? 0
+  const analyticsGaps = feed?.priceCoverage.currentAnalyticsGapSeriesCount ?? 0
+  const adjustedPrices = feed?.priceCoverage.priceBasis === 'adjusted-total-return'
   const actionable = actionableRows(rows).length
   const tone: Tone =
     status === 'backend' && qualified > 0 ? 'caution' : status === 'loading' ? 'neutral' : 'danger'
@@ -651,8 +666,8 @@ function StatusStrip({
       ? 'Loading evidence'
       : status === 'backend' && qualified > 0
         ? fundamentals > 0
-          ? `Price + SEC fundamentals (${fundamentals} names) - options proxied`
-          : 'Price-backed - fundamentals warming, options proxied'
+          ? `${adjustedPrices ? 'Adjusted prices' : `Adjusted-price coverage ${adjustedCoverage.toFixed(1)}%`} + SEC fundamentals (${fundamentals} names)`
+          : `${adjustedPrices ? 'Adjusted prices' : `Adjusted-price coverage ${adjustedCoverage.toFixed(1)}%`} - fundamentals warming`
         : 'Recommendations paused'
 
   return (
@@ -670,6 +685,12 @@ function StatusStrip({
       <div className="status-strip-stat">
         <span>Excluded</span>
         <strong>{excluded}</strong>
+      </div>
+      <div className="status-strip-stat">
+        <span>Adjusted</span>
+        <strong title={analyticsGaps > 0 ? `${analyticsGaps} series paused by a gap inside the current 200-row analytical window` : 'No current analytical-window gaps'}>
+          {adjustedCoverage.toFixed(1)}%{analyticsGaps > 0 ? ` · ${analyticsGaps} paused` : ''}
+        </strong>
       </div>
       <div className="status-strip-stat">
         <span>Latest bar</span>
@@ -874,7 +895,9 @@ function DecisionTable({
                 <th scope="col">Why</th>
                 <th scope="col">Opp</th>
                 <th scope="col">Risk</th>
-                <th scope="col">20d</th>
+                <th scope="col" title="Monte Carlo estimate when available; otherwise a rule-derived factor proxy">
+                  Proxy/MC 20d
+                </th>
                 <th scope="col" title="ML model prediction (when available)">ML</th>
                 <th scope="col">Data</th>
                 <th scope="col" aria-label="Row actions"></th>
@@ -950,7 +973,9 @@ function DecisionTable({
                         </span>
                       </td>
                       <td className={`delta ${row.forecast20d < 0 ? 'danger' : 'positive'}`}>
-                        {formatSignedPercent(row.forecast20d)}
+                        <span title={row.quantConfirmed ? 'Monte Carlo 20-day estimate' : 'Rule-derived factor proxy; not a calibrated return forecast'}>
+                          {formatSignedPercent(row.forecast20d)}
+                        </span>
                       </td>
                       <td className={(() => {
                         const prediction = mlPredictions.get(row.ticker)
@@ -1311,7 +1336,7 @@ function DetailPanel({
               : "Heuristic only: rule-derived from the composite factor score (normal-CDF of the alpha Z) — NOT a calibrated or simulated probability. Read it as a relative confidence cue, not a forecast."
           }
         >
-          Forecast {formatSignedPercent(signal.forecast20d)} 20d · {signal.probabilityOutperform}% outperform / {signal.probabilityDrawdown}% drawdown {signal.quantConfirmed ? '(simulated)' : '(heuristic)'}
+          {signal.quantConfirmed ? 'Monte Carlo estimate' : 'Factor proxy'} {formatSignedPercent(signal.forecast20d)} 20d · {signal.probabilityOutperform}% outperform / {signal.probabilityDrawdown}% drawdown {signal.quantConfirmed ? '(simulated)' : '(heuristic)'}
         </span>
       </section>
 
@@ -1559,7 +1584,10 @@ function App() {
     const fromUrl = migrateViewId(
       new URLSearchParams(window.location.search).get('view') ?? undefined,
     )
-    return fromUrl ?? persisted.activeView ?? 'brief'
+    // The decision brief is the canonical daily entry point. A deliberate
+    // deep link may open another surface, but stale local state must not hide
+    // today's actions on the next launch.
+    return fromUrl ?? 'brief'
   })
   const [deskMode, setDeskMode] = useState<DeskMode>(persisted.deskMode ?? 'table')
   const [query, setQuery] = useState('')
@@ -1573,7 +1601,9 @@ function App() {
   const [refreshCount, setRefreshCount] = useState(0)
   const [reviewedTickers, setReviewedTickers] = useState<Set<string>>(() => new Set())
   const [reviewedHydrated, setReviewedHydrated] = useState(false)
-  const [activeScenario, setActiveScenario] = useState<ScenarioId>(persisted.activeScenario ?? 'base')
+  // Never reopen into yesterday's hypothetical shock. Scenario state remains
+  // sticky within this session, but every fresh launch starts from live/base.
+  const [activeScenario, setActiveScenario] = useState<ScenarioId>('base')
   const [signalInputs, setSignalInputs] = useState<RawSignal[] | null>(null)
   const [decisionFeed, setDecisionFeed] = useState<DecisionUniverseResponse | null>(null)
   // Client-side history classified by the SAME JS engine the list uses — the
@@ -1622,7 +1652,14 @@ function App() {
   const [reconnectIn, setReconnectIn] = useState<number | null>(null)
   const reconnectAttemptsRef = useRef(0)
   const reconnectTimerRef = useRef<number | null>(null)
+  // Increments on EVERY failed feed load. The reconnect effect keys on this:
+  // keying on feedStatus alone died after one retry, because the second
+  // failure set feedStatus to 'fallback' when it already WAS 'fallback' — a
+  // no-op state change, so the effect never re-armed and a few seconds of
+  // backend startup lag became a permanent "not reachable" banner.
+  const [feedFailureCount, setFeedFailureCount] = useState(0)
   const { showToast } = useToast()
+  const modelAuthority = useMemo(() => modelDecisionAuthority(mlModel), [mlModel])
 
   const ownedKey = useMemo(() => Array.from(ownedTickers).sort().join(','), [ownedTickers])
   const watchKey = useMemo(() => Array.from(watchTickers).sort().join(','), [watchTickers])
@@ -1669,22 +1706,32 @@ function App() {
     // and a rules-green with no ML backing is demoted to Hold instead of
     // reaching the screen. Regime gating and evidence/risk gates live inside
     // applyMlLedVerdicts. 'rules' mode keeps the legacy labels for A/B.
-    if (decisionMode === 'ml' && mlModel) {
+    if (decisionMode === 'ml') {
       return applyMlLedVerdicts(
         withQuant,
         new Map(
           [...mlPredictions.entries()].map(([ticker, p]) => [ticker, p.predictedReturn20d]),
         ),
-        { regimeGated: regimeGate?.gated === true },
+        {
+          regimeGated: regimeGate?.gated === true,
+          evidenceGated: !modelAuthority.canLeadDecisions,
+          predictionEvidenceByTicker: mlPredictions,
+          scenario: activeScenario,
+        },
       )
     }
     return withQuant
-  }, [activeScenario, signalInputs, optionsSnapshots, revisionRanks, quantAnalyses, decisionMode, mlPredictions, regimeGate, mlModel])
+  }, [activeScenario, signalInputs, optionsSnapshots, revisionRanks, quantAnalyses, decisionMode, mlPredictions, regimeGate, modelAuthority])
   // Conviction stacks: six independent evidence layers per name (rules,
   // ML, Monte Carlo, options skew, regime, multi-horizon agreement).
   const convictionStacks = useMemo(
-    () => buildConvictionStacks(universe, mlPredictions, regimeGate),
-    [universe, mlPredictions, regimeGate],
+    () =>
+      buildConvictionStacks(
+        universe,
+        modelAuthority.canLeadDecisions ? mlPredictions : new Map(),
+        regimeGate,
+      ),
+    [universe, mlPredictions, regimeGate, modelAuthority.canLeadDecisions],
   )
   const sectors = useMemo(() => ['All', ...Array.from(new Set(universe.map((row) => row.sector))).sort()], [universe])
   const activeMarketContext = useMemo(
@@ -1841,11 +1888,19 @@ function App() {
         setDataError(payload.errorMessage ?? null)
         setLastRefresh(new Date(payload.asOf))
         setPriceSyncMode('off')
+        if (payload.dataMode === 'fallback') {
+          // loadDecisionUniverse RESOLVES with a fallback payload on
+          // connection failures (it never throws for those), so the retry
+          // counter must tick HERE — the catch below only sees bugs, not
+          // outages. This was the second half of the dead-retry-loop fix.
+          setFeedFailureCount((count) => count + 1)
+        }
       })
       .catch((error: unknown) => {
         if (cancelled) return
         setFeedStatus('fallback')
         setDataError(error instanceof Error ? error.message : 'Decision feed failed to load')
+        setFeedFailureCount((count) => count + 1) // re-arms the reconnect timer
       })
 
     return () => {
@@ -2047,7 +2102,10 @@ function App() {
         reconnectTimerRef.current = null
       }
     }
-  }, [feedStatus])
+    // feedFailureCount: every failure re-arms the next backoff attempt —
+    // without it the loop silently stopped after the first retry (see the
+    // state declaration note).
+  }, [feedStatus, feedFailureCount])
 
   // Record current action into the decision log for owned/watched tickers
   // so the per-ticker history timeline populates over time.
@@ -2133,7 +2191,11 @@ function App() {
       // Log the whole batch in ONE write so the scorecard has data later —
       // 30 concurrent single-entry writes raced each other and dropped ~29
       // of 30. The model stamp attributes samples across retrains.
-      void logLivePredictions([...predictions.values()], mlModel.trainedAt)
+      void logLivePredictions(
+        [...predictions.values()],
+        mlModel.trainedAt,
+        mlModel.servingEnsembleAudit?.executableStateFingerprint,
+      )
     })
     return () => {
       cancelled = true
@@ -2400,6 +2462,7 @@ function App() {
       opportunityScore: row.opportunityScore,
       riskScore: row.riskScore,
       forecast20d: row.forecast20d,
+      forecastBasis: row.quantConfirmed ? 'Monte Carlo' : 'Factor proxy',
       lastPrice: row.lastPrice,
     }))
     if (rows.length === 0) {
@@ -2630,26 +2693,33 @@ function App() {
             >
               {theme === 'dark' ? <Sun size={15} /> : <Moon size={15} />}
             </button>
-            {mlModel ? (
-              <label
-                className="select-control"
-                title="ML-led: only the validated model can mint a Buy; rules keep exits and vetoes. Rules: legacy hand-set labels (measured anti-predictive on buys)."
+            <label
+              className="select-control"
+              title={modelAuthority.canLeadDecisions
+                ? 'ML-led: the promoted model can mint a Buy; rules keep exits and vetoes.'
+                : `ML research-only: forecasts remain visible but cannot mint actions. ${modelAuthority.detail}`}
+            >
+              <span>Mode</span>
+              <select
+                onChange={(event) =>
+                  setDecisionMode(event.target.value as 'rules' | 'ml')
+                }
+                value={decisionMode}
               >
-                <span>Mode</span>
-                <select
-                  onChange={(event) =>
-                    setDecisionMode(event.target.value as 'rules' | 'ml')
-                  }
-                  value={decisionMode}
-                >
-                  <option value="ml">ML-led</option>
-                  <option value="rules">Rules (legacy)</option>
-                </select>
-              </label>
-            ) : null}
+                <option value="ml">
+                  {modelAuthority.canLeadDecisions ? 'ML-led' : 'ML research-only'}
+                </option>
+                <option value="rules">Rules (legacy)</option>
+              </select>
+            </label>
             {mlModel && regimeGate?.gated && decisionMode !== 'rules' ? (
               <span className="regime-gate-chip" title={regimeGate.detail}>
                 ML regime-gated
+              </span>
+            ) : null}
+            {!modelAuthority.canLeadDecisions && decisionMode !== 'rules' ? (
+              <span className="regime-gate-chip" title={modelAuthority.detail}>
+                ML evidence-gated
               </span>
             ) : null}
           </div>
@@ -2936,7 +3006,7 @@ function App() {
 
         {activeView === 'lab' ? (
           <section className="workflow-stack" data-testid="view-lab">
-            <ModelReadinessPanel feed={decisionFeed} universe={universe} />
+            <ModelReadinessPanel feed={decisionFeed} model={mlModel} universe={universe} />
             <ModelDecayMonitor />
             <BacktestPanel />
           </section>

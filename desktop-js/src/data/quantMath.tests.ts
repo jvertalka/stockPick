@@ -48,6 +48,16 @@ function approx(actual: number, expected: number, tolerance = 1e-3): boolean {
   return Math.abs(actual - expected) < tolerance
 }
 
+// Fixed xorshift32 stream: startup self-tests must produce the same result in
+// development, CI, and the packaged runtime.
+let testRandomState = 0x6f726163
+function testRandom(): number {
+  testRandomState ^= testRandomState << 13
+  testRandomState ^= testRandomState >>> 17
+  testRandomState ^= testRandomState << 5
+  return (testRandomState >>> 0) / 0x1_0000_0000
+}
+
 const tests: Array<() => TestResult> = [
   () => {
     // Hull's textbook example: S=42, K=40, r=0.10, q=0, T=0.5, v=0.2
@@ -221,7 +231,7 @@ const tests: Array<() => TestResult> = [
 
   () => {
     // GARCH(1,1) stationarity
-    const returns = Array.from({ length: 250 }, () => (Math.random() - 0.5) * 0.04)
+    const returns = Array.from({ length: 250 }, () => (testRandom() - 0.5) * 0.04)
     const params = fitGarch(returns)
     const ok = params.alpha > 0 && params.beta > 0 && params.alpha + params.beta < 1
     return {
@@ -233,7 +243,7 @@ const tests: Array<() => TestResult> = [
 
   () => {
     // GJR-GARCH stationarity: α + β + γ/2 < 1
-    const returns = Array.from({ length: 300 }, () => (Math.random() - 0.5) * 0.04)
+    const returns = Array.from({ length: 300 }, () => (testRandom() - 0.5) * 0.04)
     const params = fitGjrGarch(returns)
     const sum = params.alpha + params.beta + params.gamma / 2
     return {
@@ -245,7 +255,7 @@ const tests: Array<() => TestResult> = [
 
   () => {
     // GARCH vol forecast is positive
-    const returns = Array.from({ length: 200 }, () => (Math.random() - 0.5) * 0.03)
+    const returns = Array.from({ length: 200 }, () => (testRandom() - 0.5) * 0.03)
     const vol = garchVolatilityForecast(returns)
     return {
       name: 'GARCH vol forecast is positive',
@@ -256,7 +266,7 @@ const tests: Array<() => TestResult> = [
 
   () => {
     // GJR-GARCH vol forecast is positive
-    const returns = Array.from({ length: 200 }, () => (Math.random() - 0.5) * 0.03)
+    const returns = Array.from({ length: 200 }, () => (testRandom() - 0.5) * 0.03)
     const params = fitGjrGarch(returns)
     const vol = gjrGarchVolatilityForecast(returns, params)
     return {
@@ -279,7 +289,7 @@ const tests: Array<() => TestResult> = [
 
   () => {
     // Empirical jump stats: a series with no big jumps should detect ≈ 0
-    const calmReturns = Array.from({ length: 250 }, () => (Math.random() - 0.5) * 0.01)
+    const calmReturns = Array.from({ length: 250 }, () => (testRandom() - 0.5) * 0.01)
     const stats = empiricalJumpStats(calmReturns, 4)
     return {
       name: 'Empirical jump stats: calm series detects few jumps',
@@ -290,7 +300,7 @@ const tests: Array<() => TestResult> = [
 
   () => {
     // Empirical jump stats: a series WITH a big shock should detect it
-    const shockyReturns = Array.from({ length: 250 }, () => (Math.random() - 0.5) * 0.01)
+    const shockyReturns = Array.from({ length: 250 }, () => (testRandom() - 0.5) * 0.01)
     shockyReturns[100] = -0.10  // big drop
     shockyReturns[150] = 0.08   // big jump up
     const stats = empiricalJumpStats(shockyReturns, 3)
@@ -344,7 +354,7 @@ const tests: Array<() => TestResult> = [
   () => {
     // HAR-RV fit should produce coefficients summing close to historical
     // average autoregression coefficient (Corsi reports ~0.9 sum on equities)
-    const returns = Array.from({ length: 300 }, () => (Math.random() - 0.5) * 0.025)
+    const returns = Array.from({ length: 300 }, () => (testRandom() - 0.5) * 0.025)
     const params = fitHarRv(returns)
     const sum = params.betaDaily + params.betaWeekly + params.betaMonthly
     return {
@@ -356,7 +366,7 @@ const tests: Array<() => TestResult> = [
 
   () => {
     // HAR-RV one-step forecast should be positive and finite
-    const returns = Array.from({ length: 200 }, () => (Math.random() - 0.5) * 0.02)
+    const returns = Array.from({ length: 200 }, () => (testRandom() - 0.5) * 0.02)
     const params = fitHarRv(returns)
     const vol = harRvForecast(returns, params)
     return {
@@ -371,7 +381,7 @@ const tests: Array<() => TestResult> = [
     // (because skew=0, kurtosis=0 in expectation for normal)
     const returns = Array.from({ length: 500 }, () => {
       let value = 0
-      for (let i = 0; i < 12; i++) value += Math.random()
+      for (let i = 0; i < 12; i++) value += testRandom()
       return (value - 6) / 3 * 0.01  // approximately normal via central limit
     })
     const cf = cornishFisherVaR(returns, 0.95)
@@ -384,7 +394,7 @@ const tests: Array<() => TestResult> = [
 
   () => {
     // Skewness of an injected-skew series should be negative
-    const returns = Array.from({ length: 300 }, () => (Math.random() - 0.5) * 0.01)
+    const returns = Array.from({ length: 300 }, () => (testRandom() - 0.5) * 0.01)
     returns[50] = -0.08
     returns[100] = -0.07
     returns[150] = -0.06
@@ -398,7 +408,7 @@ const tests: Array<() => TestResult> = [
 
   () => {
     // Excess kurtosis of injected-tail series should be > 0
-    const returns = Array.from({ length: 300 }, () => (Math.random() - 0.5) * 0.005)
+    const returns = Array.from({ length: 300 }, () => (testRandom() - 0.5) * 0.005)
     returns[100] = 0.08
     returns[200] = -0.08
     const exKurt = sampleExcessKurtosis(returns)
@@ -412,8 +422,8 @@ const tests: Array<() => TestResult> = [
   () => {
     // Markov regime fitter should separate variances (high > low)
     const returns: number[] = []
-    for (let i = 0; i < 200; i++) returns.push((Math.random() - 0.5) * 0.005)
-    for (let i = 0; i < 50; i++) returns.push((Math.random() - 0.5) * 0.04)
+    for (let i = 0; i < 200; i++) returns.push((testRandom() - 0.5) * 0.005)
+    for (let i = 0; i < 50; i++) returns.push((testRandom() - 0.5) * 0.04)
     const state = fitMarkovRegime(returns)
     return {
       name: 'Markov regime fitter separates low/high vol states',
@@ -484,6 +494,7 @@ let alreadyRun = false
 export function runQuantSelfTests(): TestResult[] {
   if (alreadyRun) return []
   alreadyRun = true
+  testRandomState = 0x6f726163
   const results = tests.map((test) => {
     try {
       return test()

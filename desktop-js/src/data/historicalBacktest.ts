@@ -1,4 +1,9 @@
-import { cachedFetchDailyBars, type DailyBar } from './marketData'
+import {
+  cachedFetchDailyBars,
+  normalizeYahooSymbol,
+  type DailyBar,
+  type DailyBarAdjustmentSummary,
+} from './marketData'
 import {
   fitBaggedGradientBoosting,
   fitGradientBoosting,
@@ -10,7 +15,6 @@ import {
   type GradientBoostingModel,
 } from './quantMath'
 import {
-  MISSING_CAP_FALLBACK_USD,
   SIZE_TIERED_BORROW_FEE_ANNUAL,
   SIZE_TIERED_TRADING_COST,
   TRADING_DAYS_PER_YEAR,
@@ -20,11 +24,21 @@ import { isotonicRegression, applyIsotonic, brierScore } from './calibration'
 
 export type { DailyBar }
 
+/** Bump whenever feature formulas, price semantics, missing-data transforms,
+ * or label construction change. Same-named features from another version are
+ * not evidence-compatible with this serving pipeline. */
+export const HISTORICAL_FEATURE_PIPELINE_VERSION =
+  'finance-oracle-feature-pipeline-v3-adjusted-source-audit-2026-07-10' as const
+
 /** One-way effective trading cost (bps) for a name of the given market
  * cap, per the size-tiered table (Frazzini-Israel-Moskowitz 2018;
- * Novy-Marx-Velikov 2016). NaN/missing cap → liquid large-cap fallback. */
+ * Novy-Marx-Velikov 2016). Unknown cap uses the table's most conservative
+ * observed tier; an uncited synthetic cap must never make costs look cheaper. */
 function oneWayCostBps(marketCapUsd: number): number {
-  const cap = Number.isFinite(marketCapUsd) ? marketCapUsd : MISSING_CAP_FALLBACK_USD
+  if (!Number.isFinite(marketCapUsd)) {
+    return SIZE_TIERED_TRADING_COST[SIZE_TIERED_TRADING_COST.length - 1].oneWayBps
+  }
+  const cap = marketCapUsd
   for (const tier of SIZE_TIERED_TRADING_COST) {
     if (cap >= tier.minMarketCapUsd) return tier.oneWayBps
   }
@@ -34,7 +48,10 @@ function oneWayCostBps(marketCapUsd: number): number {
 /** Annualized stock-borrow fee (bps) for the SHORT leg by size tier
  * (D'Avolio 2002; Drechsler-Drechsler 2014). */
 function borrowFeeAnnualBps(marketCapUsd: number): number {
-  const cap = Number.isFinite(marketCapUsd) ? marketCapUsd : MISSING_CAP_FALLBACK_USD
+  if (!Number.isFinite(marketCapUsd)) {
+    return SIZE_TIERED_BORROW_FEE_ANNUAL[SIZE_TIERED_BORROW_FEE_ANNUAL.length - 1].annualBps
+  }
+  const cap = marketCapUsd
   for (const tier of SIZE_TIERED_BORROW_FEE_ANNUAL) {
     if (cap >= tier.minMarketCapUsd) return tier.annualBps
   }
@@ -316,6 +333,10 @@ export type HistoricalSample = {
    * pruning — it must not depend on fund_log_market_cap staying in the
    * model's column set. */
   logMarketCap: number
+  /** True when a real SEC snapshot was available at formation. Kept separate
+   * from capped filing age: a stale-but-real snapshot and the no-data sentinel
+   * can both equal FUNDAMENTAL_MISSING_AGE_DAYS. */
+  pitFundamentalsObserved?: boolean
   /** Survivorship cohort AT FORMATION (assigned per cross-section date):
    *  'survivorPrivileged' = listed < 3y (Fama-French 2004 new-list
    *  failure window) OR bottom size-quintile of that date's cross-section
@@ -444,11 +465,18 @@ export function computeFeaturesAtDate(
   if (dateIndex < 252) return null  // need 252 bars for the 1-year features
   const window = bars.slice(0, dateIndex)
   const closes = window.map((bar) => bar.close)
+  // Ratios/returns use total-return-adjusted close. Absolute price and dollar
+  // volume must use the contemporaneous raw exchange price: Yahoo adjclose is
+  // back-adjusted for later distributions, so multiplying it by historical
+  // shares would corrupt market cap and leak future distributions into level
+  // features even though return ratios themselves remain valid.
+  const rawCloses = window.map((bar) => bar.rawClose ?? bar.close)
   const highs = window.map((bar) => bar.high)
   const lows = window.map((bar) => bar.low)
   const volumes = window.map((bar) => bar.volume)
   if (closes.length < 252) return null
   const lastClose = closes[closes.length - 1]
+  const rawLastClose = rawCloses[rawCloses.length - 1]
   if (lastClose <= 0) return null
 
   const ret = (lookback: number): number => {
@@ -498,7 +526,9 @@ export function computeFeaturesAtDate(
   const volumeZScore = volume60Std > 0 ? (volumes[volumes.length - 1] - volume60Mean) / volume60Std : 0
 
   // Amihud (2002) illiquidity: |return| / dollar volume, averaged
-  const dollarVolumes = volumes.slice(-20).map((v, i) => v * closes[closes.length - 20 + i])
+  const dollarVolumes = volumes
+    .slice(-20)
+    .map((volume, index) => volume * rawCloses[rawCloses.length - 20 + index])
   const absReturns20 = log20.map(Math.abs)
   let amihud = 0
   if (dollarVolumes.length === absReturns20.length && dollarVolumes.length > 0) {
@@ -637,9 +667,9 @@ export function computeFeaturesAtDate(
       options?.firstBarDateMs ?? Date.parse(bars[0].date),
       bars[dateIndex].date,
     ),
-    Math.log(Math.max(0.01, lastClose)),
+    Math.log(Math.max(0.01, rawLastClose)),
     // Fundamentals (13) — point-in-time as of this bar's date
-    ...fundamentalFeaturesAt(fundamentals ?? null, bars[dateIndex].date, lastClose, {
+    ...fundamentalFeaturesAt(fundamentals ?? null, bars[dateIndex].date, rawLastClose, {
       vol252Annualized: vol252,
       return252Pct: ret(252),
     }),
@@ -1056,28 +1086,38 @@ function fundamentalFeaturesAt(
   ]
 }
 
-/** In-module cache: one history fetch per ticker per process. */
+/** In-module cache: successful timelines persist; transient failures are
+ * evicted so backend/SEC recovery heals the live feature path. */
 const fundamentalsCache = new Map<string, Promise<FundamentalsTimeline | null>>()
 
 export function fetchFundamentalsTimeline(ticker: string): Promise<FundamentalsTimeline | null> {
   const cached = fundamentalsCache.get(ticker)
   if (cached) return cached
   const promise = (async () => {
+    const controller = new AbortController()
+    const timer = window.setTimeout(() => controller.abort(), 8000)
     try {
       const base = import.meta.env.VITE_ORACLE_BACKEND_URL ?? 'http://127.0.0.1:8787'
       const response = await fetch(
         `${base}/fundamentals/history?symbol=${encodeURIComponent(ticker)}`,
-        { headers: { Accept: 'application/json' } },
+        { headers: { Accept: 'application/json' }, signal: controller.signal },
       )
-      if (!response.ok) return null  // 404 = ETF / non-filer — features stay neutral
+      if (!response.ok) return null
       const payload = (await response.json()) as Parameters<typeof FundamentalsTimeline.fromHistory>[0]
       const timeline = FundamentalsTimeline.fromHistory(payload)
       return timeline.size > 0 ? timeline : null
     } catch {
       return null
+    } finally {
+      window.clearTimeout(timer)
     }
   })()
   fundamentalsCache.set(ticker, promise)
+  void promise.then((timeline) => {
+    if (timeline == null && fundamentalsCache.get(ticker) === promise) {
+      fundamentalsCache.delete(ticker)
+    }
+  })
   return promise
 }
 
@@ -1094,8 +1134,125 @@ export function computeForwardReturn(
   return (end / start - 1) * 100
 }
 
+export type BacktestDatasetProvenance = {
+  schemaVersion: 2
+  builtAt: string
+  featurePipelineVersion: typeof HISTORICAL_FEATURE_PIPELINE_VERSION
+  priceSource: 'Yahoo Finance chart via local cache proxy'
+  fundamentalsSource: 'SEC EDGAR XBRL companyfacts via local backend'
+  /** Exact caller-supplied symbols. This is intentionally retained: a model
+   * artifact without its training universe cannot be reproduced or audited. */
+  universeTickers: string[]
+  universeConstruction:
+    | 'caller-supplied current-symbol list'
+    | 'point-in-time security master with delistings'
+  universeEvidence:
+    | {
+        kind: 'current-symbol-list'
+        membershipSource: string
+        constituentEffectiveDateField: null
+        delistedSecuritySource: null
+        delistingReturnSource: null
+      }
+    | {
+        kind: 'point-in-time-with-delistings'
+        membershipSource: string
+        constituentEffectiveDateField: string
+        delistedSecuritySource: string
+        delistingReturnSource: string
+      }
+  requestedRange: '1y' | '2y' | '5y' | '10y' | '15y' | 'max'
+  fetchedRange: 'max'
+  cadenceTradingDays: number
+  minimumBarsPerTicker: number
+  featureNames: string[]
+  labelHorizonsTradingDays: HorizonKey[]
+  sampleCount: number
+  sampleDateRange: { start: string | null; end: string | null }
+}
+
+/** Reproducible xorshift32 stream seeded from the measured series. Bootstrap
+ * CIs and permutation importance are evidence artifacts, so identical data
+ * must produce identical promotion decisions across runs. */
+function deterministicRandom(values: readonly number[], salt = 0): () => number {
+  let state = (0x811c9dc5 ^ salt) >>> 0
+  for (const value of values) {
+    const token = Number.isFinite(value) ? Math.round(value * 1_000_000) : 0x7fc00000
+    state = Math.imul(state ^ token, 0x01000193) >>> 0
+  }
+  if (state === 0) state = 0x6d2b79f5
+  return () => {
+    state ^= state << 13
+    state ^= state >>> 17
+    state ^= state << 5
+    return (state >>> 0) / 0x1_0000_0000
+  }
+}
+
+export type BacktestDatasetQuality = {
+  schemaVersion: 1
+  universe: {
+    pointInTimeMembership: boolean
+    includesDelistedSecurities: boolean
+    includesDelistingReturns: boolean
+    survivorshipBiasControlled: boolean
+    intendedMemberCount: number
+    membersWithUsablePriceHistory: number
+    membersWithExplicitNoHistoryOutcome: number
+    memberOutcomeCoverage: number
+    limitation: string
+  }
+  returns: {
+    /** computeFeaturesAtDate and every forward label currently read DailyBar.close. */
+    labelPriceField: string
+    labelAdjustment: 'unadjusted-close' | 'adjusted-close' | 'total-return' | 'mixed' | 'unknown'
+    barsObserved: number
+    /** Source completeness is tracked before local filtering so a missing
+     * OHLCV row cannot disappear and make analytical coverage look perfect. */
+    sourceRowsObserved: number
+    sourceInvalidRawBars: number
+    sourceRowAcceptanceCoverage: number
+    sourceEligibleRawBars: number
+    sourceMissingAdjustedBars: number
+    sourceAdjustmentCoverage: number
+    /** Coverage of accepted bars whose `close` is proven to be on the
+     * adjusted-total-return basis used by features and labels. */
+    barsWithAdjustedCloseAvailable: number
+    adjustedCloseAvailabilityCoverage: number
+    adjustedReturnLabelCoverage: number
+    totalReturnLabelCoverage: number
+    dividendsIncludedInLabels: boolean
+    limitation: string
+  }
+  fundamentals: {
+    source: 'SEC EDGAR XBRL companyfacts'
+    alignedByFiledDate: boolean
+    tickersWithTimeline: number
+    usableTickers: number
+    tickerTimelineCoverage: number
+    samplesWithPointInTimeSnapshot: number
+    totalSamples: number
+    sampleSnapshotCoverage: number
+    observedFeatureCells: number
+    totalFeatureCells: number
+    observedFeatureCellCoverage: number
+    limitation: string
+  }
+  evaluation: {
+    purgedWalkForwardSupported: boolean
+    embargoSupported: boolean
+    /** False until imputation/global fallback statistics are fit within each
+     * training fold rather than once across the complete dataset. */
+    foldLocalPreprocessing: boolean
+    lockedPostSelectionHoldout: boolean
+    limitation: string
+  }
+}
+
 export type DatasetBuildResult = {
   samples: HistoricalSample[]
+  provenance: BacktestDatasetProvenance
+  quality: BacktestDatasetQuality
   diagnostics: {
     tickersAttempted: number
     tickersWithUsableBars: number
@@ -1175,11 +1332,11 @@ const LOG_MKTCAP_FEATURE_INDEX = HISTORICAL_FEATURE_NAMES.indexOf('fund_log_mark
  * failure risk is front-loaded) OR in the bottom size quintile of that
  * date's cross-section (Hou-Xue-Zhang 2020: microcaps drive most anomaly
  * returns and are exactly what a survivors-only sample misrepresents).
- * Runs AFTER imputation (which never touches fund_filing_age), so
- * "no fundamentals at this date" is detected via the filing-age sentinel:
- * it equals FUNDAMENTAL_MISSING_AGE_DAYS exactly when no filing existed.
- * Those samples (ETFs/non-filers) are 'noFundamentals' and sit outside
- * the cohort diagnostics.
+ * Runs AFTER imputation. New datasets use the explicit
+ * pitFundamentalsObserved bit; the filing-age sentinel remains only as a
+ * backward-compatible fallback for older/synthetic samples. The explicit bit
+ * matters because a real but stale filing can reach the same capped age as the
+ * no-data sentinel. ETFs/non-filers sit outside the cohort diagnostics.
  */
 function assignSurvivorshipCohorts(samples: HistoricalSample[]): void {
   if (samples.length === 0) return
@@ -1197,7 +1354,9 @@ function assignSurvivorshipCohorts(samples: HistoricalSample[]): void {
     const caps: number[] = []
     for (const idx of indices) {
       const sample = samples[idx]
-      const hasFundamentals = sample.rawFeatures[ageIdx] < FUNDAMENTAL_MISSING_AGE_DAYS
+      const hasFundamentals =
+        sample.pitFundamentalsObserved ??
+        sample.rawFeatures[ageIdx] < FUNDAMENTAL_MISSING_AGE_DAYS
       const capImputed = sample.imputedMask?.[LOG_MKTCAP_FEATURE_INDEX] === true
       if (hasFundamentals && !capImputed) {
         caps.push(sample.rawFeatures[LOG_MKTCAP_FEATURE_INDEX])
@@ -1207,7 +1366,9 @@ function assignSurvivorshipCohorts(samples: HistoricalSample[]): void {
     const quintileCut = caps.length >= 10 ? caps[Math.floor(caps.length * 0.2)] : -Infinity
     for (const idx of indices) {
       const sample = samples[idx]
-      const hasFundamentals = sample.rawFeatures[ageIdx] < FUNDAMENTAL_MISSING_AGE_DAYS
+      const hasFundamentals =
+        sample.pitFundamentalsObserved ??
+        sample.rawFeatures[ageIdx] < FUNDAMENTAL_MISSING_AGE_DAYS
       if (!hasFundamentals) {
         sample.cohort = 'noFundamentals'
         continue
@@ -1314,6 +1475,26 @@ function applyCrossSectionalNormalization(samples: HistoricalSample[]): void {
   }
 }
 
+/** The canonical Yahoo adapter marks `close` as adjusted-total-return. Keep the
+ * conventional adjusted-close aliases as a compatibility inventory for custom
+ * importers, but only the canonical marker proves that `close` itself is on the
+ * adjusted basis consumed by features and labels. */
+function hasTotalReturnPriceBasis(bar: DailyBar): boolean {
+  if (bar.priceBasis === 'adjusted-total-return') return true
+  const candidate = bar as DailyBar & {
+    adjustedClose?: unknown
+    adjClose?: unknown
+    adjclose?: unknown
+  }
+  const value = candidate.adjustedClose ?? candidate.adjClose ?? candidate.adjclose
+  return (
+    typeof value === 'number' &&
+    Number.isFinite(value) &&
+    value > 0 &&
+    Math.abs(value - bar.close) <= Math.max(1e-8, Math.abs(value) * 1e-10)
+  )
+}
+
 export async function buildHistoricalDataset(
   tickers: string[],
   options: {
@@ -1323,6 +1504,17 @@ export async function buildHistoricalDataset(
     onProgress?: (current: number, total: number, ticker: string) => void
   } = {},
 ): Promise<DatasetBuildResult> {
+  const normalizedTickers = tickers.map((ticker) => ticker.trim().toUpperCase())
+  if (normalizedTickers.some((ticker) => ticker.length === 0)) {
+    throw new Error('Historical dataset universe contains an empty ticker.')
+  }
+  if (new Set(normalizedTickers).size !== normalizedTickers.length) {
+    throw new Error('Historical dataset universe contains duplicate tickers after normalization.')
+  }
+  if (new Set(normalizedTickers.map(normalizeYahooSymbol)).size !== normalizedTickers.length) {
+    throw new Error('Historical dataset universe contains duplicate Yahoo provider aliases.')
+  }
+  tickers = normalizedTickers
   const cadence = options.cadenceDays ?? 10
   const minBars = options.minBars ?? 400  // 252 history + 120 forward + buffer
   const range = options.range ?? '5y'
@@ -1341,16 +1533,34 @@ export async function buildHistoricalDataset(
   let tickersWithZeroBars = 0
   let tickersBelowMinBars = 0
   let tickersWithFundamentals = 0
+  let barsObserved = 0
+  let barsWithAdjustedCloseAvailable = 0
+  let sourceRowsObserved = 0
+  let sourceInvalidRawBars = 0
+  let sourceEligibleRawBars = 0
+  let sourceMissingAdjustedBars = 0
+  let samplesWithPointInTimeSnapshot = 0
+  let observedFundamentalFeatureCells = 0
+  const filingAgeIndex = HISTORICAL_FEATURE_NAMES.indexOf('fund_filing_age')
+  const fundamentalStartIndex = HISTORICAL_FEATURE_NAMES.length - FUNDAMENTAL_FEATURE_COUNT
 
   for (let t = 0; t < tickers.length; t++) {
     const ticker = tickers[t]
     options.onProgress?.(t, tickers.length, ticker)
     let bars: DailyBar[]
+    let adjustmentSummary: DailyBarAdjustmentSummary | undefined
     try {
-      bars = await cachedFetchDailyBars(ticker, fetchRange)
+      const fetched = await cachedFetchDailyBars(ticker, fetchRange)
+      bars = fetched
+      adjustmentSummary = fetched.adjustment
     } catch {
       bars = []
     }
+    sourceRowsObserved += adjustmentSummary?.sourceRows ?? bars.length
+    sourceInvalidRawBars += adjustmentSummary?.invalidRawBars ?? 0
+    sourceEligibleRawBars += adjustmentSummary?.eligibleRawBars ?? bars.length
+    sourceMissingAdjustedBars +=
+      adjustmentSummary?.missingAdjustedBars ?? bars.filter((bar) => !hasTotalReturnPriceBasis(bar)).length
     // Listing age must come from the FULL history even when the backtest
     // window is trimmed — a 1998 listing trimmed to 15y is still old.
     const firstBarDateMs = bars.length > 0 ? Date.parse(bars[0].date) : Number.NaN
@@ -1360,6 +1570,16 @@ export async function buildHistoricalDataset(
     if (bars.length === 0) {
       tickersWithZeroBars++
       perTickerSummary.push({ ticker, bars: 0, samplesGenerated: 0, reason: 'fetch failed or empty' })
+      continue
+    }
+    if ((adjustmentSummary?.rejectedBars ?? 0) > 0) {
+      tickersBelowMinBars++
+      perTickerSummary.push({
+        ticker,
+        bars: bars.length,
+        samplesGenerated: 0,
+        reason: `${adjustmentSummary!.rejectedBars} incomplete/unaligned provider rows; series rejected fail-closed`,
+      })
       continue
     }
     if (bars.length < minBars) {
@@ -1374,6 +1594,10 @@ export async function buildHistoricalDataset(
     }
     // Point-in-time fundamentals (null for ETFs/non-filers — the ten
     // fundamental features stay at their neutral encoding for them).
+    // Coverage describes bars eligible to enter model features/labels, not
+    // short/failed ticker histories excluded before sample creation.
+    barsObserved += bars.length
+    barsWithAdjustedCloseAvailable += bars.filter(hasTotalReturnPriceBasis).length
     const fundamentals = await fetchFundamentalsTimeline(ticker)
     if (fundamentals) tickersWithFundamentals++
     let generated = 0
@@ -1387,6 +1611,14 @@ export async function buildHistoricalDataset(
       const fwd60 = computeForwardReturn(bars, i, 60)
       const fwd120 = computeForwardReturn(bars, i, 120)
       if (fwd5 == null || fwd20 == null || fwd60 == null || fwd120 == null) continue
+      const hasPointInTimeSnapshot =
+        fundamentals?.at(Date.parse(bars[i].date)) != null && filingAgeIndex >= 0
+      if (hasPointInTimeSnapshot) {
+        samplesWithPointInTimeSnapshot++
+        for (let featureIndex = fundamentalStartIndex; featureIndex < features.length; featureIndex++) {
+          if (Number.isFinite(features[featureIndex])) observedFundamentalFeatureCells++
+        }
+      }
       samples.push({
         ticker,
         asOf: bars[i].date,
@@ -1409,6 +1641,7 @@ export async function buildHistoricalDataset(
         // Raw log market cap (NaN if no fundamentals) — full-feature index,
         // captured before pruning so the cost model always has it.
         logMarketCap: features[LOG_MKTCAP_FEATURE_INDEX],
+        pitFundamentalsObserved: hasPointInTimeSnapshot,
       })
       generated++
     }
@@ -1432,8 +1665,115 @@ export async function buildHistoricalDataset(
   // the pointwise squared loss on the raw demeaned target already ranks well.
   // Keep the raw target; do not winsorize or rank-transform it.
 
+  const sampleDates = samples.map((sample) => sample.asOf).sort()
+  const ratio = (numerator: number, denominator: number): number =>
+    denominator > 0 ? numerator / denominator : 0
+  const totalFundamentalFeatureCells = samples.length * FUNDAMENTAL_FEATURE_COUNT
+  const adjustedReturnLabelCoverage = ratio(barsWithAdjustedCloseAvailable, barsObserved)
+  const sourceAdjustmentCoverage = ratio(
+    sourceEligibleRawBars - sourceMissingAdjustedBars,
+    sourceEligibleRawBars,
+  )
+  const labelAdjustment: BacktestDatasetQuality['returns']['labelAdjustment'] =
+    adjustedReturnLabelCoverage === 1
+      ? 'total-return'
+      : adjustedReturnLabelCoverage === 0
+        ? 'unadjusted-close'
+        : 'mixed'
+
   return {
     samples,
+    provenance: {
+      schemaVersion: 2,
+      builtAt: new Date().toISOString(),
+      featurePipelineVersion: HISTORICAL_FEATURE_PIPELINE_VERSION,
+      priceSource: 'Yahoo Finance chart via local cache proxy',
+      fundamentalsSource: 'SEC EDGAR XBRL companyfacts via local backend',
+      universeTickers: [...tickers],
+      universeConstruction: 'caller-supplied current-symbol list',
+      universeEvidence: {
+        kind: 'current-symbol-list',
+        membershipSource: 'caller-supplied current symbols',
+        constituentEffectiveDateField: null,
+        delistedSecuritySource: null,
+        delistingReturnSource: null,
+      },
+      requestedRange: range,
+      fetchedRange: 'max',
+      cadenceTradingDays: cadence,
+      minimumBarsPerTicker: minBars,
+      featureNames: [...HISTORICAL_FEATURE_NAMES],
+      labelHorizonsTradingDays: [...ENSEMBLE_HORIZONS],
+      sampleCount: samples.length,
+      sampleDateRange: {
+        start: sampleDates[0] ?? null,
+        end: sampleDates[sampleDates.length - 1] ?? null,
+      },
+    },
+    quality: {
+      schemaVersion: 1,
+      universe: {
+        pointInTimeMembership: false,
+        includesDelistedSecurities: false,
+        includesDelistingReturns: false,
+        survivorshipBiasControlled: false,
+        intendedMemberCount: tickers.length,
+        membersWithUsablePriceHistory: tickersWithUsableBars,
+        membersWithExplicitNoHistoryOutcome: 0,
+        memberOutcomeCoverage: ratio(tickersWithUsableBars, tickers.length),
+        limitation:
+          'The caller supplies symbols that exist today; historical constituents, dead symbols, and delisting returns are absent, so absolute performance is survivorship-biased.',
+      },
+      returns: {
+        labelPriceField: 'close',
+        labelAdjustment,
+        barsObserved,
+        sourceRowsObserved,
+        sourceInvalidRawBars,
+        sourceRowAcceptanceCoverage: ratio(
+          sourceRowsObserved - sourceInvalidRawBars,
+          sourceRowsObserved,
+        ),
+        sourceEligibleRawBars,
+        sourceMissingAdjustedBars,
+        sourceAdjustmentCoverage,
+        barsWithAdjustedCloseAvailable,
+        adjustedCloseAvailabilityCoverage: ratio(barsWithAdjustedCloseAvailable, barsObserved),
+        adjustedReturnLabelCoverage,
+        totalReturnLabelCoverage: adjustedReturnLabelCoverage,
+        dividendsIncludedInLabels: adjustedReturnLabelCoverage === 1,
+        limitation:
+          adjustedReturnLabelCoverage === 1
+            ? `Every accepted bar uses Yahoo adjclose total-return prices; ${sourceMissingAdjustedBars} of ${sourceEligibleRawBars} otherwise-valid source rows without adjclose were excluded fail-closed.`
+            : 'One or more accepted bars lack a proven adjusted-total-return basis; do not promote until every feature and label bar is adjusted for splits and distributions.',
+      },
+      fundamentals: {
+        source: 'SEC EDGAR XBRL companyfacts',
+        alignedByFiledDate: true,
+        tickersWithTimeline: tickersWithFundamentals,
+        usableTickers: tickersWithUsableBars,
+        tickerTimelineCoverage: ratio(tickersWithFundamentals, tickersWithUsableBars),
+        samplesWithPointInTimeSnapshot,
+        totalSamples: samples.length,
+        sampleSnapshotCoverage: ratio(samplesWithPointInTimeSnapshot, samples.length),
+        observedFeatureCells: observedFundamentalFeatureCells,
+        totalFeatureCells: totalFundamentalFeatureCells,
+        observedFeatureCellCoverage: ratio(
+          observedFundamentalFeatureCells,
+          totalFundamentalFeatureCells,
+        ),
+        limitation:
+          'Coverage is measured before median imputation. ETFs, pre-EDGAR history, and missing XBRL concepts remain neutral/imputed rather than being mistaken for observed data.',
+      },
+      evaluation: {
+        purgedWalkForwardSupported: true,
+        embargoSupported: true,
+        foldLocalPreprocessing: false,
+        lockedPostSelectionHoldout: false,
+        limitation:
+          'Walk-forward folds purge labels and embargo dates, but sparse-date imputation/normalization fallback statistics are still derived before folding. There is no fold-local preprocessing or untouched final post-selection holdout.',
+      },
+    },
     diagnostics: {
       tickersAttempted: tickers.length,
       tickersWithUsableBars,
@@ -1517,6 +1857,9 @@ export type WalkForwardResult = {
   testSize: number
   testStartDate: string
   testEndDate: string
+  /** Exact end of the latest 20-trading-day forward label in this test
+   * window. Used to measure dependence between adjacent evaluation windows. */
+  testLabelEndDate: string
   informationCoefficient: number
   spearmanIc: number
   hitRate: number
@@ -1763,9 +2106,10 @@ export function walkForwardStep(
     )
   }
 
-  // BASELINE: random predictions
-  const randomPredictions = predictions.map(() => Math.random())
-  const baselineRandomIc = pearsonCorrelation(randomPredictions, actuals)
+  // BASELINE: the expected information coefficient of an independent random
+  // ranking is exactly zero. Using the analytical expectation avoids letting
+  // one lucky random draw change a model's promotion result.
+  const baselineRandomIc = 0
 
   // BASELINE: long-horizon momentum ranking (Jegadeesh-Titman). NaN when
   // the momentum feature isn't in the (possibly pruned) set — better an
@@ -1807,8 +2151,12 @@ export function walkForwardStep(
     void shuffled
     const permutedFeatures = testSamples.map((sample) => [...sample.features])
     const indicesShuf = Array.from({ length: testSamples.length }, (_, i) => i)
+    const permutationRandom = deterministicRandom(
+      actuals,
+      (Date.parse(testStartDate) ^ f) >>> 0,
+    )
     for (let i = indicesShuf.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1))
+      const j = Math.floor(permutationRandom() * (i + 1))
       ;[indicesShuf[i], indicesShuf[j]] = [indicesShuf[j], indicesShuf[i]]
     }
     permutedFeatures.forEach((features, i) => {
@@ -1826,6 +2174,10 @@ export function walkForwardStep(
     testSize: testSamples.length,
     testStartDate,
     testEndDate: testSamples[testSamples.length - 1].asOf,
+    testLabelEndDate: testSamples.reduce(
+      (latest, sample) => sample.labelEnd20d > latest ? sample.labelEnd20d : latest,
+      testSamples[0].labelEnd20d,
+    ),
     informationCoefficient: ic,
     spearmanIc,
     hitRate,
@@ -1875,6 +2227,52 @@ function ranks(values: number[]): number[] {
 
 export type ConfidenceInterval = { lower: number; mean: number; upper: number }
 
+export type BaselineComparisonEvidence = {
+  baseline: 'random' | 'momentum_252d'
+  metric: 'information-coefficient'
+  /** Differences are paired by the same out-of-sample walk-forward window:
+   * model IC minus baseline IC. */
+  pairedStepCount: number
+  meanDifference: number | null
+  bootstrapIterations: number
+  blockLength: number | null
+  ci95: ConfidenceInterval | null
+  ciClearOfZero: boolean
+}
+
+export type BaselineEvidence = {
+  method: 'paired moving-block bootstrap (Kunsch 1989; Politis-Romano 1994)'
+  confidenceLevel: 0.95
+  random: BaselineComparisonEvidence
+  momentum: BaselineComparisonEvidence
+}
+
+export type ModelPromotionReason = {
+  code:
+    | 'POINT_IN_TIME_UNIVERSE_AND_DELISTINGS'
+    | 'TOTAL_RETURN_LABELS'
+    | 'POINT_IN_TIME_FUNDAMENTALS'
+    | 'FUNDAMENTALS_COVERAGE'
+    | 'FOLD_LOCAL_PREPROCESSING'
+    | 'LOCKED_POST_SELECTION_HOLDOUT'
+    | 'EDGE_OVER_RANDOM'
+    | 'EDGE_OVER_MOMENTUM'
+  status: 'pass' | 'block' | 'warning'
+  title: string
+  detail: string
+}
+
+export type ModelPromotionAssessment = {
+  schemaVersion: 1
+  policy: 'research-evidence-promotion-v1'
+  status: 'promotable' | 'advisory-only'
+  promotable: boolean
+  /** Complete, UI-ready audit trail. A criterion is never silently omitted. */
+  reasons: ModelPromotionReason[]
+  blockerCodes: ModelPromotionReason['code'][]
+  baselineEvidence: BaselineEvidence
+}
+
 export type HorizonModelBundle = {
   horizon: HorizonKey
   /** Median (q=0.5) GBT — the point-estimate model */
@@ -1904,6 +2302,9 @@ export type FullBacktestResult = {
   meanLongShortSharpe: number
   meanBaselineRandomIc: number
   meanBaselineMomentumIc: number
+  /** Paired model-minus-baseline IC differences with moving-block bootstrap
+   * CIs. Promotion requires both lower bounds to clear zero. */
+  baselineEvidence: BaselineEvidence
   cumulativeReturn: number
   maxDrawdown: number
   meanFeatureImportance: number[]
@@ -2051,7 +2452,7 @@ function servingConsistentIC(
 function blockBootstrapStat(
   values: number[],
   statistic: (sample: number[]) => number,
-  blockLen = 3,
+  blockLen: number,
   iterations = 1000,
 ): ConfidenceInterval {
   const n = values.length
@@ -2059,10 +2460,11 @@ function blockBootstrapStat(
   const point = statistic(values)
   if (n <= blockLen) return { lower: point, mean: point, upper: point }
   const stats: number[] = []
+  const random = deterministicRandom(values, iterations ^ blockLen)
   for (let it = 0; it < iterations; it++) {
     const resample: number[] = []
     while (resample.length < n) {
-      const start = Math.floor(Math.random() * (n - blockLen + 1))
+      const start = Math.floor(random() * (n - blockLen + 1))
       for (let k = 0; k < blockLen && resample.length < n; k++) {
         resample.push(values[start + k])
       }
@@ -2077,6 +2479,228 @@ function blockBootstrapStat(
   }
 }
 
+/** Measure how many consecutive evaluation windows share 20-day label
+ * information using the artifact's exact dates. This replaces the former
+ * hand-set block length of three with a reproducible property of the split. */
+export function measuredOverlapBlockLength(
+  steps: ReadonlyArray<Pick<WalkForwardResult, 'testStartDate' | 'testLabelEndDate'>>,
+): number {
+  if (steps.length <= 1) return 1
+  const ordered = [...steps].sort((left, right) => left.testStartDate.localeCompare(right.testStartDate))
+  let maximum = 1
+  for (let i = 0; i < ordered.length; i++) {
+    let span = 1
+    for (let j = i + 1; j < ordered.length; j++) {
+      if (ordered[j].testStartDate > ordered[i].testLabelEndDate) break
+      span++
+    }
+    maximum = Math.max(maximum, span)
+  }
+  return maximum
+}
+
+/**
+ * Pair each model IC with the baseline IC from the exact same test window,
+ * then bootstrap the DIFFERENCE in contiguous blocks. Pairing removes common
+ * regime/window noise; blocks retain the serial dependence caused by
+ * overlapping forward labels. A single window cannot estimate uncertainty,
+ * so its CI is deliberately unavailable rather than reported as degenerate.
+ */
+export function computeBaselineEvidence(
+  steps: Array<
+    Pick<
+      WalkForwardResult,
+      | 'informationCoefficient'
+      | 'baselineRandomIc'
+      | 'baselineMomentumIc'
+      | 'testStartDate'
+      | 'testLabelEndDate'
+    >
+  >,
+  bootstrapIterations = 1000,
+): BaselineEvidence {
+  const iterations = Math.max(1, Math.floor(bootstrapIterations))
+  const comparison = (
+    baseline: BaselineComparisonEvidence['baseline'],
+    key: 'baselineRandomIc' | 'baselineMomentumIc',
+  ): BaselineComparisonEvidence => {
+    const paired = steps
+      .map((step) => ({ model: step.informationCoefficient, baseline: step[key] }))
+      .map((pair, index) => ({ ...pair, step: steps[index] }))
+      .filter((pair) => Number.isFinite(pair.model) && Number.isFinite(pair.baseline))
+    const differences = paired.map((pair) => pair.model - pair.baseline)
+    const meanDifference =
+      differences.length > 0
+        ? differences.reduce((sum, value) => sum + value, 0) / differences.length
+        : null
+    const blockLength = measuredOverlapBlockLength(paired.map((pair) => pair.step))
+    const ci95 =
+      differences.length >= 2 && blockLength < differences.length
+        ? blockBootstrapStat(
+            differences,
+            (values) => values.reduce((sum, value) => sum + value, 0) / values.length,
+            blockLength,
+            iterations,
+          )
+        : null
+    return {
+      baseline,
+      metric: 'information-coefficient',
+      pairedStepCount: differences.length,
+      meanDifference,
+      bootstrapIterations: iterations,
+      blockLength: differences.length >= 2 ? blockLength : null,
+      ci95,
+      ciClearOfZero: ci95 != null && ci95.lower > 0,
+    }
+  }
+
+  return {
+    method: 'paired moving-block bootstrap (Kunsch 1989; Politis-Romano 1994)',
+    confidenceLevel: 0.95,
+    random: comparison('random', 'baselineRandomIc'),
+    momentum: comparison('momentum_252d', 'baselineMomentumIc'),
+  }
+}
+
+/** Promotion policy encoded as auditable statistical/provenance predicates.
+ * There are no hand-tuned score cutoffs: data gates are booleans/full
+ * coverage, and skill gates require the paired 95% CI lower bound > 0, exactly
+ * matching the product doctrine's "CI clear of zero" rule. */
+export function assessModelPromotion(
+  quality: BacktestDatasetQuality,
+  baselineEvidence: BaselineEvidence,
+): ModelPromotionAssessment {
+  const reasons: ModelPromotionReason[] = []
+  const add = (
+    code: ModelPromotionReason['code'],
+    passed: boolean,
+    title: string,
+    passDetail: string,
+    blockDetail: string,
+  ): void => {
+    reasons.push({
+      code,
+      status: passed ? 'pass' : 'block',
+      title,
+      detail: passed ? passDetail : blockDetail,
+    })
+  }
+
+  const universeReady =
+    quality.universe.pointInTimeMembership &&
+    quality.universe.includesDelistedSecurities &&
+    quality.universe.includesDelistingReturns &&
+    quality.universe.survivorshipBiasControlled &&
+    quality.universe.memberOutcomeCoverage === 1
+  add(
+    'POINT_IN_TIME_UNIVERSE_AND_DELISTINGS',
+    universeReady,
+    'Point-in-time universe and delistings',
+    'Universe membership is point-in-time and includes dead securities plus delisting returns.',
+    quality.universe.limitation,
+  )
+
+  const totalReturnReady =
+    quality.returns.labelAdjustment === 'total-return' &&
+    quality.returns.sourceRowAcceptanceCoverage === 1 &&
+    quality.returns.sourceAdjustmentCoverage === 1 &&
+    quality.returns.adjustedReturnLabelCoverage === 1 &&
+    quality.returns.totalReturnLabelCoverage === 1 &&
+    quality.returns.dividendsIncludedInLabels
+  add(
+    'TOTAL_RETURN_LABELS',
+    totalReturnReady,
+    'Corporate-action-adjusted total-return labels',
+    'Every return label includes split and dividend adjustments.',
+    quality.returns.limitation,
+  )
+
+  add(
+    'POINT_IN_TIME_FUNDAMENTALS',
+    quality.fundamentals.alignedByFiledDate,
+    'Point-in-time fundamentals alignment',
+    'Fundamental snapshots are keyed by their public filed date.',
+    'Fundamental inputs are not proven to be aligned by public filed date.',
+  )
+  const snapshotCoveragePct = (quality.fundamentals.sampleSnapshotCoverage * 100).toFixed(1)
+  reasons.push({
+    code: 'FUNDAMENTALS_COVERAGE',
+    status: quality.fundamentals.sampleSnapshotCoverage === 1 ? 'pass' : 'warning',
+    title: 'Point-in-time fundamentals coverage',
+    detail:
+      `${snapshotCoveragePct}% of samples have a filed snapshot; ` +
+      `${(quality.fundamentals.observedFeatureCellCoverage * 100).toFixed(1)}% of fundamental cells were observed before imputation. ` +
+      quality.fundamentals.limitation,
+  })
+
+  add(
+    'FOLD_LOCAL_PREPROCESSING',
+    quality.evaluation.foldLocalPreprocessing,
+    'Fold-local preprocessing',
+    'Imputation and fallback normalization statistics are fit within each training fold.',
+    'Global fallback preprocessing statistics are derived before walk-forward folds and can see future/test-period features.',
+  )
+
+  const lockedEvaluationReady =
+    quality.evaluation.purgedWalkForwardSupported &&
+    quality.evaluation.embargoSupported &&
+    quality.evaluation.lockedPostSelectionHoldout
+  add(
+    'LOCKED_POST_SELECTION_HOLDOUT',
+    lockedEvaluationReady,
+    'Purged evaluation with locked post-selection holdout',
+    'Evaluation is purged and embargoed, with a final period locked before feature/model selection.',
+    quality.evaluation.limitation,
+  )
+
+  const evidenceDetail = (comparison: BaselineComparisonEvidence): string =>
+    comparison.ci95
+      ? `Paired model-minus-${comparison.baseline} IC is ${comparison.ci95.mean.toFixed(4)} ` +
+        `(95% moving-block bootstrap CI ${comparison.ci95.lower.toFixed(4)} to ${comparison.ci95.upper.toFixed(4)}, ` +
+        `n=${comparison.pairedStepCount} windows, block=${comparison.blockLength ?? 'unavailable'}, ` +
+        `${comparison.bootstrapIterations} resamples).`
+      : `A paired bootstrap CI versus ${comparison.baseline} is unavailable ` +
+        `(n=${comparison.pairedStepCount} usable windows).`
+  // Efron & Tibshirani (1993), An Introduction to the Bootstrap, recommend
+  // at least 1,000 resamples for interval estimation. Requiring block<n is a
+  // structural identifiability check: one all-covering block has no resampling
+  // variation and therefore cannot estimate uncertainty.
+  const baselineReady = (comparison: BaselineComparisonEvidence): boolean =>
+    comparison.ci95 != null &&
+    comparison.ci95.lower > 0 &&
+    comparison.bootstrapIterations >= 1000 &&
+    comparison.blockLength != null &&
+    comparison.blockLength < comparison.pairedStepCount
+  add(
+    'EDGE_OVER_RANDOM',
+    baselineReady(baselineEvidence.random),
+    'Out-of-sample edge over random',
+    evidenceDetail(baselineEvidence.random),
+    evidenceDetail(baselineEvidence.random),
+  )
+  add(
+    'EDGE_OVER_MOMENTUM',
+    baselineReady(baselineEvidence.momentum),
+    'Out-of-sample edge over momentum',
+    evidenceDetail(baselineEvidence.momentum),
+    evidenceDetail(baselineEvidence.momentum),
+  )
+
+  const blockerCodes = reasons
+    .filter((reason) => reason.status === 'block')
+    .map((reason) => reason.code)
+  return {
+    schemaVersion: 1,
+    policy: 'research-evidence-promotion-v1',
+    status: blockerCodes.length === 0 ? 'promotable' : 'advisory-only',
+    promotable: blockerCodes.length === 0,
+    reasons,
+    blockerCodes,
+    baselineEvidence,
+  }
+}
+
 /* =========================================================================
    Selection-inflation analysis (offline honesty layer)
    -------------------------------------------------------------------------
@@ -2088,18 +2712,19 @@ function blockBootstrapStat(
  * preserve the serial dependence created by overlapping 20d-forward label
  * windows (the same reason blockBootstrapStat exists), so the null variance is
  * not understated the way an i.i.d. shuffle would. Add-one smoothed. */
-function blockBootstrapPValueMeanZero(values: number[], blockLen = 3, iterations = 1000): number {
+function blockBootstrapPValueMeanZero(values: number[], blockLen: number, iterations = 1000): number {
   const n = values.length
   if (n < 3) return 1
   const obsMean = values.reduce((s, v) => s + v, 0) / n
   const centered = values.map((v) => v - obsMean) // impose the null
   const eff = Math.min(blockLen, n)
   let extreme = 0
+  const random = deterministicRandom(centered, iterations ^ eff ^ 0x42535450)
   for (let it = 0; it < iterations; it++) {
     let sum = 0
     let count = 0
     while (count < n) {
-      const start = Math.floor(Math.random() * (n - eff + 1))
+      const start = Math.floor(random() * (n - eff + 1))
       for (let k = 0; k < eff && count < n; k++) {
         sum += centered[start + k]
         count++
@@ -2126,16 +2751,29 @@ export type FeatureFDRResult = {
 export function featureSelectionFDR(
   samples: HistoricalSample[],
   featureNames: string[],
-  q = 0.1,
+  q: number,
   iterations = 2000,
 ): FeatureFDRResult {
+  if (!Number.isFinite(q) || q <= 0 || q >= 1) {
+    throw new Error('FDR q must be explicitly pre-registered between 0 and 1.')
+  }
   const byDate = new Map<string, number[]>()
   samples.forEach((s, i) => {
     const a = byDate.get(s.asOf) ?? []
     a.push(i)
     byDate.set(s.asOf, a)
   })
-  const dateGroups = [...byDate.values()].filter((g) => g.length >= 5)
+  const datedGroups = [...byDate.entries()].filter(([, group]) => group.length >= 5)
+  const dateGroups = datedGroups.map(([, group]) => group)
+  const blockLength = measuredOverlapBlockLength(
+    datedGroups.map(([date, group]) => ({
+      testStartDate: date,
+      testLabelEndDate: group.reduce(
+        (latest, index) => samples[index].labelEnd20d > latest ? samples[index].labelEnd20d : latest,
+        samples[group[0]].labelEnd20d,
+      ),
+    })),
+  )
   const perFeature: FeatureFDRResult['perFeature'] = []
   const pValues: number[] = []
   for (let f = 0; f < featureNames.length; f++) {
@@ -2148,7 +2786,7 @@ export function featureSelectionFDR(
       if (Number.isFinite(ic)) icSeries.push(ic)
     }
     const meanIC = icSeries.length ? icSeries.reduce((s, v) => s + v, 0) / icSeries.length : 0
-    const pValue = blockBootstrapPValueMeanZero(icSeries, 3, iterations)
+    const pValue = blockBootstrapPValueMeanZero(icSeries, blockLength, iterations)
     perFeature.push({ name: featureNames[f], meanIC, pValue, significant: false })
     pValues.push(pValue)
   }
@@ -2572,21 +3210,28 @@ export function runWalkForwardBacktest(
 
   // 95% CIs via MOVING-BLOCK bootstrap (steps are serially dependent —
   // overlapping label windows). i.i.d. bootstrap here would report a
-  // spuriously tight interval.
-  const icCI = blockBootstrapStat(steps.map((step) => step.informationCoefficient), meanOfArr)
-  const hitRateCI = blockBootstrapStat(steps.map((step) => step.hitRate), meanOfArr)
-  const longShortReturnNetCI = blockBootstrapStat(stepNetReturns, meanOfArr)
-  const longShortSharpeCI = blockBootstrapStat(stepNetReturns, sharpeOf)
+  // spuriously tight interval. The block length is measured from the exact
+  // test/label dates rather than selected by a hand-tuned constant.
+  const evidenceBlockLength = measuredOverlapBlockLength(steps)
+  const icCI = blockBootstrapStat(steps.map((step) => step.informationCoefficient), meanOfArr, evidenceBlockLength)
+  const hitRateCI = blockBootstrapStat(steps.map((step) => step.hitRate), meanOfArr, evidenceBlockLength)
+  const longShortReturnNetCI = blockBootstrapStat(stepNetReturns, meanOfArr, evidenceBlockLength)
+  const longShortSharpeCI = blockBootstrapStat(stepNetReturns, sharpeOf, evidenceBlockLength)
   const coverageSteps = steps.filter((step) => step.intervalCoverage80 != null)
   const intervalCoverage80CI =
     coverageSteps.length > 0
-      ? blockBootstrapStat(coverageSteps.map((step) => step.intervalCoverage80!), meanOfArr)
+      ? blockBootstrapStat(
+          coverageSteps.map((step) => step.intervalCoverage80!),
+          meanOfArr,
+          measuredOverlapBlockLength(coverageSteps),
+        )
       : undefined
   const intervalMeanWidthPct =
     coverageSteps.length > 0
       ? coverageSteps.reduce((sum, step) => sum + (step.intervalMeanWidthPct ?? 0), 0) /
         coverageSteps.length
       : undefined
+  const baselineEvidence = computeBaselineEvidence(steps)
 
   return {
     steps,
@@ -2598,6 +3243,7 @@ export function runWalkForwardBacktest(
     meanLongShortSharpe: portfolioSharpe,
     meanBaselineRandomIc: mean('baselineRandomIc'),
     meanBaselineMomentumIc: mean('baselineMomentumIc'),
+    baselineEvidence,
     cumulativeReturn: runningCumReturn,
     maxDrawdown: maxDD,
     meanFeatureImportance,
@@ -2925,12 +3571,10 @@ export function analyzeSurvivorship(
   const firstTestDate = steps[0]?.testStartDate ?? ''
   const ddIdx = HISTORICAL_FEATURE_NAMES.indexOf('fund_naive_dd')
   const zIdx = HISTORICAL_FEATURE_NAMES.indexOf('fund_altman_z')
-  const ageIdx = HISTORICAL_FEATURE_NAMES.indexOf('fund_filing_age')
   const oos = samples.filter(
     (sample) =>
       sample.asOf >= firstTestDate &&
       sample.cohort !== 'noFundamentals' &&
-      sample.rawFeatures[ageIdx] < FUNDAMENTAL_MISSING_AGE_DAYS &&
       // Financials excluded per BS/CHS practice — see set above.
       !CANARY_EXCLUDED_FINANCIALS.has(sample.ticker),
   )

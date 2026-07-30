@@ -29,7 +29,12 @@ export function ModelDecayMonitor() {
     await reconcilePredictions()
     const [m, log] = await Promise.all([loadModel(), loadPredictionLog()])
     setModel(m)
-    setCard(computeLiveScorecard(log))
+    setCard(
+      computeLiveScorecard(log, {
+        modelFingerprint: m?.servingEnsembleAudit?.executableStateFingerprint,
+        modelTrainedAt: m?.trainedAt,
+      }),
+    )
     setLoading(false)
   }
 
@@ -58,14 +63,6 @@ export function ModelDecayMonitor() {
 
   const scored = card != null && card.datesUsed > 0
   const drift = scored && card.meanIc != null ? card.meanIc - model.meanIC : null
-  const driftTone =
-    drift == null
-      ? 'neutral'
-      : drift > -0.01
-        ? 'positive'
-        : drift > -0.03
-          ? 'caution'
-          : 'danger'
 
   return (
     <section className="panel decay-monitor" data-testid="decay-monitor">
@@ -87,8 +84,9 @@ export function ModelDecayMonitor() {
         Each prediction day is scored as its own cross-section — did the names
         the model ranked higher actually do better than the names it ranked
         lower that day? Market-wide moves cancel out, so this live IC is
-        directly comparable to the backtest IC. Drift below −0.01 is mild;
-        below −0.03 the model has materially decayed and a retrain is overdue.
+        directly comparable to the backtest IC. Drift is descriptive until a
+        model-specific confidence interval versus baseline is implemented; no
+        hand-set color threshold grants or removes decision authority.
       </p>
 
       <div className="backtest-summary">
@@ -98,13 +96,13 @@ export function ModelDecayMonitor() {
         </div>
         <div>
           <span>Live IC ({card?.datesUsed ?? 0} days)</span>
-          <strong className={driftTone === 'positive' ? 'positive' : driftTone === 'danger' ? 'danger' : ''}>
+          <strong>
             {scored && card.meanIc != null ? card.meanIc.toFixed(3) : '–'}
           </strong>
         </div>
         <div>
           <span>Drift</span>
-          <strong className={driftTone === 'positive' ? 'positive' : driftTone === 'danger' ? 'danger' : ''}>
+          <strong>
             {drift == null ? '–' : `${drift >= 0 ? '+' : ''}${drift.toFixed(3)}`}
           </strong>
         </div>
@@ -153,7 +151,7 @@ export function ModelDecayMonitor() {
             <div className="scorecard-dates">
               {card.recentDates.map((d) => (
                 <span
-                  className={`pill ${d.ic > 0.02 ? 'positive' : d.ic < -0.02 ? 'danger' : 'neutral'}`}
+                  className="pill neutral"
                   key={d.date}
                   title={`${d.n} names scored on ${d.date}`}
                 >
