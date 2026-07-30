@@ -1982,28 +1982,83 @@ class DecisionPriceHistoryStore {
 
   final Directory cacheDirectory;
 
+  /// All store file access is serialized process-wide. During the
+  /// 2026-07-29 catch-up sync, one request READ this file while another
+  /// was mid-WRITE: the torn read failed to parse, load() silently fell
+  /// back to an empty store, that build synced 96 names onto the
+  /// emptiness, and its save PERSISTED the wipe — 1,460 freshly synced
+  /// names gone in one write. Three defenses below: the lock (no torn
+  /// reads), tmp+rotate saves with a .bak (no half-written live file,
+  /// recovery if a write dies), and a shrink guard (a suspiciously small
+  /// state is refused rather than allowed to clobber the store).
+  static Future<void> _fileLock = Future<void>.value();
+
+  Future<T> _withFileLock<T>(Future<T> Function() action) {
+    final previous = _fileLock;
+    final gate = Completer<void>();
+    _fileLock = gate.future;
+    return previous.then((_) => action()).whenComplete(gate.complete);
+  }
+
   File get _file => File(
     '${cacheDirectory.path}${Platform.pathSeparator}decision_price_history.json',
   );
+  File get _backupFile => File('${_file.path}.bak');
+  File get _tmpFile => File('${_file.path}.tmp');
 
-  Future<DecisionPriceHistoryState> load() async {
-    if (!await _file.exists()) {
-      return DecisionPriceHistoryState.empty();
-    }
-    try {
-      final decoded = jsonDecode(await _file.readAsString());
-      if (decoded is Map<String, dynamic>) {
-        return DecisionPriceHistoryState.fromJson(decoded);
+  Future<DecisionPriceHistoryState> load() => _withFileLock(_loadLocked);
+
+  Future<DecisionPriceHistoryState> _loadLocked() async {
+    for (final candidate in [_file, _backupFile]) {
+      if (!await candidate.exists()) {
+        continue;
       }
-    } catch (_) {
-      return DecisionPriceHistoryState.empty();
+      try {
+        final decoded = jsonDecode(await candidate.readAsString());
+        if (decoded is Map<String, dynamic>) {
+          if (identical(candidate, _backupFile)) {
+            stdout.writeln(
+              'price store: primary unreadable — recovered from backup',
+            );
+          }
+          return DecisionPriceHistoryState.fromJson(decoded);
+        }
+      } catch (error) {
+        stdout.writeln('price store: could not read ${candidate.path}: $error');
+      }
     }
     return DecisionPriceHistoryState.empty();
   }
 
-  Future<void> save(DecisionPriceHistoryState state) async {
+  Future<void> save(DecisionPriceHistoryState state) =>
+      _withFileLock(() => _saveLocked(state));
+
+  Future<void> _saveLocked(DecisionPriceHistoryState state) async {
     await cacheDirectory.create(recursive: true);
-    await _file.writeAsString(jsonEncode(state.toJson()), flush: true);
+    // Wipe guard: a state carrying under half the symbols currently on
+    // disk almost certainly began from a failed (empty) load rather than
+    // a genuine universe change. Refuse it loudly; the next honest build
+    // reloads the intact store and re-syncs whatever this one fetched.
+    final current = await _loadLocked();
+    if (current.seriesBySymbol.length >= 50 &&
+        state.seriesBySymbol.length < current.seriesBySymbol.length ~/ 2) {
+      stdout.writeln(
+        'price store: REFUSED save of ${state.seriesBySymbol.length} symbols '
+        'over ${current.seriesBySymbol.length} on disk (wipe guard)',
+      );
+      return;
+    }
+    await _tmpFile.writeAsString(jsonEncode(state.toJson()), flush: true);
+    // Rotate live -> .bak, tmp -> live. Windows rename cannot overwrite,
+    // so targets are cleared first; the whole sequence runs under the
+    // file lock, so no reader can observe the intermediate states.
+    if (await _backupFile.exists()) {
+      await _backupFile.delete();
+    }
+    if (await _file.exists()) {
+      await _file.rename(_backupFile.path);
+    }
+    await _tmpFile.rename(_file.path);
   }
 }
 
