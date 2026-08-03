@@ -191,7 +191,6 @@ class BackendCacheServer {
   /// continue until coverage stops improving.
   Future<void> _warmUpUniverse() async {
     try {
-      var previousReturned = -1;
       var noProgressPasses = 0;
       // The pass ceiling is a runaway backstop, NOT the expected exit — the
       // three-strike no-progress break below is what actually ends warmup.
@@ -212,24 +211,40 @@ class BackendCacheServer {
         if (_stopping) return;
         final returned = (result['returned'] as num?)?.toInt() ?? 0;
         final universe = (result['universeSize'] as num?)?.toInt() ?? 0;
+        final sync = result['sync'];
+        final updatedThisPass = sync is Map
+            ? ((sync['updated'] as num?)?.toInt() ?? 0)
+            : 0;
+        final requestedThisPass = sync is Map
+            ? ((sync['requested'] as num?)?.toInt() ?? 0)
+            : 0;
         stdout.writeln(
-          'Universe warmup pass $pass: $returned/$universe symbols scoreable',
+          'Universe warmup pass $pass: $returned/$universe symbols scoreable '
+          '(synced $updatedThisPass/$requestedThisPass this pass)',
         );
-        if (returned >= universe) {
-          stdout.writeln('Universe warmup complete.');
+        // DONE means the SYNC ran dry, not that the scoreable count went
+        // flat. After a short offline gap every name is already "scoreable"
+        // on slightly stale bars, so the count is pinned from pass 1 — the
+        // old returned-count exit fired after 3 passes and left ~2,000
+        // names days out of date. A pass that requested nothing has no
+        // stale symbols left: that is completion.
+        if (requestedThisPass == 0) {
+          stdout.writeln(
+            'Universe warmup complete: nothing left to sync '
+            '($returned/$universe scoreable).',
+          );
           break;
         }
-        // A single zero-progress pass is NOT proof of completion: after a
-        // 3-week-offline restart, one provider-throttled pass (all fetches
-        // 429ing) read as "no progress" and the warmup quit at 736/2500,
-        // leaving the rest of the universe stale until manual syncs.
-        // Require THREE consecutive empty passes, with a cool-down between
-        // them so a throttle window can pass.
-        if (returned == previousReturned) {
+        // A pass that requested work but landed NONE of it is a throttled
+        // pass, not completion. Require three consecutive fully-failed
+        // passes (with cool-downs so a throttle window can lapse) before
+        // giving up — one 429-storm pass once ended warmup at 736/2500.
+        if (updatedThisPass == 0) {
           noProgressPasses++;
           if (noProgressPasses >= 3) {
             stdout.writeln(
-              'Universe warmup complete ($returned/$universe reachable).',
+              'Universe warmup stopped: provider unreachable for 3 passes '
+              '($returned/$universe scoreable; stale symbols remain).',
             );
             break;
           }
@@ -237,7 +252,6 @@ class BackendCacheServer {
         } else {
           noProgressPasses = 0;
         }
-        previousReturned = returned;
       }
       // Each pass above queued EDGAR fundamentals for its scoreable stocks;
       // wait for that queue to drain so boot ends with fundamentals ready.
