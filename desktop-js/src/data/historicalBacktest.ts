@@ -1279,7 +1279,7 @@ export type DatasetBuildResult = {
  * imputed cell is recorded on sample.imputedMask so raw-value diagnostics
  * (distress canary, size-quintile cuts) can skip synthetic values.
  */
-function imputeMissingWithDateMedians(samples: HistoricalSample[]): void {
+export function imputeMissingWithDateMedians(samples: HistoricalSample[]): void {
   if (samples.length === 0) return
   const byDate = new Map<string, number[]>()
   samples.forEach((sample, idx) => {
@@ -1288,17 +1288,31 @@ function imputeMissingWithDateMedians(samples: HistoricalSample[]): void {
     byDate.set(sample.asOf, arr)
   })
   const featureCount = samples[0].rawFeatures.length
-  // Global per-feature medians over observed values (fallback for dates
-  // whose whole cross-section is missing a feature).
-  const globalMedians = new Array(featureCount).fill(0)
-  for (let f = 0; f < featureCount; f++) {
-    const observed = samples
-      .map((sample) => sample.rawFeatures[f])
-      .filter((value) => !Number.isNaN(value))
-      .sort((a, b) => a - b)
-    globalMedians[f] = observed.length > 0 ? observed[Math.floor(observed.length / 2)] : 0
+  // CAUSAL fallback medians (fixes a promotion BLOCK): the fallback for a
+  // date whose whole cross-section is missing a feature used to be the
+  // median over ALL dates — a 2012 gap could be filled with a value that
+  // includes 2026 observations, leaking future information into training
+  // features. The pool below only ever contains observations from dates
+  // AT OR BEFORE the date being imputed (same-date data is knowable at
+  // that date's close — identical footing to the per-date median branch).
+  const observedSoFar: number[][] = Array.from({ length: featureCount }, () => [])
+  const causalFallbackMedian = (f: number): number => {
+    const pool = observedSoFar[f]
+    if (pool.length === 0) return 0
+    const sorted = [...pool].sort((a, b) => a - b)
+    return sorted[Math.floor(sorted.length / 2)]
   }
-  for (const indices of byDate.values()) {
+  const orderedDates = [...byDate.keys()].sort()
+  for (const date of orderedDates) {
+    const indices = byDate.get(date)!
+    // Admit this date's observations into the pool FIRST, mirroring how
+    // the per-date branch uses same-date values.
+    for (let f = 0; f < featureCount; f++) {
+      for (const idx of indices) {
+        const value = samples[idx].rawFeatures[f]
+        if (!Number.isNaN(value)) observedSoFar[f].push(value)
+      }
+    }
     for (let f = 0; f < featureCount; f++) {
       const present: number[] = []
       for (const idx of indices) {
@@ -1308,7 +1322,9 @@ function imputeMissingWithDateMedians(samples: HistoricalSample[]): void {
       if (present.length === indices.length) continue  // nothing missing
       present.sort((a, b) => a - b)
       const median =
-        present.length > 0 ? present[Math.floor(present.length / 2)] : globalMedians[f]
+        present.length > 0
+          ? present[Math.floor(present.length / 2)]
+          : causalFallbackMedian(f)
       for (const idx of indices) {
         if (Number.isNaN(samples[idx].rawFeatures[f])) {
           const sample = samples[idx]
@@ -1429,7 +1445,7 @@ function applyCrossSectionalReturnDemeaning(samples: HistoricalSample[]): void {
  * stocks at any given date — the model learns relative ranking rather
  * than absolute level.
  */
-function applyCrossSectionalNormalization(samples: HistoricalSample[]): void {
+export function applyCrossSectionalNormalization(samples: HistoricalSample[]): void {
   // Group sample indices by date
   const byDate = new Map<string, number[]>()
   samples.forEach((sample, idx) => {
@@ -1441,24 +1457,43 @@ function applyCrossSectionalNormalization(samples: HistoricalSample[]): void {
   const featureCount = samples[0].rawFeatures.length
   const MIN_GROUP_FOR_ZSCORE = 5
 
-  // Compute global mean/std as fallback for sparse-date groups
-  const globalMean = new Array(featureCount).fill(0)
-  const globalStd = new Array(featureCount).fill(1)
-  for (let f = 0; f < featureCount; f++) {
-    const values = samples.map((sample) => sample.rawFeatures[f])
-    const m = values.reduce((sum, value) => sum + value, 0) / values.length
-    const v = values.reduce((sum, value) => sum + (value - m) ** 2, 0) / values.length
-    globalMean[f] = m
-    globalStd[f] = Math.sqrt(Math.max(1e-12, v))
-  }
+  // CAUSAL sparse-date fallback (fixes a promotion BLOCK): sparse dates
+  // (< MIN_GROUP_FOR_ZSCORE names) used to be Z-scored against a mean/std
+  // pooled over ALL dates — a thin 2011 date was normalized with statistics
+  // containing 2026 data. The running accumulators below only ever hold
+  // observations from dates at or before the one being normalized, so no
+  // preprocessing statistic can see the future. Dense dates are untouched:
+  // their per-date Z uses same-date data only, which was always causal.
+  // Runs AFTER imputation, so every rawFeature is finite here.
+  const runningSum = new Array<number>(featureCount).fill(0)
+  const runningSumSq = new Array<number>(featureCount).fill(0)
+  let runningCount = 0
 
-  for (const indices of byDate.values()) {
+  const orderedDates = [...byDate.keys()].sort()
+  for (const date of orderedDates) {
+    const indices = byDate.get(date)!
+    // Admit this date's values first — a sparse date's own names belong in
+    // its cross-section, the same footing the dense branch gives them.
+    for (const idx of indices) {
+      for (let f = 0; f < featureCount; f++) {
+        const value = samples[idx].rawFeatures[f]
+        runningSum[f] += value
+        runningSumSq[f] += value * value
+      }
+    }
+    runningCount += indices.length
+
     if (indices.length < MIN_GROUP_FOR_ZSCORE) {
-      // Sparse date — fall back to global Z-score so we don't lose the
-      // sample's information. This is honest about the limitation.
+      // Sparse date — expanding-window Z so we don't lose the sample's
+      // information without borrowing statistics from the future. The
+      // earliest sparse dates normalize against thin pools; that costs
+      // estimate quality, never causality.
       indices.forEach((idx) => {
         for (let f = 0; f < featureCount; f++) {
-          samples[idx].features[f] = (samples[idx].rawFeatures[f] - globalMean[f]) / globalStd[f]
+          const mean = runningSum[f] / runningCount
+          const variance = Math.max(0, runningSumSq[f] / runningCount - mean * mean)
+          const sigma = Math.sqrt(Math.max(1e-12, variance))
+          samples[idx].features[f] = (samples[idx].rawFeatures[f] - mean) / sigma
         }
       })
       continue
@@ -1768,10 +1803,17 @@ export async function buildHistoricalDataset(
       evaluation: {
         purgedWalkForwardSupported: true,
         embargoSupported: true,
-        foldLocalPreprocessing: false,
+        // True since 2026-08-03: every preprocessing statistic is causal.
+        // Per-date cross-sectional stats use same-date data only, and the
+        // sparse-date/empty-date fallbacks (imputation medians, Z-score
+        // mean/std) use EXPANDING-WINDOW pools over dates at or before the
+        // sample's date — strictly stronger than fold-local fitting, since
+        // no fold's training features can embed statistics from any later
+        // period, including its own test window.
+        foldLocalPreprocessing: true,
         lockedPostSelectionHoldout: false,
         limitation:
-          'Walk-forward folds purge labels and embargo dates, but sparse-date imputation/normalization fallback statistics are still derived before folding. There is no fold-local preprocessing or untouched final post-selection holdout.',
+          'Walk-forward folds purge labels and embargo dates, and all preprocessing statistics are causal (expanding-window; nothing sees future data). There is still no untouched final post-selection holdout period.',
       },
     },
     diagnostics: {
@@ -2637,8 +2679,8 @@ export function assessModelPromotion(
   add(
     'FOLD_LOCAL_PREPROCESSING',
     quality.evaluation.foldLocalPreprocessing,
-    'Fold-local preprocessing',
-    'Imputation and fallback normalization statistics are fit within each training fold.',
+    'Causal preprocessing statistics',
+    'Every preprocessing statistic is causal: per-date cross-sectional stats use same-date data only, and sparse-date fallbacks use expanding-window pools over dates at or before each sample — no training feature embeds future/test-period information.',
     'Global fallback preprocessing statistics are derived before walk-forward folds and can see future/test-period features.',
   )
 

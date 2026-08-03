@@ -1,10 +1,13 @@
 /** Focused tests for evidence-vs-baseline CIs and fail-closed model promotion. */
 import {
+  applyCrossSectionalNormalization,
   assessModelPromotion,
   buildHistoricalDataset,
   computeBaselineEvidence,
+  imputeMissingWithDateMedians,
   measuredOverlapBlockLength,
   type BacktestDatasetQuality,
+  type HistoricalSample,
 } from './historicalBacktest'
 
 type TestResult = { name: string; passed: boolean; detail?: string }
@@ -244,6 +247,112 @@ export async function runHistoricalBacktestQualityTests(): Promise<TestResult[]>
       name: 'dataset universe: Yahoo-equivalent aliases are rejected before fetch',
       passed: rejected,
       detail: rejected ? undefined : 'BRK.B and BRK/B were not rejected as duplicates',
+    })
+  }
+
+  // --- Causal preprocessing (the fixed promotion BLOCK) -------------------
+  // The fallback statistics used to pool over ALL dates; these tests pin the
+  // causal behavior with hand-computed values AND prove future data cannot
+  // reach past samples.
+  const preprocSample = (asOf: string, rawFeatures: number[]): HistoricalSample =>
+    ({
+      asOf,
+      rawFeatures: [...rawFeatures],
+      features: [...rawFeatures],
+    }) as unknown as HistoricalSample
+  const approx = (a: number, b: number, tol = 1e-9) => Math.abs(a - b) < tol
+
+  // Qc1 — imputation fallback is the CAUSAL median, not the global one.
+  // Dates: A observes {10, 20}; B is entirely missing; C observes {1000, 2000}.
+  // Causal median at B = median{10,20} = 20. The old global median over all
+  // four values was 1000 — a future-contaminated fill.
+  {
+    const rows = [
+      preprocSample('2020-01-01', [10]),
+      preprocSample('2020-01-01', [20]),
+      preprocSample('2020-01-02', [Number.NaN]),
+      preprocSample('2020-01-02', [Number.NaN]),
+      preprocSample('2020-01-03', [1000]),
+      preprocSample('2020-01-03', [2000]),
+    ]
+    imputeMissingWithDateMedians(rows)
+    const ok =
+      approx(rows[2].rawFeatures[0], 20) &&
+      approx(rows[3].rawFeatures[0], 20) &&
+      rows[2].imputedMask?.[0] === true
+    results.push({
+      name: 'causal preprocessing: empty-date imputation uses past-only median (20, not 1000)',
+      passed: ok,
+      detail: ok ? undefined : `imputed=${rows[2].rawFeatures[0]}`,
+    })
+  }
+
+  // Qc2 — perturbing the FUTURE cannot change a past imputation.
+  {
+    const build = (futureScale: number) => {
+      const rows = [
+        preprocSample('2020-01-01', [10]),
+        preprocSample('2020-01-01', [20]),
+        preprocSample('2020-01-02', [Number.NaN]),
+        preprocSample('2020-01-03', [1000 * futureScale]),
+      ]
+      imputeMissingWithDateMedians(rows)
+      return rows[2].rawFeatures[0]
+    }
+    const ok = approx(build(1), build(1000)) && approx(build(1), 20)
+    results.push({
+      name: 'causal preprocessing: imputation invariant under future perturbation',
+      passed: ok,
+      detail: ok ? undefined : `base=${build(1)} perturbed=${build(1000)}`,
+    })
+  }
+
+  // Qc3 — sparse-date Z uses the expanding window (own date included).
+  // Dense A = {1..5} (mean 3, popstd √2 → the 5 maps to +1.414214…).
+  // Sparse B = {3}; expanding pool {1,2,3,4,5,3}: mean 3 → B's Z is exactly 0.
+  {
+    const rows = [
+      preprocSample('2020-01-01', [1]),
+      preprocSample('2020-01-01', [2]),
+      preprocSample('2020-01-01', [3]),
+      preprocSample('2020-01-01', [4]),
+      preprocSample('2020-01-01', [5]),
+      preprocSample('2020-01-02', [3]),
+    ]
+    applyCrossSectionalNormalization(rows)
+    const ok =
+      approx(rows[4].features[0], 2 / Math.SQRT2, 1e-6) &&
+      approx(rows[5].features[0], 0, 1e-6)
+    results.push({
+      name: 'causal preprocessing: sparse-date Z from expanding window (hand-computed)',
+      passed: ok,
+      detail: ok ? undefined : `dense5=${rows[4].features[0]} sparseB=${rows[5].features[0]}`,
+    })
+  }
+
+  // Qc4 — future dates cannot move a past sparse-date Z. Adding a later
+  // date of huge values (old global fallback would have dragged B's Z
+  // strongly negative) leaves B at exactly 0.
+  {
+    const rows = [
+      preprocSample('2020-01-01', [1]),
+      preprocSample('2020-01-01', [2]),
+      preprocSample('2020-01-01', [3]),
+      preprocSample('2020-01-01', [4]),
+      preprocSample('2020-01-01', [5]),
+      preprocSample('2020-01-02', [3]),
+      preprocSample('2020-01-03', [100]),
+      preprocSample('2020-01-03', [100]),
+      preprocSample('2020-01-03', [100]),
+      preprocSample('2020-01-03', [100]),
+      preprocSample('2020-01-03', [100]),
+    ]
+    applyCrossSectionalNormalization(rows)
+    const ok = approx(rows[5].features[0], 0, 1e-6)
+    results.push({
+      name: 'causal preprocessing: sparse-date Z invariant under future perturbation',
+      passed: ok,
+      detail: ok ? undefined : `sparseB=${rows[5].features[0]} (should be 0)`,
     })
   }
 
