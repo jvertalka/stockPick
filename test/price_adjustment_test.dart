@@ -122,6 +122,56 @@ void main() {
       );
     });
 
+    test('fully-null provider placeholder rows are dropped and counted', () {
+      // Yahoo has served rows where every field including volume is null
+      // (fleet-wide for the 2026-07-21/22/31 sessions). Such a row carries
+      // zero information, so it is dropped like a market holiday and the
+      // exclusion is counted for provenance.
+      final closes = List<double?>.filled(221, 50)..[100] = null;
+      final volumes = List<double?>.filled(221, 1000)..[100] = null;
+      final series = DecisionPriceSeries.fromYahooChart(
+        symbol: 'TEST',
+        fetchedAt: DateTime.utc(2024, 2, 1),
+        body: _yahooChartBody(
+          rawCloses: closes,
+          adjustedCloses: closes,
+          rawVolumes: volumes,
+        ),
+        maxBars: 0,
+      );
+
+      expect(series.bars.length, 220);
+      expect(series.excludedProviderPlaceholderRows, 1);
+      expect(series.incompleteProviderBarCount, 0);
+      expect(series.currentAnalyticsGapCount, 0);
+      expect(series.hasAdjustedTotalReturnPrices, isTrue);
+      expect(DecisionPriceMetrics.fromSeriesOrNull(series), isNotNull);
+
+      final restored = DecisionPriceSeries.fromJson(
+        jsonDecode(jsonEncode(series.toJson())) as Map<String, dynamic>,
+      );
+      expect(restored.excludedProviderPlaceholderRows, 1);
+      expect(restored.hasAdjustedTotalReturnPrices, isTrue);
+    });
+
+    test('a null-price row with real volume is kept and rejects the window', () {
+      // Real volume means the provider had SOME data for the session, so the
+      // row is not a placeholder: it stays as an ineligible bar and the
+      // series goes back to the refresh queue.
+      final closes = List<double?>.filled(220, 50)..[100] = null;
+      final series = DecisionPriceSeries.fromYahooChart(
+        symbol: 'TEST',
+        fetchedAt: DateTime.utc(2024, 2, 1),
+        body: _yahooChartBody(rawCloses: closes, adjustedCloses: closes),
+        maxBars: 0,
+      );
+
+      expect(series.bars.length, 220);
+      expect(series.excludedProviderPlaceholderRows, 0);
+      expect(series.hasAdjustedTotalReturnPrices, isFalse);
+      expect(DecisionPriceMetrics.fromSeriesOrNull(series), isNull);
+    });
+
     test('missing Yahoo OHLCV stays as a marked non-analytical row', () {
       final opens = List<double?>.filled(220, 49)..[219] = null;
       final volumes = List<double?>.filled(220, 1000)..[218] = null;
