@@ -14,6 +14,12 @@ stored with every new model artifact.
   reconstruction, and dollar-liquidity calculations.
 - A row without valid, internally consistent OHLCV or `adjclose` is rejected
   and remains in the source-row coverage denominator rather than disappearing.
+- Exception: a provider placeholder row — every price field AND volume null —
+  carries zero information and is dropped at parse time, so the date reads
+  like a market holiday. The count is stored on the series as
+  `excludedProviderPlaceholderRows` so the exclusion stays visible. A row
+  with any real field is never dropped. (Yahoo served such placeholders
+  fleet-wide for the 2026-07-21/22/31 sessions.)
 - Timestamps must be strictly increasing; rows are never sorted/deduplicated in
   a way that would compress trading-day horizons.
 - Live decision metrics require the latest 200 provider rows to be complete

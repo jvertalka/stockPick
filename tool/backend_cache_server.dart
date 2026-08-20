@@ -2212,12 +2212,21 @@ class DecisionPriceSeries {
     required this.source,
     required this.fetchedAt,
     required this.bars,
+    this.excludedProviderPlaceholderRows = 0,
   });
 
   final String symbol;
   final String source;
   final DateTime fetchedAt;
   final List<DecisionPriceBar> bars;
+
+  // Provider rows whose every price field (and volume) was null. Yahoo emits
+  // these as calendar placeholders — a timestamp with zero information — and
+  // in Aug 2026 served them fleet-wide for the 2026-07-21/22/31 sessions.
+  // They are dropped at parse time (the date then reads like a market
+  // holiday, which the gap checks already tolerate) but counted here so the
+  // exclusion stays visible in provenance.
+  final int excludedProviderPlaceholderRows;
 
   int get adjustedBarCount =>
       bars.where((bar) => bar.isAdjustedTotalReturn).length;
@@ -2290,6 +2299,7 @@ class DecisionPriceSeries {
       'analyticsWindowSize': analyticsWindowSize,
       'currentAnalyticsGapCount': currentAnalyticsGapCount,
       'hasOlderAnalyticalGaps': hasOlderAnalyticalGaps,
+      'excludedProviderPlaceholderRows': excludedProviderPlaceholderRows,
       'bars': bars.map((bar) => bar.toJson()).toList(),
     };
   }
@@ -2316,6 +2326,8 @@ class DecisionPriceSeries {
           DateTime.tryParse(json['fetchedAt'] as String? ?? '') ??
           DateTime.fromMillisecondsSinceEpoch(0, isUtc: true),
       bars: bars,
+      excludedProviderPlaceholderRows:
+          (json['excludedProviderPlaceholderRows'] as num?)?.toInt() ?? 0,
     );
   }
 
@@ -2419,6 +2431,7 @@ class DecisionPriceSeries {
     }
     final adjusted = adjustedList.first as Map<String, dynamic>;
     final bars = <DecisionPriceBar>[];
+    var excludedPlaceholders = 0;
     int? previousTimestampMs;
     for (var index = 0; index < timestamps.length; index++) {
       final timestamp = timestamps[index];
@@ -2455,6 +2468,21 @@ class DecisionPriceSeries {
       final rawLow = _numberAt(quote['low'], index);
       final rawVolume = _numberAt(quote['volume'], index);
       final adjustedClose = _numberAt(adjusted['adjclose'], index);
+      // A row where every price field AND volume is null is a provider
+      // placeholder: a calendar timestamp carrying no data at all. Dropping
+      // it makes the date read like a market holiday, which every gap check
+      // already tolerates. A row with ANY real field is not dropped — it
+      // stays as an ineligible bar so partial provider data keeps rejecting
+      // the series instead of being papered over.
+      if (rawClose == null &&
+          rawOpen == null &&
+          rawHigh == null &&
+          rawLow == null &&
+          adjustedClose == null &&
+          (rawVolume == null || rawVolume == 0)) {
+        excludedPlaceholders++;
+        continue;
+      }
       final hasRawClose = rawClose != null && rawClose > 0;
       final hasAdjustment = adjustedClose != null && adjustedClose > 0;
       var providerRowComplete = false;
@@ -2513,6 +2541,7 @@ class DecisionPriceSeries {
       bars: maxBars > 0 && bars.length > maxBars
           ? bars.sublist(bars.length - maxBars)
           : bars,
+      excludedProviderPlaceholderRows: excludedPlaceholders,
     );
   }
 }
