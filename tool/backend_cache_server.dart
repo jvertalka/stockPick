@@ -204,8 +204,14 @@ class BackendCacheServer {
               config.cacheDirectory,
               cache: _cache,
             ).build(
+              // AUTO, not force: auto's candidate set is "genuinely needs
+              // work" (missing/unproven/stale series, minus chronic-futility
+              // cooldowns), so `requested` reaching zero really means done.
+              // Force makes every symbol a candidate on every pass, which
+              // kept `requested` pinned at the limit and made the
+              // nothing-left-to-sync exit unreachable.
               Uri.parse(
-                '/decision/universe?limit=0&historyLimit=0&sync=force&syncLimit=96',
+                '/decision/universe?limit=0&historyLimit=0&sync=auto&syncLimit=96',
               ),
             );
         if (_stopping) return;
@@ -1462,16 +1468,24 @@ class DecisionUniverseService {
     };
   }
 
-  /// Consecutive fetch-failure streaks per symbol, process-lifetime (the
-  /// service is constructed per request, so this must be static). Chronic
-  /// failures — delisted/renamed tickers that can never fetch — used to
-  /// sort to the FRONT of every sync pass forever (never-fetched reads as
-  /// "stalest"), eating ~60 of every 96 slots while genuinely stale live
-  /// names waited behind them. Three misses sends a symbol to the back of
-  /// the queue; it still retries when slots remain, and one success clears
-  /// the streak, so a recovered ticker heals normally.
+  /// Consecutive FUTILE-sync streaks per symbol, process-lifetime (the
+  /// service is constructed per request, so this must be static). Futile
+  /// means the attempt moved nothing forward: the fetch failed (delisted/
+  /// renamed tickers), OR it succeeded but the stored series still cannot
+  /// prove its adjusted analytics window (thin tickers with legitimate
+  /// no-trade rows in their latest-200 — they can never pass). Both kinds
+  /// used to re-enter the FRONT of the priority queue every pass and
+  /// starve it: measured live as the same 96 symbols "syncing" every pass
+  /// with scoreable frozen at 73/2500. Three futile attempts sends a
+  /// symbol to the back of the queue AND (in auto mode) into a 7-day
+  /// cooldown out of the candidate pool — without the cooldown, permanent
+  /// candidates keep `requested` above zero forever and the warmup's
+  /// nothing-left-to-sync exit can never fire. One eligible success
+  /// clears everything, so a recovered ticker heals normally.
   static final Map<String, int> _syncFailureStreaks = <String, int>{};
+  static final Map<String, DateTime> _lastFutileAttempt = <String, DateTime>{};
   static const int _kChronicFailureStreak = 3;
+  static const Duration _kChronicRetryCooldown = Duration(days: 7);
 
   Future<DecisionPriceSyncResult> _maybeSyncPriceHistory({
     required DecisionPriceHistoryState state,
@@ -1486,6 +1500,20 @@ class DecisionUniverseService {
     final force = syncMode == 'force' || syncMode == '1' || syncMode == 'true';
     final staleBefore = now.subtract(const Duration(hours: 18));
     final candidates = symbols.where((symbol) {
+      // Chronic-futility cooldown (auto mode only — an explicit force sync
+      // is a user demand and includes everything): a symbol whose last 3+
+      // attempts were futile sits out for 7 days. This is what lets
+      // `requested` reach zero so callers can tell "done" from "looping".
+      if (!force) {
+        final chronic =
+            (_syncFailureStreaks[symbol] ?? 0) >= _kChronicFailureStreak;
+        final lastFutile = _lastFutileAttempt[symbol];
+        if (chronic &&
+            lastFutile != null &&
+            now.difference(lastFutile) < _kChronicRetryCooldown) {
+          return false;
+        }
+      }
       final series = state.seriesBySymbol[symbol];
       if (series == null) {
         return true;
@@ -1562,9 +1590,27 @@ class DecisionUniverseService {
           failed.add(result.key);
           _syncFailureStreaks[result.key] =
               (_syncFailureStreaks[result.key] ?? 0) + 1;
+          _lastFutileAttempt[result.key] = now;
         } else {
-          _syncFailureStreaks.remove(result.key);
-          nextSeries[result.key] = result.value!;
+          final series = result.value!;
+          // A fetch that SUCCEEDS but still cannot prove its adjusted
+          // analytics window is exactly as futile as a failure. Thin
+          // tickers (preferred shares, notes) have legitimate no-trade
+          // rows inside their latest-200 window, so they can never pass
+          // hasAdjustedTotalReturnPrices — yet each "successful" refetch
+          // used to clear their streak AND re-enter them at the front of
+          // the needs-adjustment priority, starving the whole queue:
+          // measured live 2026-08-19 as 96/96 "synced" per pass with the
+          // SAME symbols every pass and scoreable frozen at 73/2500.
+          if (series.hasAdjustedTotalReturnPrices) {
+            _syncFailureStreaks.remove(result.key);
+            _lastFutileAttempt.remove(result.key);
+          } else {
+            _syncFailureStreaks[result.key] =
+                (_syncFailureStreaks[result.key] ?? 0) + 1;
+            _lastFutileAttempt[result.key] = now;
+          }
+          nextSeries[result.key] = series;
           updated.add(result.key);
         }
       }
