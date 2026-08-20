@@ -1641,8 +1641,22 @@ class DecisionUniverseService {
     DateTime fetchedAt,
   ) async {
     try {
+      // NOT range=18mo: Yahoo's range= shorthand serves corrupted responses.
+      // Measured live 2026-08-19: under range=18mo, SWKS carried ALL-NULL
+      // rows on real trading days (2026-07-21/31) that are fully populated
+      // under explicit period bounds — and one null row inside the
+      // latest-200 window permanently fails hasAdjustedTotalReturnPrices,
+      // which froze most of the universe out of scoreability while every
+      // re-sync "succeeded". Same family as range=max silently degrading to
+      // monthly bars (2026-07-07): never use Yahoo's range= shorthand.
+      // period2 anchors to the next UTC midnight so the URL — and the proxy
+      // cache key — stays stable within a day.
+      final period2 =
+          ((DateTime.now().toUtc().millisecondsSinceEpoch ~/ 86400000) + 1) *
+          86400;
+      final period1 = period2 - (548 * 86400); // ~18 months of daily bars
       final uri = Uri.parse(
-        'https://query1.finance.yahoo.com/v8/finance/chart/${Uri.encodeComponent(_toYahooSymbol(symbol))}?interval=1d&range=18mo&includeAdjustedClose=true',
+        'https://query1.finance.yahoo.com/v8/finance/chart/${Uri.encodeComponent(_toYahooSymbol(symbol))}?period1=$period1&period2=$period2&interval=1d&includePrePost=false&events=div%2Csplits&includeAdjustedClose=true',
       );
       final response = await _cache.fetch(uri);
       if (response.statusCode < 200 || response.statusCode >= 300) {
