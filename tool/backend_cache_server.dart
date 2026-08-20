@@ -1462,6 +1462,17 @@ class DecisionUniverseService {
     };
   }
 
+  /// Consecutive fetch-failure streaks per symbol, process-lifetime (the
+  /// service is constructed per request, so this must be static). Chronic
+  /// failures — delisted/renamed tickers that can never fetch — used to
+  /// sort to the FRONT of every sync pass forever (never-fetched reads as
+  /// "stalest"), eating ~60 of every 96 slots while genuinely stale live
+  /// names waited behind them. Three misses sends a symbol to the back of
+  /// the queue; it still retries when slots remain, and one success clears
+  /// the streak, so a recovered ticker heals normally.
+  static final Map<String, int> _syncFailureStreaks = <String, int>{};
+  static const int _kChronicFailureStreak = 3;
+
   Future<DecisionPriceSyncResult> _maybeSyncPriceHistory({
     required DecisionPriceHistoryState state,
     required List<String> symbols,
@@ -1493,6 +1504,14 @@ class DecisionUniverseService {
         symbols[index]: index,
     };
     candidates.sort((left, right) {
+      // Chronic failures retry LAST (see _syncFailureStreaks above).
+      final leftChronic =
+          (_syncFailureStreaks[left] ?? 0) >= _kChronicFailureStreak ? 1 : 0;
+      final rightChronic =
+          (_syncFailureStreaks[right] ?? 0) >= _kChronicFailureStreak ? 1 : 0;
+      if (leftChronic != rightChronic) {
+        return leftChronic.compareTo(rightChronic);
+      }
       final leftNeedsAdjustment =
           !(state.seriesBySymbol[left]?.hasAdjustedTotalReturnPrices ?? false);
       final rightNeedsAdjustment =
@@ -1541,7 +1560,10 @@ class DecisionUniverseService {
         }
         if (result.value == null) {
           failed.add(result.key);
+          _syncFailureStreaks[result.key] =
+              (_syncFailureStreaks[result.key] ?? 0) + 1;
         } else {
+          _syncFailureStreaks.remove(result.key);
           nextSeries[result.key] = result.value!;
           updated.add(result.key);
         }
