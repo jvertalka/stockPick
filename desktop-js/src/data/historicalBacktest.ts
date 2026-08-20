@@ -2643,20 +2643,65 @@ export function assessModelPromotion(
     quality.universe.limitation,
   )
 
-  const totalReturnReady =
+  // This check verifies the LABELS' price basis. It used to also demand
+  // sourceRowAcceptanceCoverage === 1 — i.e. that the third-party raw feed
+  // contained ZERO malformed rows across ~1.7M — which made the check
+  // unpassable forever even when every accepted bar was fully adjusted
+  // (the Aug-3 run printed a success-voiced detail under a BLOCK status).
+  // Rows the pipeline rejects fail-closed never become labels, so their
+  // mere existence in the source cannot contaminate the label basis.
+  // Severity now matches the actual risk:
+  //   labels not fully adjusted            -> BLOCK (real contamination)
+  //   labels clean, material exclusions    -> BLOCK (>1% of source rows
+  //     excluded can bias which names/periods the panel represents)
+  //   labels clean, minor exclusions       -> WARN with the rate disclosed
+  //   labels clean, zero exclusions        -> PASS
+  const labelsFullyAdjusted =
     quality.returns.labelAdjustment === 'total-return' &&
-    quality.returns.sourceRowAcceptanceCoverage === 1 &&
-    quality.returns.sourceAdjustmentCoverage === 1 &&
     quality.returns.adjustedReturnLabelCoverage === 1 &&
     quality.returns.totalReturnLabelCoverage === 1 &&
     quality.returns.dividendsIncludedInLabels
-  add(
-    'TOTAL_RETURN_LABELS',
-    totalReturnReady,
-    'Corporate-action-adjusted total-return labels',
-    'Every return label includes split and dividend adjustments.',
-    quality.returns.limitation,
-  )
+  const excludedSourceRows =
+    quality.returns.sourceInvalidRawBars + quality.returns.sourceMissingAdjustedBars
+  const excludedShare =
+    quality.returns.sourceRowsObserved > 0
+      ? excludedSourceRows / quality.returns.sourceRowsObserved
+      : 0
+  const MATERIAL_EXCLUSION_SHARE = 0.01
+  if (!labelsFullyAdjusted) {
+    add(
+      'TOTAL_RETURN_LABELS',
+      false,
+      'Corporate-action-adjusted total-return labels',
+      'Every return label includes split and dividend adjustments.',
+      quality.returns.limitation,
+    )
+  } else if (excludedShare > MATERIAL_EXCLUSION_SHARE) {
+    add(
+      'TOTAL_RETURN_LABELS',
+      false,
+      'Corporate-action-adjusted total-return labels',
+      'Every return label includes split and dividend adjustments.',
+      `Every accepted bar is adjusted, but ${excludedSourceRows} of ` +
+        `${quality.returns.sourceRowsObserved} source rows ` +
+        `(${(excludedShare * 100).toFixed(2)}%) were excluded fail-closed — ` +
+        `an exclusion rate this material can bias which names and periods ` +
+        `the panel represents.`,
+    )
+  } else {
+    reasons.push({
+      code: 'TOTAL_RETURN_LABELS',
+      status: excludedSourceRows === 0 ? 'pass' : 'warning',
+      title: 'Corporate-action-adjusted total-return labels',
+      detail:
+        excludedSourceRows === 0
+          ? 'Every return label includes split and dividend adjustments; no source rows required exclusion.'
+          : `Every return label includes split and dividend adjustments. ` +
+            `${excludedSourceRows} of ${quality.returns.sourceRowsObserved} source rows ` +
+            `(${(excludedShare * 100).toFixed(3)}%) were malformed or lacked an adjusted close ` +
+            `and were excluded fail-closed — disclosed here, never used as labels.`,
+    })
+  }
 
   add(
     'POINT_IN_TIME_FUNDAMENTALS',

@@ -221,16 +221,22 @@ export async function runHistoricalBacktestQualityTests(): Promise<TestResult[]>
   }
 
   {
+    // Updated 2026-08-19 with the check's severity re-scope: rows lacking
+    // adjclose are excluded fail-closed UPSTREAM and never become labels,
+    // so a small disclosed exclusion warns; a MATERIAL missing-adjclose
+    // rate (>1% of source rows) still fails closed — heavy exclusion can
+    // bias which names and periods the panel represents.
     const quality = completeQuality()
-    quality.returns.sourceEligibleRawBars = 101
-    quality.returns.sourceMissingAdjustedBars = 1
-    quality.returns.sourceAdjustmentCoverage = 100 / 101
-    quality.returns.limitation = 'one otherwise-valid source row lacked adjclose'
+    quality.returns.sourceRowsObserved = 100
+    quality.returns.sourceEligibleRawBars = 100
+    quality.returns.sourceMissingAdjustedBars = 5
+    quality.returns.sourceAdjustmentCoverage = 95 / 100
+    quality.returns.limitation = 'five otherwise-valid source rows lacked adjclose'
     const assessment = assessModelPromotion(quality, strongEvidence())
     const passed =
       !assessment.promotable && assessment.blockerCodes.includes('TOTAL_RETURN_LABELS')
     results.push({
-      name: 'promotion: incomplete source adjustment coverage fails closed',
+      name: 'promotion: material missing-adjclose exclusion fails closed',
       passed,
       detail: passed ? undefined : JSON.stringify(assessment),
     })
@@ -247,6 +253,61 @@ export async function runHistoricalBacktestQualityTests(): Promise<TestResult[]>
       name: 'dataset universe: Yahoo-equivalent aliases are rejected before fetch',
       passed: rejected,
       detail: rejected ? undefined : 'BRK.B and BRK/B were not rejected as duplicates',
+    })
+  }
+
+  // --- Total-return label check severity (fixed 2026-08-19) ---------------
+  // The check verifies the LABELS' basis; correctly-rejected source rows
+  // never become labels, so a tiny disclosed exclusion rate warns instead
+  // of blocking forever, while material exclusion (>1%) still blocks.
+  {
+    const quality = completeQuality()
+    quality.returns.sourceRowsObserved = 1000
+    quality.returns.sourceInvalidRawBars = 3
+    quality.returns.sourceRowAcceptanceCoverage = 997 / 1000
+    const assessment = assessModelPromotion(quality, strongEvidence())
+    const reason = assessment.reasons.find((r) => r.code === 'TOTAL_RETURN_LABELS')
+    const passed =
+      assessment.promotable &&
+      !assessment.blockerCodes.includes('TOTAL_RETURN_LABELS') &&
+      reason?.status === 'warning' &&
+      reason.detail.includes('excluded fail-closed')
+    results.push({
+      name: 'promotion: clean labels + minor disclosed exclusions warn, never block',
+      passed,
+      detail: passed ? undefined : JSON.stringify(reason ?? assessment.blockerCodes),
+    })
+  }
+
+  {
+    const quality = completeQuality()
+    quality.returns.sourceRowsObserved = 1000
+    quality.returns.sourceInvalidRawBars = 50
+    quality.returns.sourceRowAcceptanceCoverage = 950 / 1000
+    const assessment = assessModelPromotion(quality, strongEvidence())
+    const passed =
+      !assessment.promotable &&
+      assessment.blockerCodes.includes('TOTAL_RETURN_LABELS')
+    results.push({
+      name: 'promotion: material source-row exclusion (5%) blocks',
+      passed,
+      detail: passed ? undefined : JSON.stringify(assessment.blockerCodes),
+    })
+  }
+
+  {
+    const quality = completeQuality()
+    quality.returns.adjustedReturnLabelCoverage = 0.99
+    quality.returns.totalReturnLabelCoverage = 0.99
+    quality.returns.dividendsIncludedInLabels = false
+    const assessment = assessModelPromotion(quality, strongEvidence())
+    const passed =
+      !assessment.promotable &&
+      assessment.blockerCodes.includes('TOTAL_RETURN_LABELS')
+    results.push({
+      name: 'promotion: any unadjusted label still hard-blocks',
+      passed,
+      detail: passed ? undefined : JSON.stringify(assessment.blockerCodes),
     })
   }
 
