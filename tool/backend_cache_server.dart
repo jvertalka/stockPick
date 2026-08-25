@@ -2213,6 +2213,7 @@ class DecisionPriceSeries {
     required this.fetchedAt,
     required this.bars,
     this.excludedProviderPlaceholderRows = 0,
+    this.excludedInProgressSessionBars = 0,
   });
 
   final String symbol;
@@ -2227,6 +2228,15 @@ class DecisionPriceSeries {
   // holiday, which the gap checks already tolerate) but counted here so the
   // exclusion stays visible in provenance.
   final int excludedProviderPlaceholderRows;
+
+  // The final row of a response that arrived while this instrument's own
+  // regular session was still running. Yahoo serves the session in progress
+  // as though it were a finished daily bar, and its open/high/low/close come
+  // from update paths that have not reconciled yet — measured live on
+  // 2026-08-25 at 18:16Z, ABCB reported an open of 86.10 above its own high
+  // of 85.99. A part of a day is not a day, and its "close" is not the day's
+  // close, so the bar is excluded from the series and counted here.
+  final int excludedInProgressSessionBars;
 
   int get adjustedBarCount =>
       bars.where((bar) => bar.isAdjustedTotalReturn).length;
@@ -2300,6 +2310,7 @@ class DecisionPriceSeries {
       'currentAnalyticsGapCount': currentAnalyticsGapCount,
       'hasOlderAnalyticalGaps': hasOlderAnalyticalGaps,
       'excludedProviderPlaceholderRows': excludedProviderPlaceholderRows,
+      'excludedInProgressSessionBars': excludedInProgressSessionBars,
       'bars': bars.map((bar) => bar.toJson()).toList(),
     };
   }
@@ -2328,6 +2339,8 @@ class DecisionPriceSeries {
       bars: bars,
       excludedProviderPlaceholderRows:
           (json['excludedProviderPlaceholderRows'] as num?)?.toInt() ?? 0,
+      excludedInProgressSessionBars:
+          (json['excludedInProgressSessionBars'] as num?)?.toInt() ?? 0,
     );
   }
 
@@ -2531,7 +2544,37 @@ class DecisionPriceSeries {
         ),
       );
     }
-    if (bars.length < 5) {
+    // Yahoo keeps serving the session that is running RIGHT NOW as if it
+    // were a finished daily bar. Drop that last row whenever the exchange's
+    // own metadata says its regular session is still open, whether or not the
+    // half-finished prices happen to look sane at this second: excluding it
+    // only when it looks wrong is exactly what made scoreable coverage churn
+    // (2344 -> 2172 on one market-hours refresh, 177 symbols lost and 175
+    // gained). This runs before the maxBars trim so a trimmed series still
+    // keeps its full count of COMPLETED sessions.
+    var excludedInProgressBars = 0;
+    if (bars.isNotEmpty &&
+        _isBarFromOpenRegularSession(
+          entry['meta'],
+          barDate: bars.last.date,
+          now: fetchedAt,
+        )) {
+      bars.removeLast();
+      excludedInProgressBars = 1;
+    }
+    // The floor asks one question — did the provider send enough sessions for
+    // this response to be worth storing — so it is measured on the rows Yahoo
+    // sent, not on what this parser then trimmed away. Counting the
+    // in-progress bar back in is what keeps the answer the same all day:
+    // without it, a thin ticker holding exactly five rows parses fine after
+    // the close and throws FormatException during the session, which the
+    // caller turns into a failed sync. That clock-dependent flip between
+    // stored and failed is the same churn this whole rule exists to stop. A
+    // genuinely short or empty response still throws exactly as before, and
+    // the four completed bars that can survive here sit far below the 200-row
+    // analytics window, so nothing downstream can score them — they are
+    // simply stored honestly.
+    if (bars.length + excludedInProgressBars < 5) {
       throw const FormatException('Yahoo chart response had too few bars.');
     }
     return DecisionPriceSeries(
@@ -2542,6 +2585,7 @@ class DecisionPriceSeries {
           ? bars.sublist(bars.length - maxBars)
           : bars,
       excludedProviderPlaceholderRows: excludedPlaceholders,
+      excludedInProgressSessionBars: excludedInProgressBars,
     );
   }
 }
@@ -3314,6 +3358,91 @@ const Map<String, String> _sectorBenchmarkSymbols = {
 
 String _toYahooSymbol(String symbol) {
   return symbol.toUpperCase().replaceAll('.', '-');
+}
+
+// The longest regular session any real stock exchange runs is about eight and
+// a half hours: London trades 08:00 to 16:30 local, Frankfurt and Paris 09:00
+// to 17:30. The US names this app follows run six and a half hours, and an
+// early-close day runs three and a half. Twelve hours therefore clears every
+// genuine session with room to spare while still staying far short of a whole
+// day, which is exactly the point: a window that stretches across sessions
+// that already finished must never be believed. Rejecting a window only ever
+// means keeping every bar, so a bound that is too generous costs nothing.
+// (A 24-hour "session" — what Yahoo reports for crypto and FX — fails this
+// bound. That is deliberate and harmless here: this universe is US stocks and
+// ETFs, and the only consequence of rejection is that no bar is dropped.)
+const double _kMaxRegularSessionMs = 12 * 60 * 60 * 1000;
+
+// Nothing real is shorter than the shortest half-day session an exchange
+// runs, which is a couple of hours. A window under half an hour is degenerate
+// metadata rather than a trading day.
+const double _kMinRegularSessionMs = 30 * 60 * 1000;
+
+// True only when Yahoo's own session metadata says this instrument's regular
+// trading session is open at [now] AND [barDate] falls inside that same
+// session — which is how a daily bar for a day that has not finished yet
+// shows up, since Yahoo stamps each daily bar with its session's open time.
+//
+// The session bounds come from the response rather than from a clock here on
+// purpose: they are per-exchange and already correct for daylight saving.
+// Anything missing or malformed answers false, so a response without usable
+// metadata keeps every bar it came with. Missing metadata must never cost us
+// data.
+//
+// KNOWN EXPOSURE, early-close days (the Friday after Thanksgiving, Christmas
+// Eve): this code trusts whatever end second the response carries. If Yahoo
+// shortens `regular.end` to the real early close on those days, the rule is
+// exactly right. If Yahoo instead keeps publishing the nominal 20:00Z end,
+// then between the real close and the nominal one this rule reads the session
+// as still running and drops a bar that is genuinely FINISHED. Which of those
+// Yahoo does could not be confirmed here without a live half-day response,
+// and guessing would be worse than the exposure: any clock-side heuristic
+// (say, treating a session as over once trades stop arriving) would drop real
+// bars for every thinly traded name on an ordinary day. So the behaviour is
+// left alone and the exposure is written down instead. It is bounded on all
+// three sides — it can touch only the last bar, only during the few hours
+// between the real and the nominal close, on the two or three half days a
+// year — and it is not durable loss: the exclusion is recomputed from the
+// response on every fetch, so the first sync after the nominal end stores the
+// full bar again. Inside that window the app behaves exactly as it does
+// during any open session, showing the previous close as the newest completed
+// one.
+bool _isBarFromOpenRegularSession(
+  Object? rawMeta, {
+  required DateTime barDate,
+  required DateTime now,
+}) {
+  if (rawMeta is! Map<String, dynamic>) return false;
+  final tradingPeriod = rawMeta['currentTradingPeriod'];
+  if (tradingPeriod is! Map<String, dynamic>) return false;
+  final regular = tradingPeriod['regular'];
+  if (regular is! Map<String, dynamic>) return false;
+  final start = regular['start'];
+  final end = regular['end'];
+  if (start is! num || end is! num) return false;
+  final startMs = start.toDouble() * 1000;
+  final endMs = end.toDouble() * 1000;
+  if (!startMs.isFinite || !endMs.isFinite) return false;
+  // One duration test, and every nonsensical window fails it: an end at or
+  // before the start, a window too short to be a trading day, and — the one
+  // that costs real data — a window long enough to reach back over sessions
+  // that already finished. Without that upper bound a start of 0, or any
+  // far-past second, paired with a plausible end makes an old COMPLETED bar
+  // look like it belongs to the session running right now, and it is deleted
+  // with no trace. When the window fails this test nothing changes and every
+  // bar is kept.
+  final durationMs = endMs - startMs;
+  if (durationMs < _kMinRegularSessionMs ||
+      durationMs > _kMaxRegularSessionMs) {
+    return false;
+  }
+  final nowMs = now.toUtc().millisecondsSinceEpoch;
+  final sessionIsOpenNow = nowMs >= startMs && nowMs < endMs;
+  if (!sessionIsOpenNow) return false;
+  // Only a bar stamped inside the open session counts. A halted or stale
+  // symbol whose newest bar is days old is left completely alone.
+  final barMs = barDate.toUtc().millisecondsSinceEpoch;
+  return barMs >= startMs && barMs <= endMs;
 }
 
 double? _numberAt(Object? values, int index) {

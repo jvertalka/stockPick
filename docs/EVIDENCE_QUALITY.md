@@ -20,6 +20,21 @@ stored with every new model artifact.
   `excludedProviderPlaceholderRows` so the exclusion stays visible. A row
   with any real field is never dropped. (Yahoo served such placeholders
   fleet-wide for the 2026-07-21/22/31 sessions.)
+- Exception: the session in progress. Yahoo serves today's running session as
+  if it were a finished daily bar, and its open/high/low/close come from update
+  paths that have not reconciled yet (measured 2026-08-25 at 18:16Z, ABCB
+  reported an open of 86.10 above its own high of 85.99). When the response's
+  own `meta.currentTradingPeriod.regular` says the instrument's regular session
+  is open right now and the last bar belongs to that session, the bar is
+  excluded from the analytics series and counted in
+  `excludedInProgressSessionBars`. The exclusion is unconditional while the
+  session is open, because dropping the bar only when it happens to look wrong
+  is what made scoreable coverage churn between refreshes. Only ever the last
+  bar, only against the currently open session; a halted or stale symbol keeps
+  every bar, and a response without usable session metadata changes nothing.
+  The consequence is deliberate: during market hours a symbol's newest stored
+  bar is the last COMPLETED session, so the last stored price is the previous
+  close until today's session ends. That is the honest last daily close.
 - Timestamps must be strictly increasing; rows are never sorted/deduplicated in
   a way that would compress trading-day horizons.
 - Live decision metrics require the latest 200 provider rows to be complete
