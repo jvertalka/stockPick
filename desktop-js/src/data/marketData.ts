@@ -92,7 +92,13 @@ export type DailyBarAdjustmentSummary = {
   priceBasis: 'adjusted-total-return'
   source: 'yahoo-chart-adjclose'
   sourceField: 'chart.result[0].indicators.adjclose[0].adjclose'
-  /** Timestamped rows returned by Yahoo before any local validation. */
+  /**
+   * Timestamped rows returned by Yahoo before any local validation, minus the
+   * in-progress session row counted below. A row for a session that has not
+   * finished yet is not evidence we asked for and never got; it is a row that
+   * does not exist yet, so it stays out of the coverage denominator instead of
+   * reading as a hole in the history.
+   */
   sourceRows: number
   /** Source rows rejected because timestamp or raw OHLCV was invalid/missing. */
   invalidRawBars: number
@@ -102,6 +108,13 @@ export type DailyBarAdjustmentSummary = {
   /** All rejected source rows, including invalid raw data and missing adjclose. */
   rejectedBars: number
   coveragePct: number
+  /**
+   * How many trailing rows were dropped because the exchange's own session
+   * block said their session was still running at parse time. It is 0 or 1 —
+   * only ever the last row — and it keeps the exclusion visible instead of
+   * letting a bar quietly disappear.
+   */
+  excludedInProgressSessionBars: number
 }
 
 /** Array-compatible result with auditable Yahoo adjustment coverage. */
@@ -113,6 +126,19 @@ type YahooChartResponse = {
   chart?: {
     result?: Array<{
       timestamp?: number[]
+      /**
+       * Yahoo's own description of the instrument's trading day. The regular
+       * session bounds are epoch seconds, already per-exchange and already
+       * correct for daylight saving, which is why the open-session test below
+       * reads them from the response instead of guessing from a local clock.
+       * Everything here is optional: Yahoo does not always send it, and a
+       * response that omits it must keep every bar it came with.
+       */
+      meta?: {
+        currentTradingPeriod?: {
+          regular?: { start?: number; end?: number }
+        }
+      }
       indicators?: {
         quote?: Array<{
           open?: Array<number | null>
@@ -150,6 +176,7 @@ function withAdjustmentSummary(
   sourceRows: number,
   eligibleRawBars: number,
   invalidRawBars: number,
+  excludedInProgressSessionBars = 0,
 ): DailyBarSeries {
   const adjustedBars = bars.length
   return Object.assign(bars, {
@@ -164,16 +191,98 @@ function withAdjustmentSummary(
       missingAdjustedBars: Math.max(0, eligibleRawBars - adjustedBars),
       rejectedBars: Math.max(0, sourceRows - adjustedBars),
       coveragePct: sourceRows > 0 ? (adjustedBars / sourceRows) * 100 : 0,
+      excludedInProgressSessionBars,
     },
   })
+}
+
+/** A plain JSON object, or null for anything else. Yahoo's payload is
+ * untrusted text, so every level of the session block is checked before it is
+ * read. An array is not an object here: it cannot carry the named fields the
+ * session test needs. */
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null
+}
+
+/**
+ * True only when Yahoo's own session block says this instrument's regular
+ * trading session is open at [nowMs] AND the bar at [barTimestampMs] falls
+ * inside that same session — which is how a daily bar for a day that has not
+ * finished yet shows up, since Yahoo stamps each daily bar with its session's
+ * open time.
+ *
+ * The session bounds come from the response rather than from a clock here on
+ * purpose: they are per-exchange and already correct for daylight saving.
+ * Anything missing or malformed answers false, so a response without usable
+ * metadata keeps every bar it came with. Missing metadata must never cost us
+ * data.
+ *
+ * This is the exact rule the Dart backend applies in
+ * `_isBarFromOpenRegularSession`. The two layers must agree condition for
+ * condition, or the backend and this desktop layer would report a different
+ * newest price for the same symbol at the same instant.
+ */
+// Longest regular session any real exchange runs is about 8.5 hours (London
+// 08:00-16:30, Frankfurt and Paris 09:00-17:30); the US names here run 6.5, and
+// a half day 3.5. Twelve hours clears all of them while staying far short of a
+// whole day, which is what makes a multi-day "session" impossible to believe.
+// A 24-hour crypto or FX window is rejected on purpose: this universe is US
+// stocks and ETFs, and rejection only ever means no bar is dropped.
+const MAX_REGULAR_SESSION_MS = 12 * 60 * 60 * 1000
+// A window under half an hour is degenerate metadata, not a trading day.
+const MIN_REGULAR_SESSION_MS = 30 * 60 * 1000
+
+function isBarFromOpenRegularSession(
+  rawMeta: unknown,
+  barTimestampMs: number,
+  nowMs: number,
+): boolean {
+  const meta = asRecord(rawMeta)
+  if (!meta) return false
+  const tradingPeriod = asRecord(meta.currentTradingPeriod)
+  if (!tradingPeriod) return false
+  const regular = asRecord(tradingPeriod.regular)
+  if (!regular) return false
+  const start = regular.start
+  const end = regular.end
+  if (typeof start !== 'number' || typeof end !== 'number') return false
+  const startMs = start * 1000
+  const endMs = end * 1000
+  if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) return false
+  // The window must last like a real trading session before we believe it.
+  // Without this, a degenerate start (0, or any far-past second) paired with a
+  // plausible end stretches the "open session" back for years, and a bar that
+  // finished days ago matches it and gets deleted. Rejecting a window only ever
+  // means no bar is dropped, so a generous bound costs nothing. These two
+  // numbers mirror _kMinRegularSessionMs / _kMaxRegularSessionMs in
+  // tool/backend_cache_server.dart and must stay in step with them: the two
+  // parsers have to agree on the newest price or the product contradicts itself.
+  const sessionLengthMs = endMs - startMs
+  if (sessionLengthMs < MIN_REGULAR_SESSION_MS || sessionLengthMs > MAX_REGULAR_SESSION_MS) {
+    return false
+  }
+  const sessionIsOpenNow = nowMs >= startMs && nowMs < endMs
+  if (!sessionIsOpenNow) return false
+  // Only a bar stamped inside the open session counts. A halted or stale
+  // symbol whose newest bar is days old is left completely alone.
+  return barTimestampMs >= startMs && barTimestampMs <= endMs
 }
 
 /**
  * Parse Yahoo chart bars fail-closed for research use: a row without a valid
  * adjclose is excluded instead of silently substituting the raw close. The
  * raw fields remain attached to every accepted bar for live-price display.
+ *
+ * [nowMs] is the instant the session test is made against. It defaults to the
+ * current clock and is a parameter only so tests can hold a session open or
+ * closed on purpose.
  */
-export function parseYahooDailyBars(payload: YahooChartResponse | null): DailyBarSeries {
+export function parseYahooDailyBars(
+  payload: YahooChartResponse | null,
+  nowMs: number = Date.now(),
+): DailyBarSeries {
   const result = payload?.chart?.result?.[0]
   const timestamps = result?.timestamp
   const quote = result?.indicators?.quote?.[0]
@@ -191,10 +300,31 @@ export function parseYahooDailyBars(payload: YahooChartResponse | null): DailyBa
     previousTimestamp = timestamp as number
   }
 
+  // Yahoo keeps serving the session that is running RIGHT NOW as if it were a
+  // finished daily bar, and its open/high/low/close come from update paths
+  // that have not reconciled yet: mid-session a symbol can report an open
+  // above its own high. Drop that last row whenever the exchange's own
+  // metadata says its regular session is still open, whether or not the
+  // half-finished prices happen to look sane at this second. Excluding it only
+  // when it looks wrong is exactly what made scoreable coverage churn between
+  // refreshes. The backend applies the same rule to the bars it stores, so
+  // both layers name the same last completed close.
+  let excludedInProgressSessionBars = 0
+  const lastIndex = timestamps.length - 1
+  if (
+    lastIndex >= 0 &&
+    isBarFromOpenRegularSession(result?.meta, (timestamps[lastIndex] ?? Number.NaN) * 1000, nowMs)
+  ) {
+    excludedInProgressSessionBars = 1
+  }
+  // The excluded row leaves the series entirely: it is not an invalid row and
+  // it is not a coverage hole, so it is not counted as either.
+  const rowCount = timestamps.length - excludedInProgressSessionBars
+
   const bars: DailyBar[] = []
   let eligibleRawBars = 0
   let invalidRawBars = 0
-  for (let i = 0; i < timestamps.length; i++) {
+  for (let i = 0; i < rowCount; i++) {
     const timestamp = timestamps[i]
     const date = new Date((timestamp ?? Number.NaN) * 1000)
     const rawClose = quote.close?.[i]
@@ -253,7 +383,13 @@ export function parseYahooDailyBars(payload: YahooChartResponse | null): DailyBa
       adjustmentSource: 'yahoo-chart-adjclose',
     })
   }
-  return withAdjustmentSummary(bars, timestamps.length, eligibleRawBars, invalidRawBars)
+  return withAdjustmentSummary(
+    bars,
+    rowCount,
+    eligibleRawBars,
+    invalidRawBars,
+    excludedInProgressSessionBars,
+  )
 }
 
 /** Yahoo encodes class-share separators with a dash (BRK-B), while the
