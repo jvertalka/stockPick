@@ -196,8 +196,18 @@ class BackendCacheServer {
       // three-strike no-progress break below is what actually ends warmup.
       // 40 proved too small in practice: a fully stale 2,500-name universe
       // under provider throttling landed only ~35-45 names per pass and the
-      // budget ran out at 2055/2500 while still progressing.
-      for (var pass = 1; pass <= 150; pass++) {
+      // budget ran out at 2055/2500 while still progressing. The ceiling now
+      // scales with the universe instead of staying pinned at 150, because
+      // the generated catalog (see tool/generate_expanded_universe.dart)
+      // grew the universe to roughly 6,000 names: at the measured ~35 names
+      // per throttled pass a fully stale universe needs about
+      // universe/35 passes, so the backstop is double that with 150 as the
+      // floor that already proved out for 2,500 names.
+      final passBackstop = math.max(
+        150,
+        (kDefaultSymbolUniverse.length / 35).ceil() * 2,
+      );
+      for (var pass = 1; pass <= passBackstop; pass++) {
         if (_stopping) return;
         final result =
             await DecisionUniverseService(

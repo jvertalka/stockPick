@@ -1,3 +1,5 @@
+import 'expanded_symbol_universe.dart';
+
 class DefaultSymbolBucket {
   const DefaultSymbolBucket({
     required this.sector,
@@ -64,7 +66,23 @@ class DefaultSymbolProfile {
   String get displayName => isEtf ? '$symbol ETF' : symbol;
 }
 
-const int kDefaultStockUniverseLimit = 1500;
+// This floor must stay ABOVE the size of the effective universe (hand-built
+// plus generated buckets, 5,343 symbols as of 2026-09-09), because
+// market_data_configuration.dart uses it as the minimum stock universe limit
+// and anything smaller silently truncates fixture and configuration paths
+// below the catalog the backend actually scores. Nothing throws when the
+// limit is hit: the symbol list is simply cut short with `.take(limit)` in
+// alpha_vantage_market_feed_provider.dart and fixture_market_repository.dart,
+// so a universe that outgrows this number loses its tail with no error, no
+// warning, and no log line. The only defence is keeping real room here.
+//
+// 8,000 is that room. The generator's own caps allow at most 3,000 stocks
+// plus 500 ETFs, and the hand-curated catalog holds 2,500, so 6,000 was
+// exactly the ceiling those numbers can reach - one extra listing anywhere
+// would have started silently dropping names. 8,000 clears that ceiling by
+// 2,000, which is enough for the curated catalog to roughly double or for a
+// generator cap to be raised, without anyone having to remember this file.
+const int kDefaultStockUniverseLimit = 8000;
 
 const Set<String> kCoreEtfSymbols = {
   'SPY',
@@ -102,7 +120,11 @@ const Set<String> kCoreEtfSymbols = {
   'EEM',
 };
 
-const List<DefaultSymbolBucket> kDefaultSymbolBuckets = [
+// The hand-curated catalog. Every entry below was placed by hand and must
+// survive regeneration of the expanded catalog byte-for-byte; the generator
+// in tool/generate_expanded_universe.dart never touches this list and always
+// excludes any symbol that already appears here.
+const List<DefaultSymbolBucket> kHandBuiltSymbolBuckets = [
   DefaultSymbolBucket(
     sector: 'Technology',
     industry: 'Mega-cap platforms',
@@ -2136,6 +2158,16 @@ const List<DefaultSymbolBucket> kDefaultSymbolBuckets = [
   ),
 ];
 
+// The effective scoring universe: the hand-built buckets above followed by
+// the generated catalog that tool/generate_expanded_universe.dart emits into
+// expanded_symbol_universe.dart. The hand-built entries come first, and every
+// lookup in this file keeps first-wins semantics, so a curated profile always
+// beats a generated one if the same symbol ever appeared in both.
+const List<DefaultSymbolBucket> kDefaultSymbolBuckets = [
+  ...kHandBuiltSymbolBuckets,
+  ...kGeneratedSymbolBuckets,
+];
+
 List<String> get kDefaultSymbolUniverse {
   final seen = <String>{};
   final symbols = <String>[];
@@ -2151,32 +2183,49 @@ List<String> get kDefaultSymbolUniverse {
   return symbols;
 }
 
+// Built once on first use and reused for every later lookup. The old code
+// walked every bucket and scanned every symbol list per call, which was fine
+// at a few hundred symbols but became the hot path once the generated catalog
+// pushed the universe to roughly 6,000 names with hundreds of buckets. The
+// index preserves the exact first-wins semantics of the old scan because the
+// buckets are visited in declaration order and an already-seen symbol is
+// never overwritten.
+Map<String, DefaultSymbolProfile>? _profileIndexCache;
+
+Map<String, DefaultSymbolProfile> _buildProfileIndex() {
+  final index = <String, DefaultSymbolProfile>{};
+  for (final bucket in kDefaultSymbolBuckets) {
+    for (final raw in bucket.symbols) {
+      final symbol = raw.trim().toUpperCase();
+      if (symbol.isEmpty || index.containsKey(symbol)) {
+        continue;
+      }
+      index[symbol] = DefaultSymbolProfile(
+        symbol: symbol,
+        sector: bucket.sector,
+        industry: bucket.industry,
+        templateTicker: bucket.templateTicker,
+        isEtf: bucket.isEtf,
+        momentumBias: bucket.momentumBias,
+        qualityBias: bucket.qualityBias,
+        valuationBias: bucket.valuationBias,
+        riskBias: bucket.riskBias,
+        growthBias: bucket.growthBias,
+        defensiveBias: bucket.defensiveBias,
+        creditBias: bucket.creditBias,
+        rateBias: bucket.rateBias,
+      );
+    }
+  }
+  return index;
+}
+
 DefaultSymbolProfile? defaultSymbolProfileFor(String rawSymbol) {
   final symbol = rawSymbol.trim().toUpperCase();
   if (symbol.isEmpty) {
     return null;
   }
-  for (final bucket in kDefaultSymbolBuckets) {
-    if (!bucket.symbols.contains(symbol)) {
-      continue;
-    }
-    return DefaultSymbolProfile(
-      symbol: symbol,
-      sector: bucket.sector,
-      industry: bucket.industry,
-      templateTicker: bucket.templateTicker,
-      isEtf: bucket.isEtf,
-      momentumBias: bucket.momentumBias,
-      qualityBias: bucket.qualityBias,
-      valuationBias: bucket.valuationBias,
-      riskBias: bucket.riskBias,
-      growthBias: bucket.growthBias,
-      defensiveBias: bucket.defensiveBias,
-      creditBias: bucket.creditBias,
-      rateBias: bucket.rateBias,
-    );
-  }
-  return null;
+  return (_profileIndexCache ??= _buildProfileIndex())[symbol];
 }
 
 bool isCoreEtfSymbol(String rawSymbol) {
