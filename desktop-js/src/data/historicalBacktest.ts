@@ -28,7 +28,7 @@ export type { DailyBar }
  * or label construction change. Same-named features from another version are
  * not evidence-compatible with this serving pipeline. */
 export const HISTORICAL_FEATURE_PIPELINE_VERSION =
-  'finance-oracle-feature-pipeline-v3-adjusted-source-audit-2026-07-10' as const
+  'finance-oracle-feature-pipeline-v4-company-descriptors-2026-09-10' as const
 
 /** One-way effective trading cost (bps) for a name of the given market
  * cap, per the size-tiered table (Frazzini-Israel-Moskowitz 2018;
@@ -445,9 +445,72 @@ export const HISTORICAL_FEATURE_NAMES: FeatureNames = [
     'fund_altman_z',
     'fund_naive_dd',
   ],
+  // ---------------------------------------------------------------------
+  // Company-type descriptors (3) — added 2026-09-10 as CANDIDATES only. They
+  // are appended AFTER the fundamentals block on purpose, so not one existing
+  // feature changes position and the saved model bundle keeps resolving its
+  // columns by name exactly as before. The FDR screen decides whether any of
+  // them ship, the same as every other candidate here.
+  //
+  // The owner asked for variables that say what KIND of company a name is.
+  // The obvious answer would have been the sector label, and this repository
+  // does hold one for every symbol - but every single one of the 1,359
+  // backtest names draws its label from the hand-curated half of the universe
+  // file, which is one person's 2026 judgement about companies whose whole
+  // return history is already known, and which includes outcome-flavoured
+  // buckets such as "Speculative Growth". Stamping that onto a 2013 sample
+  // tells the model how the story ended. The SEC's own numeric industry code
+  // would be the defensible point-in-time answer, and the universe generator
+  // already fetches it per company and caches it - but it immediately folds it
+  // down into one of those coarse sector strings and keeps only that, so the
+  // number itself never reaches this file. So the descriptors below are read
+  // out of the price and filing record that already existed at each sample's
+  // own date instead:
+  //
+  //   payout_yield_252d - trailing 12-month cash-distribution yield, taken
+  //   from the ratio of two historical adjustment factors. Fama-French (2001,
+  //   "Disappearing Dividends") establish payers and non-payers as
+  //   structurally different kinds of firm; payout level is also a duration
+  //   descriptor. It is the only company-type number that exists for the ~286
+  //   funds in the universe, which otherwise carry no filings at all.
+  //
+  //   filing_cadence_3y - distinct SEC filing dates over the trailing three
+  //   years, per year. A US domestic filer reports about four times a year, a
+  //   foreign private issuer once or twice, a fund never. It is the only
+  //   proxy available here for domicile and depositary-receipt status, and
+  //   disclosure frequency is the information-environment variable behind
+  //   post-earnings drift (Bernard-Thomas 1989).
+  //
+  //   capital_intensity_3y - capital spending as a share of revenue over the
+  //   latest annual periods on file. This is the company type stated as a
+  //   number rather than a label: utilities, energy producers and chip makers
+  //   are capital-hungry, software and services are not, and unlike a sector
+  //   label it also catches the asset-light firm sitting inside a heavy
+  //   sector (Titman-Wei-Xie 2004; Fama-French 2015).
+  //
+  // Three descriptors and no more. Five were drafted and two were withdrawn
+  // the same day, because each one only restated something the pipeline
+  // already had. A "does this name file with the SEC" flag was the same fact
+  // as sample.pitFundamentalsObserved, which buildHistoricalDataset already
+  // records from the identical lookup at the identical date, and it was
+  // already implied by filing_cadence_3y, which reads zero exactly when no
+  // filing landed in three years. A "is it losing money" flag was a fixed
+  // threshold on fund_net_margin, whose clamp keeps the sign, so the two
+  // columns agreed everywhere the margin was observed; a depth-three boosted
+  // tree can already put a split at zero, and the argument for handing a
+  // model a ready-made indicator is an argument about straight-line models.
+  // Six peer-relative columns were withdrawn as well - the note further down
+  // this file, where their code used to live, says why and what would bring
+  // them back.
+  'payout_yield_252d',
+  'filing_cadence_3y',
+  'capital_intensity_3y',
 ]
 
 export const FUNDAMENTAL_FEATURE_COUNT = 13
+/** Number of company-type descriptor columns appended after the
+ * fundamentals block. */
+export const COMPANY_DESCRIPTOR_FEATURE_COUNT = 3
 /** Sentinel for fund_filing_age when a name has no usable filing at the
  * sample date (ETF, non-filer, or pre-coverage history). */
 export const FUNDAMENTAL_MISSING_AGE_DAYS = 400
@@ -618,6 +681,35 @@ export function computeFeaturesAtDate(
   }
   const volOfVol60 = volWindows.length >= 3 ? stdOf(volWindows) : 0
 
+  // Trailing 12-month cash-distribution yield, read straight off the two
+  // adjustment factors the price adapter already stores on every bar. A bar's
+  // factor is its total-return close divided by its raw exchange close, so it
+  // carries every distribution paid AFTER that bar. Dividing the recent bar's
+  // factor by the year-old bar's factor cancels everything that happened after
+  // the recent bar and leaves only what was paid in between. That cancellation
+  // is what makes this causal even though the factors themselves are
+  // back-adjusted from today: a dividend paid next month multiplies both
+  // factors by the same number and drops straight out of the ratio.
+  //
+  // The cancellation of SPLITS rests on one assumption about the provider,
+  // namely that Yahoo's raw close series is already split-adjusted. It is, in
+  // the chart interface this pipeline uses, but that is a fact about somebody
+  // else's data rather than a guarantee. If it ever stopped being true, a
+  // ten-for-one split would read as a nine-hundred-percent distribution, so
+  // the value is clamped to a plausible zero-to-twenty-percent band below and
+  // the clamp bounds the damage rather than hiding it.
+  const adjustmentFactorBarsBack = (barsBack: number): number | null => {
+    const bar = window[window.length - 1 - barsBack]
+    const factor = bar?.adjustmentFactor
+    return typeof factor === 'number' && Number.isFinite(factor) && factor > 0 ? factor : null
+  }
+  const factorNow = adjustmentFactorBarsBack(0)
+  const factorOneYearAgo = adjustmentFactorBarsBack(252)
+  const payoutYield252 =
+    factorNow != null && factorOneYearAgo != null
+      ? (factorNow / factorOneYearAgo - 1) * 100
+      : null
+
   return [
     // Momentum (5)
     ret(5),
@@ -673,6 +765,12 @@ export function computeFeaturesAtDate(
       vol252Annualized: vol252,
       return252Pct: ret(252),
     }),
+    // Company-type descriptors (3) — every one of them reads only the price
+    // and filing record that existed at this bar's date, and every one of
+    // them can be computed for a single name on its own, which is what the
+    // live scoring path has to work with.
+    clampTo(payoutYield252, 0, 20),
+    ...filingDescriptorsAt(fundamentals ?? null, bars[dateIndex].date),
   ]
 }
 
@@ -727,6 +825,11 @@ type FundamentalSnapshot = {
   ttmOperatingIncome: number | null
   shortTermDebt: number | null
   longTermDebt: number | null
+  /** Capital spending as a percentage of revenue across the latest annual
+   * periods on file at this filing date (up to three years). Deliberately a
+   * multi-year figure so it describes the business model rather than one
+   * year's spending decision. Null when fewer than two years line up. */
+  capexToRevenue3y: number | null
 }
 
 export class FundamentalsTimeline {
@@ -759,6 +862,23 @@ export class FundamentalsTimeline {
 
   get size(): number {
     return this.snapshots.length
+  }
+
+  /** How many separate filings landed in the `years` before `dateMs`,
+   * expressed per year. Only filings dated STRICTLY BEFORE the sample date
+   * count, the same one-day lag the snapshot lookup above uses, so this can
+   * never see a statement the market had not yet read. A US company that
+   * reports quarterly lands near four, a foreign private issuer near one or
+   * two, and anything that files nothing at all reads zero. */
+  filingsPerYearBefore(dateMs: number, years = 3): number {
+    if (!Number.isFinite(dateMs) || years <= 0) return 0
+    const windowStart = dateMs - years * 365.25 * 86_400_000
+    let count = 0
+    for (const snapshot of this.snapshots) {
+      if (snapshot.filed >= dateMs) break  // snapshots are sorted by filed date
+      if (snapshot.filed >= windowStart) count++
+    }
+    return count / years
   }
 
   /** Build from the backend's /fundamentals/history payload: one snapshot
@@ -867,6 +987,35 @@ export class FundamentalsTimeline {
           ? (ttmNi / lastEquity) * 100
           : null
 
+      // Capital intensity over the latest annual periods visible at this
+      // filing date. Capex years are matched to revenue years by period end
+      // rather than just taking the last three of each, because a company
+      // that tags capex in some years and not others would otherwise divide
+      // three years of spending by two years of sales. At least two matched
+      // years are required, so one odd reporting year cannot define the
+      // company's type on its own.
+      let capexToRevenue3y: number | null = null
+      {
+        const annualRevenue = rev.filter((row) => row.span === 'annual').slice(-3)
+        const annualCapex = cap.filter((row) => row.span === 'annual')
+        let capexSum = 0
+        let revenueSum = 0
+        let matchedYears = 0
+        for (const revenueRow of annualRevenue) {
+          if (!(revenueRow.value > 0)) continue
+          const capexRow = annualCapex.find(
+            (row) => Math.abs(row.end - revenueRow.end) <= 5 * 86_400_000,
+          )
+          if (!capexRow) continue
+          capexSum += Math.abs(capexRow.value)
+          revenueSum += revenueRow.value
+          matchedYears++
+        }
+        if (matchedYears >= 2 && revenueSum > 0) {
+          capexToRevenue3y = (capexSum / revenueSum) * 100
+        }
+      }
+
       const lastShares = lastInstant(sh)
       let shareChangeYoY: number | null = null
       if (sh.length >= 2 && lastShares != null && lastShares > 0) {
@@ -898,6 +1047,7 @@ export class FundamentalsTimeline {
         ttmOperatingIncome: ttmOf(opInc),
         shortTermDebt: lastInstant(stDebt),
         longTermDebt: lastInstant(ltDebt),
+        capexToRevenue3y,
       })
     }
     return new FundamentalsTimeline(snapshots)
@@ -1086,6 +1236,38 @@ function fundamentalFeaturesAt(
   ]
 }
 
+/**
+ * The two company-type descriptors that come out of the SEC filing record:
+ * how often the name files, and how capital-hungry its business is.
+ *
+ * Both read only filings whose FILED date is strictly before the sample date,
+ * so they carry exactly the same point-in-time guarantee as the thirteen
+ * fundamental features above, and a filing that lands tomorrow can never
+ * change what this returns today.
+ *
+ * The counting descriptor returns a real zero rather than "missing" for a fund
+ * or any other non-filer. That is not a silent zero standing in for absent
+ * data: "this thing files no financial statements" is an observed fact about
+ * what kind of thing it is, and it is the fact the model needs. The measured
+ * descriptor returns NaN when it genuinely cannot be computed, and NaN flows
+ * into the same causal per-date median imputation every other feature uses, so
+ * a gap is recorded on the sample's imputed mask instead of masquerading as a
+ * real reading.
+ */
+function filingDescriptorsAt(
+  fundamentals: FundamentalsTimeline | null,
+  isoDate: string,
+): number[] {
+  const dateMs = Date.parse(isoDate)
+  if (!Number.isFinite(dateMs)) {
+    return [Number.NaN, Number.NaN]
+  }
+  const snapshot = fundamentals ? fundamentals.at(dateMs) : null
+  const filingsPerYear = fundamentals ? fundamentals.filingsPerYearBefore(dateMs, 3) : 0
+  const capitalIntensity = clampTo(snapshot?.capexToRevenue3y ?? null, 0, 200)
+  return [filingsPerYear, capitalIntensity]
+}
+
 /** In-module cache: successful timelines persist; transient failures are
  * evicted so backend/SEC recovery heals the live feature path. */
 const fundamentalsCache = new Map<string, Promise<FundamentalsTimeline | null>>()
@@ -1161,6 +1343,19 @@ export type BacktestDatasetProvenance = {
         delistedSecuritySource: string
         delistingReturnSource: string
       }
+  /** Where the company-type descriptors came from, recorded so an auditor
+   * never has to take it on trust. Optional only so that model artifacts
+   * written before these columns existed still validate; every dataset this
+   * module builds fills it in. */
+  companyDescriptors?: {
+    basis: 'derived-point-in-time-from-price-and-filing-history'
+    /** Present-day sector and industry labels are deliberately unused. The
+     * only labels this repository holds for the backtest universe are 2026
+     * hand-curated judgements about companies whose returns are already known,
+     * and the SEC's numeric industry code is not stored here at all. */
+    presentDaySectorLabelsUsed: false
+    limitation: string
+  }
   requestedRange: '1y' | '2y' | '5y' | '10y' | '15y' | 'max'
   fetchedRange: 'max'
   cadenceTradingDays: number
@@ -1268,6 +1463,55 @@ export type DatasetBuildResult = {
     }>
   }
 }
+
+/* =========================================================================
+   Peer-relative company-type features — REMOVED 2026-09-10, and this note is
+   here so nobody deletes it and builds the same thing again badly.
+
+   WHAT USED TO BE HERE. Six extra columns, each one an existing feature minus
+   the median of that same feature among companies of the same kind on the same
+   date: volatility, momentum, illiquidity, leverage, net margin and earnings
+   yield. The idea behind them is right, and it is worth keeping. Asking "is
+   this company unusual for its type" is a better question than "is this
+   company unusual", a bank and a software firm are not the same kind of thing
+   at the same leverage reading, and centring on a same-date median is one of
+   the few ways to encode company type that cannot leak the future, because
+   nothing is fitted on one date and carried into another.
+
+   WHY THEY WERE PULLED. Two things had to be true for them to work, and
+   neither was.
+
+   First, we could not tell one kind of company from another. The grouping key
+   was whether a name files with the SEC plus which third of that date's
+   capital-spending range it fell into. That puts a bank, a software firm and a
+   biotech in the same bucket whenever they happen to spend alike, so the six
+   columns were not measuring "unusual for its type" at all. Getting this right
+   needs a real point-in-time classification of what the company actually does.
+   The honest one is the SEC's own numeric industry code, which this repository
+   already fetches per company while building the universe and then throws
+   away: the generator caches the number, folds it into a coarse sector string,
+   and keeps only the string. Carrying the number through to the fundamentals
+   record is the work. Note the trap that made us reach for a substitute in the
+   first place: the sector labels stored here are present-day hand judgements
+   about companies whose returns are already known, so stamping them onto a
+   2013 sample tells the model how the story ended. Those must never be used,
+   no matter how convenient.
+
+   Second, we could not serve them. These were the only features in this file
+   that need a whole cross-section of companies on one date to compute. The
+   live app scores one name at a time and has no cross-section, so a served
+   model would have found these columns simply unavailable and filled them with
+   a neutral stand-in — a different quantity from the one it was trained on,
+   which is the train-versus-serve gap this project has already paid for once.
+   Closing it means either widening the scoring path to score the warm universe
+   together, or freezing a per-group median table into the saved model bundle
+   next to the feature means and standard deviations it already stores.
+
+   WHEN TO BRING THEM BACK. When the point-in-time industry code is stored
+   alongside the fundamentals, and when the scoring path can produce whatever
+   the grouping needs for a single name. Until both hold, adding these columns
+   trains a model on numbers the live app cannot reproduce.
+   ========================================================================= */
 
 /**
  * Replace NaN fundamental values with the cross-sectional MEDIAN of the
@@ -1577,7 +1821,13 @@ export async function buildHistoricalDataset(
   let samplesWithPointInTimeSnapshot = 0
   let observedFundamentalFeatureCells = 0
   const filingAgeIndex = HISTORICAL_FEATURE_NAMES.indexOf('fund_filing_age')
-  const fundamentalStartIndex = HISTORICAL_FEATURE_NAMES.length - FUNDAMENTAL_FEATURE_COUNT
+  // Located by name rather than by counting back from the end of the list.
+  // The company-type descriptors are appended after the fundamentals block, so
+  // "the last thirteen columns" stopped being the fundamentals; the coverage
+  // count below must stay pinned to the thirteen real fundamental columns or
+  // it would start crediting descriptor cells as observed fundamentals.
+  const fundamentalStartIndex = HISTORICAL_FEATURE_NAMES.indexOf('fund_revenue_growth_yoy')
+  const fundamentalEndIndex = fundamentalStartIndex + FUNDAMENTAL_FEATURE_COUNT
 
   for (let t = 0; t < tickers.length; t++) {
     const ticker = tickers[t]
@@ -1650,7 +1900,7 @@ export async function buildHistoricalDataset(
         fundamentals?.at(Date.parse(bars[i].date)) != null && filingAgeIndex >= 0
       if (hasPointInTimeSnapshot) {
         samplesWithPointInTimeSnapshot++
-        for (let featureIndex = fundamentalStartIndex; featureIndex < features.length; featureIndex++) {
+        for (let featureIndex = fundamentalStartIndex; featureIndex < fundamentalEndIndex; featureIndex++) {
           if (Number.isFinite(features[featureIndex])) observedFundamentalFeatureCells++
         }
       }
@@ -1684,10 +1934,10 @@ export async function buildHistoricalDataset(
     perTickerSummary.push({ ticker, bars: bars.length, samplesGenerated: generated })
   }
 
-  // Impute missing fundamentals with per-date cross-sectional medians
-  // (must run BEFORE normalization so NaNs never reach the Z-scores),
-  // then tag survivorship cohorts, then normalize, then demean the
-  // forward-return targets cross-sectionally (relative-alpha target).
+  // Impute missing values with per-date cross-sectional medians (must run
+  // BEFORE normalization so NaNs never reach the Z-scores), then tag
+  // survivorship cohorts, then normalize, then demean the forward-return
+  // targets cross-sectionally (relative-alpha target).
   imputeMissingWithDateMedians(samples)
   assignSurvivorshipCohorts(samples)
   applyCrossSectionalNormalization(samples)
@@ -1732,6 +1982,12 @@ export async function buildHistoricalDataset(
         constituentEffectiveDateField: null,
         delistedSecuritySource: null,
         delistingReturnSource: null,
+      },
+      companyDescriptors: {
+        basis: 'derived-point-in-time-from-price-and-filing-history',
+        presentDaySectorLabelsUsed: false,
+        limitation:
+          'No sector or industry label is used. The only labels this repository holds for these symbols are 2026 hand-curated judgements about companies whose returns are already known, so applying them backwards would tell a past sample how its story ended. The SEC numeric industry code would be a defensible point-in-time answer, and the universe generator fetches it, but it is collapsed into a coarse sector string and the number is never kept.',
       },
       requestedRange: range,
       fetchedRange: 'max',
@@ -3389,6 +3645,15 @@ export function runWalkForwardBacktest(
  * visibility (listing age). Annotations are the measured mean per-date IC.
  */
 export const PRUNED_FEATURE_NAMES: string[] = [
+  // UNCHANGED by the 2026-09-10 company-descriptor work, deliberately. Three
+  // new candidates were added to HISTORICAL_FEATURE_NAMES (48 -> 51) and the
+  // screen has not been re-run against them yet, so nothing here was
+  // hand-picked in or out. One thing to hold on to when it is re-run: a wider
+  // candidate list tightens every existing keeper's acceptance threshold on
+  // the Benjamini-Hochberg arithmetic alone, so a keeper sitting near the edge
+  // - fund_altman_z is annotated below as exactly that - can fail without its
+  // own evidence changing at all.
+  //
   // Refreshed 2026-07-07 from the 48-feature FDR screen (q=0.1, bagged
   // walk-forward): 13/48 clear control. Two prior keepers FAILED the wider
   // screen and drop (fund_revenue_growth_yoy, last_close_over_sma_20); two
