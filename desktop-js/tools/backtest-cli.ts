@@ -8,7 +8,7 @@
  * Build + run (from desktop-js/):
  *   npx esbuild tools/backtest-cli.ts --bundle --platform=node --format=esm \
  *     --define:import.meta.env='{}' --outfile=tools/backtest-cli.mjs
- *   node --max-old-space-size=13312 tools/backtest-cli.mjs --checkpoint <dir>
+ *   node --max-old-space-size=17408 tools/backtest-cli.mjs --checkpoint <dir>
  *
  * Memory: the in-process bar cache (marketData.ts) keeps every name's
  * 40-year history for the life of the process, the dataset holds every row
@@ -16,16 +16,30 @@
  * keeps its per-row detail. Nothing is released, so the need grows with the
  * number of names. Two smoke runs on 2026-09-16 (40 years, 359 windows,
  * price-only columns) peaked at 355 MB for 15 names and 446 MB for 25, which
- * is about 219 MB fixed plus 9.1 MB per name. For the full 1,073-name
- * universe that projects to about 9,983 MB (9.7 GB), and with a quarter of
- * headroom rounded up to a whole gigabyte the flag to pass is
- *   --max-old-space-size=13312
- * (a 12-name smoke on the same day projected 328 MB and peaked at 327 MB).
+ * is about 219 MB fixed plus 9.1 MB per name. That line covers the WINDOW
+ * LOOP only, the one phase the CLI sampled: the 200-name smoke the same day
+ * projected 2,039 MB on it and the CLI saw 1,741 MB, but the operating
+ * system's peak working set for the process was 2,864 MB, reached after the
+ * loop (served-model training, regime labelling, gate report), which was
+ * never sampled. 2,864 / 2,039 = 1.40, so the projection is the loop line
+ * times 1.4 (POST_LOOP_MEMORY_FACTOR in tools/preregistered-run.ts). For
+ * the 1,023 names the two ledgers leave fetchable (1,073 registered minus
+ * 50 excluded) the loop line gives about 9,528 MB, times 1.4 about
+ * 13,339 MB, and with a quarter of headroom rounded up to the next whole
+ * gigabyte the flag to pass is
+ *   --max-old-space-size=17408
  * Node's default ceiling is 2-4 GB, so the full run dies with "heap out of
- * memory" without it. The run prints the ceiling it actually got, the
- * projection for the universe it was given, and the exact flag, and warns
- * loudly at start when the projection is above the ceiling
- * (projectHeapNeed in tools/preregistered-run.ts holds the arithmetic).
+ * memory" without it. The run prints the machine's total and FREE memory,
+ * the ceiling it actually got, the projection for the universe it was
+ * given, and the exact flag to use, and ABORTS at start (a) when the
+ * projection is above the ceiling, because V8 slows sharply near its
+ * ceiling and a run of several hours can still die part-way through, and
+ * (b) when free memory is below the recommended heap, naming the shortfall,
+ * because the flag only raises node's own limit and a run that pages to
+ * disk for hours is no better than one that dies; --allow-low-heap runs
+ * anyway in either case. The post-loop phase is now sampled too (after the
+ * served models, the regime step and the report) and both peaks are
+ * printed and recorded, so the 1.4 can be replaced by a measurement.
  *
  * Nothing may go missing quietly. Before any data is fetched the runner asks
  * the backend's /health once and stops at once if it is down. A name whose
@@ -33,10 +47,56 @@
  * fundamentals request fails (as opposed to the backend saying the name files
  * nothing), and missing SPY history for the regime table each stop the run
  * with the names printed, unless --allow-missing is given, in which case the
- * run proceeds and the artifact's provenance lists what was dropped.
+ * run proceeds and the artifact's provenance lists what was dropped. So does
+ * a STUB: Yahoo answers HTTP 200 for some departed names with a series that
+ * is not their history (one bar, or a series that starts on 2026-07-17, or
+ * only a re-listed security's bars). The warm-up flags a registered name
+ * whose series starts after 2025-01-01, and any name with fewer than a
+ * year of bars on the full-history fetch, prints "STUB: <ticker> first bar
+ * <date>, <n> bars", and treats it like a fetch failure (classifyStubSeries
+ * in tools/preregistered-run.ts explains the two thresholds).
+ *
+ * Names Yahoo no longer serves are handled before that guard, from the two
+ * ledgers beside DEFAULT_BACKTEST_TICKERS (resolved 2026-09-16; 66 names). A
+ * name that left the market (EXCLUDED_UNFETCHABLE) is set aside before any
+ * fetch and recorded in the artifact as "registered but excluded" with the
+ * date and reason; a name that now trades under a new symbol
+ * (TICKER_RENAMES) is fetched under the successor and kept under its own
+ * symbol in the samples. Both outcomes are printed at start, and the
+ * excluded share is reported with the survivorship diagnostics, because
+ * those are companies that left the market during the window: the names
+ * that remain are more survivor-biased, not less. A name in neither ledger
+ * that still cannot be fetched is a real failure and stops the run as above.
+ *
+ * A symbol can also answer with the WRONG COMPANY: after the registered
+ * company left the market Yahoo handed its symbol to another one whose own
+ * chart is long enough to pass both stub rules (on 2026-09-16 PARA came
+ * back as Banzai International and B as Barrick Mining). So the run is
+ * pre-registered against an identity ledger, tools/registered_identity.json
+ * (the SEC CIK and the Yahoo names and first-trade date of every fetchable
+ * name on the snapshot date), and the warm-up compares each name's live SEC
+ * CIK (one fetch of the SEC ticker map per run) and the meta block of the
+ * chart it just fetched with that record. A different CIK, or with no CIK
+ * on either side a first-trade date more than 30 days away or a name that
+ * shares fewer than half its words, is printed as RECYCLED and stops the
+ * run; --allow-missing does NOT apply, because a wrong company is not a
+ * missing one. A new name under the same CIK is printed as an IDENTITY
+ * NOTE and allowed. One line sums it up: "identity: N checked, N matched,
+ * N renamed-in-place, N recycled" (checkIdentity in tools/preregistered-run.ts).
+ *
+ * With --checkpoint, the rename map, the excluded names with their dates and
+ * reasons, the attrition sentence and (after the warm-up) the stub list and
+ * the identity summary are written into <dir>/run.json before anything is
+ * fetched, so an auditor can tell from the checkpoint alone which universe
+ * the windows were scored on, even when --persist is later refused by a
+ * blocking gate.
  *
  * Flags, with the pre-registered defaults (each is printed at start):
- *   --allow-missing                   OFF by default; see above
+ *   --allow-missing                   OFF by default; see above (never covers a RECYCLED name)
+ *   --allow-low-heap                  run even when the heap ceiling is below the projection
+ *                                     or free memory is below the recommended heap
+ *   --warm-only                       stop after the price warm-up (ledgers printed and recorded,
+ *                                     stubs and fetch failures named); nothing is built or scored
  *   --range max                       bars per name (5y | 10y | 15y | max)
  *   --window-days 20                  trading days per test window
  *   --burn-in-years 10                training-only years before the first window
@@ -94,6 +154,7 @@ async function main() {
     fundamentalsFetchOutcome,
     indexSamples,
     labelStepsByRegime,
+    planUniverseFetch,
     pruneSampleFeatures,
     resolveWindowRule,
     runWalkForwardBacktest,
@@ -111,7 +172,7 @@ async function main() {
   const { dirname, resolve } = await import('node:path')
   const { fileURLToPath } = await import('node:url')
   const { getHeapStatistics } = await import('node:v8')
-  const { totalmem } = await import('node:os')
+  const { freemem, totalmem } = await import('node:os')
 
   /* ------------------------------------------------------------------ */
   /* Flags                                                               */
@@ -139,6 +200,13 @@ async function main() {
   // failed fundamentals request or missing SPY history stops the run with
   // the names printed; with it the run proceeds and records what it lost.
   const allowMissing = hasFlag('--allow-missing')
+  // The memory guard below aborts when the ceiling is under the projection
+  // or free memory is under the recommended heap; this flag runs anyway (a
+  // deliberate small-heap experiment, or a warm-up-only pass, say).
+  const allowLowHeap = hasFlag('--allow-low-heap')
+  // Stop after the price warm-up: the ledgers are printed and recorded and
+  // every stub or fetch failure is named, and nothing is built or scored.
+  const warmOnly = hasFlag('--warm-only')
   // A data failure is a different exit code from a bad flag (2), so a
   // wrapper script can tell "fix the command line" from "fix the backend".
   const abortRun = (headline: string, lines: string[] = []): never => {
@@ -247,8 +315,49 @@ async function main() {
   const etfUniverse = pre.resolveEtfUniverse(dartDataDir)
   const afterEtfs = excludeEtfs ? baseTickers.filter((ticker) => !etfUniverse.symbols.has(ticker)) : [...baseTickers]
   const etfsExcluded = baseTickers.length - afterEtfs.length
-  const tickers = limit > 0 ? afterEtfs.slice(0, limit) : [...afterEtfs]
+
+  /* ------------------------------------------------------------------ */
+  /* Universe: names Yahoo no longer serves                              */
+  /* ------------------------------------------------------------------ */
+  // The two ledgers beside DEFAULT_BACKTEST_TICKERS say which registered
+  // names left the market (set aside before any fetch, so the fail-loud
+  // guard below does not fire on a name whose fate is already known) and
+  // which now trade under a new symbol (fetched under the successor, kept
+  // under their own symbol in the samples). The dataset builder applies the
+  // same plan again on the registered list; the CLI plans here so it can
+  // print the outcome first and warm only the names that will be fetched.
+  //
+  // --limit N keeps the first N names that will actually be fetched, so
+  // "--limit 25" still means 25 scored companies. The registered universe
+  // of the run is then the prefix of the list those N names sit in, which
+  // keeps any excluded names inside that prefix on the record.
+  // Both lists are narrowed after the warm-up when --allow-missing lets a
+  // stub through: a stub must never reach the build (a re-listed security
+  // with enough bars would enter the dataset as a short-history name).
+  let registeredTickers = pre.registeredPrefixForLimit(afterEtfs, limit)
+  const plan = planUniverseFetch(registeredTickers)
+  // The names that are fetched and scored; each sample carries one of these.
+  let tickers = plan.fetch.map((entry) => entry.ticker)
+  const fetchSymbolByTicker = new Map(plan.fetch.map((entry) => [entry.ticker, entry.fetchedAs]))
+  const fetchSymbolOf = (ticker: string): string => fetchSymbolByTicker.get(ticker) ?? ticker
   const hyperparameters = { ...FROZEN_HYPERPARAMETERS }
+
+  /* ------------------------------------------------------------------ */
+  /* The identity ledger: which company each name is                     */
+  /* ------------------------------------------------------------------ */
+  // Read before anything else happens, so a missing or malformed ledger
+  // stops the run here, with nothing fetched. The check itself runs at the
+  // warm-up, name by name, against the SEC map fetched once below.
+  const identityPath = pre.registeredIdentityPath()
+  let identityLedger: import('./preregistered-run').RegisteredIdentityLedger
+  try {
+    identityLedger = pre.readRegisteredIdentityLedger(identityPath)
+  } catch (error) {
+    refuse((error as Error).message)
+  }
+  const identityOf = pre.identityByTicker(identityLedger!)
+  // The hash pins which version of the ledger this run was checked against.
+  const identitySha256 = pre.hashRegisteredIdentityLedger(identityPath)
 
   /* ------------------------------------------------------------------ */
   /* Print every setting before anything runs                            */
@@ -274,25 +383,68 @@ async function main() {
   console.log(`  --tickers-file       ${tickersFile ?? 'none (DEFAULT_BACKTEST_TICKERS)'}`)
   console.log(`  --persist            ${persist ? (allowAdvisoryPersist ? 'yes, advisory override allowed' : 'yes, promotable only') : 'no'}`)
   console.log(`  --fdr-q              ${fdrQ ?? 'none (feature screen skipped)'}`)
-  console.log(`  --allow-missing      ${allowMissing ? 'ON: lost names, failed fundamentals requests and missing SPY history are recorded, not fatal' : 'OFF (default): any of those stops the run before the walk-forward'}`)
-  console.log(`  universe             ${baseTickers.length} names -> ${etfsExcluded} ETFs ${excludeEtfs ? 'excluded' : 'kept'} -> ${afterEtfs.length}${limit > 0 ? ` -> first ${tickers.length} (--limit)` : ''}`)
-  // Memory: the smoke-measured line (fixed cost plus a cost per name),
-  // extended to this universe, against the ceiling node actually gave us.
-  const heap = pre.projectHeapNeed(tickers.length, heapLimitMb)
-  const totalMemoryMb = Math.round(totalmem() / 1024 / 1024)
-  console.log(`  node heap ceiling    ${heapLimitMb} MB (this process; machine has ${totalMemoryMb} MB)`)
+  console.log(`  --allow-missing      ${allowMissing ? 'ON: lost names, stubs, failed fundamentals requests and missing SPY history are recorded, not fatal' : 'OFF (default): any of those stops the run before the walk-forward'}`)
+  console.log(`  --allow-low-heap     ${allowLowHeap ? 'ON: a heap ceiling below the projection, or free memory below the recommended heap, is a warning' : 'OFF (default): a heap ceiling below the projection, or free memory below the recommended heap, stops the run at start'}`)
+  console.log(`  --warm-only          ${warmOnly ? 'ON: stop after the price warm-up' : 'OFF (default)'}`)
+  console.log(`  identity ledger      ${identityPath} (${identityLedger!.counts.entries} entries, ${identityLedger!.counts.withCik} with a CIK, snapshot ${identityLedger!.snapshotDate}, sha256 ${identitySha256.slice(0, 12)}...)`)
   console.log(
-    `  projected need       ${heap.projectedMb} MB for ${tickers.length} names = ${heap.baseMb.toFixed(0)} MB fixed + ${tickers.length} x ${heap.perNameMb.toFixed(1)} MB per name ` +
-      `(line through the 2026-09-16 smokes: ${pre.SMOKE_MEMORY_POINTS.map((point) => `${point.names} names -> ${point.peakRssMb} MB peak`).join(', ')})`,
+    `  universe             ${baseTickers.length} names -> ${etfsExcluded} ETFs ${excludeEtfs ? 'excluded' : 'kept'} -> ${afterEtfs.length} registered` +
+      (limit > 0 ? ` -> first ${registeredTickers.length} (the prefix holding the first ${tickers.length} fetchable names, --limit)` : '') +
+      ` -> ${plan.excluded.length} registered but excluded -> ${tickers.length} fetched and scored`,
   )
-  console.log(`  node flag to use     node ${heap.flag} tools/backtest-cli.mjs ...  (projection plus a quarter, rounded up to a whole GB)`)
-  if (heap.exceedsCeiling) {
+  // The ledgers' outcome, printed before anything is fetched so a reader
+  // sees the universe the run really works on. A name in neither ledger
+  // that still cannot be fetched is a real failure and stops the run below.
+  console.log(
+    `  ${plan.excluded.length} names registered but excluded (delisted/unresolved)${plan.excluded.length ? ': ' : ''}` +
+      plan.excluded.map((entry) => `${entry.ticker} (${entry.delistingDate ? `delisted ${entry.delistingDate}, ` : ''}${entry.reason}${entry.recycledBy ? `; symbol now ${entry.recycledBy}` : ''})`).join('; '),
+  )
+  console.log(
+    `  ${plan.renamed.length} names fetched under a successor symbol (ticker renames; the sample keeps the original symbol)${plan.renamed.length ? ': ' : ''}` +
+      plan.renamed.map((entry) => `${entry.original} -> ${entry.fetchedAs}`).join(', '),
+  )
+  console.log(`  ${plan.attrition.statement}`)
+  // Memory: the smoke-measured loop line (fixed cost plus a cost per name),
+  // extended to this universe and multiplied by the post-loop factor,
+  // against the ceiling node actually gave us and the memory the machine
+  // actually has free. Both readings are printed so a reader can tell "the
+  // flag was too small" from "the machine was full".
+  const totalMemoryMb = Math.round(totalmem() / 1024 / 1024)
+  const freeMemoryMb = Math.round(freemem() / 1024 / 1024)
+  const heap = pre.projectHeapNeed(tickers.length, heapLimitMb, freeMemoryMb)
+  console.log(`  node heap ceiling    ${heapLimitMb} MB (this process)`)
+  console.log(`  machine memory       ${totalMemoryMb} MB total, ${freeMemoryMb} MB free right now (os.totalmem / os.freemem)`)
+  console.log(
+    `  projected need       ${heap.projectedMb} MB for ${tickers.length} names = (${heap.baseMb.toFixed(1)} MB fixed + ${tickers.length} x ${heap.perNameMb.toFixed(1)} MB per name = ${heap.loopProjectedMb} MB for the window loop) x ${heap.postLoopFactor} for the post-loop phase`,
+  )
+  console.log(
+    `                       loop line through the 2026-09-16 smokes: ${pre.SMOKE_MEMORY_POINTS.map((point) => `${point.names} names -> ${point.peakRssMb} MB peak`).join(', ')}; ` +
+      `x${heap.postLoopFactor} from the ${pre.POST_LOOP_MEMORY_POINT.names}-name smoke, whose loop line projected ${pre.POST_LOOP_MEMORY_POINT.loopProjectedMb} MB, ` +
+      `whose per-window sampling peaked at ${pre.POST_LOOP_MEMORY_POINT.cliSampledPeakRssMb} MB, and whose OS-level peak working set was ${pre.POST_LOOP_MEMORY_POINT.osPeakWorkingSetMb} MB ` +
+      '(served-model training, regime labelling and the gate report were never sampled)',
+  )
+  console.log(`  node flag to use     node ${heap.flag} tools/backtest-cli.mjs ...  (projection plus a quarter, rounded up to the next whole GB)`)
+  const memoryVerdict = pre.memoryGuardVerdict(heap, allowLowHeap)
+  if (memoryVerdict.problems.length > 0) {
     console.log('')
-    console.log('  !!! WARNING: the projected need is ABOVE this process\'s heap ceiling. The run will most likely die with')
-    console.log(`  !!! "heap out of memory" part-way through. Restart it as:  node ${heap.flag} tools/backtest-cli.mjs ${args.join(' ')}`)
-    if (heap.recommendedMb > totalMemoryMb) {
-      console.log(`  !!! That is more than this machine's ${totalMemoryMb} MB of memory; use --limit or a machine with more memory.`)
+    for (let i = 0; i < memoryVerdict.problems.length; i++) {
+      console.log(`  !!! ${memoryVerdict.problems[i]}`)
+      console.log(`  !!! ${memoryVerdict.advice[i]}`)
     }
+    if (heap.exceedsCeiling) {
+      console.log(`  !!! The run would most likely die with "heap out of memory" part-way through. Start it as:  node ${heap.flag} tools/backtest-cli.mjs ${args.filter((arg) => arg !== '--allow-low-heap').join(' ')}`)
+    }
+    if (heap.recommendedMb > totalMemoryMb) {
+      console.log(`  !!! The recommended heap is more than this machine's ${totalMemoryMb} MB of memory in all; use --limit or a machine with more memory.`)
+    }
+    if (memoryVerdict.abort) {
+      console.error('')
+      console.error(`ABORTED: ${memoryVerdict.problems.join('; ')}.`)
+      for (const line of memoryVerdict.advice) console.error(`  ${line}`)
+      console.error('  Or pass --allow-low-heap to run anyway. Nothing was fetched and nothing was written.')
+      process.exit(2)
+    }
+    console.log('  !!! proceeding anyway (--allow-low-heap)')
     console.log('')
   }
   console.log('')
@@ -314,6 +466,53 @@ async function main() {
   console.log(`Backend: ${health.detail}`)
 
   /* ------------------------------------------------------------------ */
+  /* One fetch of the SEC ticker map, for the identity check             */
+  /* ------------------------------------------------------------------ */
+  // The map says which registrant (CIK) holds each symbol today. It is the
+  // decisive half of the identity check (a different CIK is a different
+  // company), so a run that cannot get it stops, unless --allow-missing,
+  // in which case the Yahoo meta alone decides and the run says so.
+  const secMap = await pre.fetchSecTickerMap({ base: backendBase })
+  if (secMap == null) {
+    if (!allowMissing) {
+      abortRun(`the SEC ticker map (${pre.SEC_COMPANY_TICKERS_URL}) could not be fetched through the proxy, so the identity check has no CIKs to compare.`, [
+        'Check the backend log (the proxy adds the User-Agent the SEC requires), then start the run again.',
+      ])
+    }
+    console.warn('  WARNING: no SEC ticker map; the identity check falls back to the Yahoo names and first-trade dates alone (--allow-missing).')
+  } else {
+    console.log(`SEC ticker map: ${secMap.size} symbols (one fetch per run, through the proxy)`)
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* The universe record in the checkpoint                               */
+  /* ------------------------------------------------------------------ */
+  // Written now, before anything is fetched, and again after the warm-up
+  // with the stubs and the identity summary filled in, so the checkpoint
+  // alone says which names were set aside, renamed, found to be stubs or
+  // found to be another company, even when --persist is later refused by
+  // a blocking gate.
+  const universeRecord = (
+    stubs: import('./preregistered-run').StubSeries[],
+    identity?: import('./preregistered-run').CheckpointUniverseRecord['identity'],
+  ): import('./preregistered-run').CheckpointUniverseRecord => ({
+    recordedAt: new Date().toISOString(),
+    registered: [...plan.registered],
+    renames: plan.renamed.map((entry) => ({ ...entry })),
+    excluded: plan.excluded.map(({ ticker, delistingDate, reason, evidence, recycledBy }) => ({ ticker, delistingDate, reason, evidence, ...(recycledBy != null ? { recycledBy } : {}) })),
+    stubs: stubs.map((stub) => ({ ...stub })),
+    attrition: { ...plan.attrition },
+    ...(identity != null ? { identity } : {}),
+  })
+  if (checkpointDir != null) {
+    pre.recordUniverseInCheckpoint(checkpointDir, universeRecord([]))
+    console.log(
+      `Checkpoint ${checkpointDir}: universe record written to run.json (${plan.registered.length} registered, ${plan.renamed.length} renames, ` +
+        `${plan.excluded.length} excluded names with dates and reasons, the attrition sentence); the stub list is added after the warm-up.`,
+    )
+  }
+
+  /* ------------------------------------------------------------------ */
   /* Dataset                                                             */
   /* ------------------------------------------------------------------ */
   // Fetch every name's full history first, with bounded retries, so a
@@ -322,27 +521,117 @@ async function main() {
   // a universe that differs between two runs makes a checkpoint unusable.
   const started = Date.now()
   const heapUsedAtStartMb = process.memoryUsage().heapUsed / 1024 / 1024
-  console.log(`Warming price history for ${tickers.length} tickers (max bars via proxy, up to 4 attempts each)...`)
-  const warm = await pre.warmDailyBars(tickers, (ticker) => cachedFetchDailyBars(ticker, 'max'), {
+  console.log(`Warming price history for ${tickers.length} tickers (max bars via proxy, up to 4 attempts each; a stub is named as it is found)...`)
+  // The listing-floor stub rule applies to registered names only; a
+  // caller-supplied list may hold a genuinely young listing, which the
+  // bar-count rule still catches.
+  const registeredSet = new Set<string>(DEFAULT_BACKTEST_TICKERS)
+  // The identity check rides along with each fetch: once a name's bars are
+  // in, the chart's meta block is read from the same URL (the proxy still
+  // holds it) and compared with the identity ledger and the SEC map. A
+  // stub is not checked (it is already set apart); a name whose fetch
+  // failed has nothing to compare.
+  const identityChecks: import('./preregistered-run').IdentityCheck[] = []
+  const identityLines: string[] = []
+  const metaByTicker = new Map<string, import('./preregistered-run').YahooChartMeta | null>()
+  const warm = await pre.warmDailyBars(tickers, (ticker) => cachedFetchDailyBars(fetchSymbolOf(ticker), 'max'), {
     attempts: 4,
     pauseMs: 1500,
     onProgress: (done, total, ticker) => {
       if (done % 25 === 0) console.log(`  ${done}/${total} ${ticker}`)
     },
+    stubCheck: (ticker, bars) => pre.classifyStubSeries(ticker, bars, { registered: registeredSet.has(ticker), maxRange: true }),
+    onStub: (stub) => console.log(`  ${stub.line}`),
+    onUsable: async (ticker) => {
+      const fetchSymbol = fetchSymbolOf(ticker)
+      let meta: import('./preregistered-run').YahooChartMeta | null = null
+      for (let attempt = 0; attempt < 3 && meta == null; attempt++) {
+        if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, 1500))
+        meta = await pre.fetchYahooChartMeta(fetchSymbol, { base: backendBase })
+      }
+      metaByTicker.set(ticker, meta)
+      const sec = secMap?.get(pre.normalizeSecSymbol(fetchSymbol)) ?? null
+      const check = pre.checkIdentity(ticker, fetchSymbol, identityOf.get(ticker), { cik: sec?.cik ?? null, secName: sec?.name ?? null, meta })
+      identityChecks.push(check)
+      if (check.line != null) {
+        identityLines.push(check.line)
+        console.log(`  ${check.line}`)
+      }
+    },
   })
   console.log(
     `  warmed ${warm.usable.length}/${tickers.length} · ${warm.retries} retr${warm.retries === 1 ? 'y' : 'ies'} · ` +
-      `${warm.failed.length ? `still no bars after 4 attempts: ${warm.failed.join(', ')}` : 'no fetch failures'} · ${((Date.now() - started) / 1000).toFixed(0)}s`,
+      `${warm.failed.length ? `still no bars after 4 attempts: ${warm.failed.join(', ')}` : 'no fetch failures'} · ` +
+      `${warm.stubs.length ? `${warm.stubs.length} stub${warm.stubs.length === 1 ? '' : 's'}: ${warm.stubs.map((stub) => stub.ticker).join(', ')}` : 'no stubs'} · ` +
+      `${((Date.now() - started) / 1000).toFixed(0)}s`,
   )
-  // Names that could not be fetched narrow the universe. That is fatal by
-  // default: a pre-registered run on fewer names than it registered is a
-  // different run, and it must say so instead of quietly going on.
-  const droppedNames = new Set<string>(warm.failed)
-  if (warm.failed.length > 0 && !allowMissing) {
-    abortRun(`${warm.failed.length} of ${tickers.length} names could not be fetched after 4 attempts each; the run would narrow silently.`, [
-      `names: ${warm.failed.join(', ')}`,
-      'Check the backend log for these symbols, then start the run again.',
-    ])
+  const identity = pre.summarizeIdentityChecks(identityChecks)
+  console.log(`  ${identity.line} (against ${identityPath}, snapshot ${identityLedger!.snapshotDate}${secMap == null ? '; no SEC map, Yahoo meta only' : ''})`)
+  const identityRecord: NonNullable<import('./preregistered-run').CheckpointUniverseRecord['identity']> = { snapshotDate: identityLedger!.snapshotDate, ledgerSha256: identitySha256, summary: identity.line, lines: [...identityLines] }
+  if (checkpointDir != null) {
+    pre.recordUniverseInCheckpoint(checkpointDir, universeRecord(warm.stubs, identityRecord))
+    console.log(`Checkpoint ${checkpointDir}: universe record updated with the stub list (${warm.stubs.length}) and the identity summary.`)
+  }
+  // A name that came back as another company is a wrong answer, not a
+  // missing one, so this stop cannot be waived: --allow-missing narrows a
+  // run honestly, it does not let the wrong history in.
+  const recycledChecks = identityChecks.filter((check) => check.status === 'recycled')
+  if (recycledChecks.length > 0) {
+    console.error('')
+    console.error(`ABORTED: ${recycledChecks.length} of ${identity.checked} checked names came back as a DIFFERENT COMPANY from the one the run is registered against.`)
+    for (const check of recycledChecks) console.error(`  ${check.line}`)
+    console.error('  --allow-missing does not apply: a wrong company is not a missing one. Each name belongs in EXCLUDED_UNFETCHABLE with a recycledBy')
+    console.error('  (src/data/historicalBacktest.ts) unless the SEC lists the new symbol under the same CIK, in which case it is a TICKER_RENAMES entry; then start the run again.')
+    process.exit(1)
+  }
+  // A name whose company could not be checked (no CIK on either side and
+  // no readable chart meta, a chart that answered under another symbol, a
+  // name on one side only) is an unknown company, and an unknown company
+  // is not missing data: --allow-missing narrows a run to the names it
+  // could verify, it does not let an unverified one in. The run stops and
+  // says which names, so each can be resolved on purpose (a ledger entry
+  // with a reason, or a fixed record) and the run started again.
+  const unverifiedChecks = identityChecks.filter((check) => check.status === 'unverified')
+  if (unverifiedChecks.length > 0) {
+    console.error('')
+    console.error(`ABORTED: ${unverifiedChecks.length} of ${identity.checked} checked names could not be identity-checked; an unknown company is not a missing one.`)
+    for (const check of unverifiedChecks) console.error(`  ${check.line ?? check.ticker}`)
+    console.error('  --allow-missing does not apply. Resolve each name (an EXCLUDED_UNFETCHABLE entry with its reason, or a corrected identity ledger) and start the run again.')
+    process.exit(1)
+  }
+  // Names that could not be fetched, and names that came back as a stub,
+  // narrow the universe. That is fatal by default: a pre-registered run on
+  // fewer names than it registered is a different run, and it must say so
+  // instead of quietly going on.
+  const stubTickers = warm.stubs.map((stub) => stub.ticker)
+  const droppedNames = new Set<string>([...warm.failed, ...stubTickers])
+  if (droppedNames.size > 0 && !allowMissing) {
+    abortRun(
+      `${droppedNames.size} of ${tickers.length} names could not be fetched after 4 attempts each or came back as a stub; the run would narrow silently.`,
+      [
+        ...(warm.failed.length ? [`no bars after 4 attempts: ${warm.failed.join(', ')}`] : []),
+        ...warm.stubs.map((stub) => stub.line),
+        'Check the backend log for the unfetched symbols. A stub belongs in EXCLUDED_UNFETCHABLE or TICKER_RENAMES (src/data/historicalBacktest.ts) with its evidence; then start the run again.',
+      ],
+    )
+  }
+  if (stubTickers.length > 0) {
+    // A stub never reaches the build: with enough bars a re-listed security
+    // would enter the dataset as a short-history name under the old symbol.
+    const stubSet = new Set(stubTickers)
+    registeredTickers = registeredTickers.filter((ticker) => !stubSet.has(ticker))
+    tickers = tickers.filter((ticker) => !stubSet.has(ticker))
+    console.warn(`  WARNING: proceeding without ${stubTickers.length} stub name${stubTickers.length === 1 ? '' : 's'} (--allow-missing): ${stubTickers.join(', ')}`)
+  }
+  if (warmOnly) {
+    console.log('')
+    console.log(
+      `--warm-only: stopping after the price warm-up. ${warm.usable.length} of ${warm.usable.length + droppedNames.size} names usable · ` +
+        `${warm.failed.length} unfetched · ${warm.stubs.length} stub${warm.stubs.length === 1 ? '' : 's'} · ${identity.line}` +
+        (checkpointDir != null ? ` · the universe record (renames, exclusions, stubs, identity, attrition) is in ${checkpointDir}/run.json` : '') +
+        '. Nothing was built or scored.',
+    )
+    process.exit(0)
   }
 
   // SPY is the regime yardstick for the era report. Fetch it now, so a run
@@ -367,8 +656,10 @@ async function main() {
   const fundamentalsWarm = await pre.warmFundamentals(
     tickers,
     async (ticker) => {
-      await fetchFundamentalsTimeline(ticker)
-      const outcome = fundamentalsFetchOutcome(ticker)
+      // SEC's ticker map knows only the current symbol, so a renamed name
+      // asks under its successor, exactly as the builder will.
+      await fetchFundamentalsTimeline(fetchSymbolOf(ticker))
+      const outcome = fundamentalsFetchOutcome(fetchSymbolOf(ticker))
       return outcome == null ? 'failed' : outcome.kind
     },
     {
@@ -384,7 +675,7 @@ async function main() {
       `${fundamentalsWarm.failed.length} requests still failing after 4 attempts · ${fundamentalsWarm.retries} retr${fundamentalsWarm.retries === 1 ? 'y' : 'ies'} · ${((Date.now() - fundamentalsStarted) / 1000).toFixed(0)}s`,
   )
   if (fundamentalsWarm.failed.length > 0) {
-    const detail = fundamentalsWarm.failed.slice(0, 20).map((ticker) => `${ticker} (${fundamentalsFetchOutcome(ticker)?.kind === 'failed' ? (fundamentalsFetchOutcome(ticker) as { detail: string }).detail : 'failed'})`)
+    const detail = fundamentalsWarm.failed.slice(0, 20).map((ticker) => `${ticker} (${fundamentalsFetchOutcome(fetchSymbolOf(ticker))?.kind === 'failed' ? (fundamentalsFetchOutcome(fetchSymbolOf(ticker)) as { detail: string }).detail : 'failed'})`)
     if (!allowMissing) {
       abortRun(`${fundamentalsWarm.failed.length} SEC fundamentals requests failed after 4 attempts each (timed out or errored; not "files nothing").`, [
         `names: ${detail.join(', ')}${fundamentalsWarm.failed.length > 20 ? ` ... and ${fundamentalsWarm.failed.length - 20} more` : ''}`,
@@ -394,7 +685,10 @@ async function main() {
     console.warn(`  WARNING: proceeding with no fundamentals for ${fundamentalsWarm.failed.length} names (--allow-missing): ${detail.join(', ')}`)
   }
   console.log(`Building dataset for ${tickers.length} tickers (${range} bars via proxy)...`)
-  const built = await buildHistoricalDataset(tickers, {
+  // The builder gets the REGISTERED list, so the artifact's universe is the
+  // list as registered; the builder applies the same ledgers and fetches
+  // only the names planned above.
+  const built = await buildHistoricalDataset(registeredTickers, {
     cadenceDays: 10,
     range,
     onProgress: (current, total, ticker) => {
@@ -409,6 +703,21 @@ async function main() {
       (d.tickersWithZeroBars ? ` · ${d.tickersWithZeroBars} fetch failures` : '') +
       (d.tickersBelowMinBars ? ` · ${d.tickersBelowMinBars} below history threshold` : '') +
       ` · ${datasetSeconds.toFixed(0)}s (${(tickers.length / Math.max(1, datasetSeconds)).toFixed(2)} names/s)`,
+  )
+  // The builder and this file must have set aside and renamed exactly the
+  // same names, or the artifact would describe a different universe from
+  // the one that was warmed and guarded above.
+  const builtExcluded = (built.provenance.universeExcluded ?? []).map((entry) => entry.ticker).join(',')
+  const plannedExcluded = plan.excluded.map((entry) => entry.ticker).join(',')
+  const builtRenamed = (built.provenance.universeRenames ?? []).map((entry) => `${entry.original}>${entry.fetchedAs}`).join(',')
+  const plannedRenamed = plan.renamed.map((entry) => `${entry.original}>${entry.fetchedAs}`).join(',')
+  if (builtExcluded !== plannedExcluded || builtRenamed !== plannedRenamed) {
+    console.error(`ABORTED: the dataset builder and the runner disagree on the universe ledgers (excluded: builder "${builtExcluded}" vs runner "${plannedExcluded}"; renamed: builder "${builtRenamed}" vs runner "${plannedRenamed}").`)
+    process.exit(1)
+  }
+  console.log(
+    `  registered ${registeredTickers.length} · registered but excluded ${plan.excluded.length} (recorded in the artifact with the reason) · ` +
+      `fetched under a successor symbol ${d.tickersRenamed ?? 0} · ${plan.attrition.statement}`,
   )
   const q = built.quality
   console.log('Dataset evidence quality:')
@@ -435,6 +744,13 @@ async function main() {
   // The builder fetches each name once more (the in-process bar cache keeps
   // a name for five minutes, and a long warm-up outlives that), so a fetch
   // can still fail here. Same rule as the warm-up: fatal unless told otherwise.
+  // A name that was fetched but produced no rows is printed by name with
+  // its bar count and the builder's reason, so a short series can never
+  // narrow the run as a bare count.
+  const noRows = d.perTickerSummary.filter((entry) => entry.bars > 0 && entry.samplesGenerated === 0)
+  if (noRows.length > 0) {
+    console.log(`  fetched but no rows (${noRows.length}): ${noRows.map((entry) => `${entry.ticker} (${entry.bars} bars${entry.reason ? `, ${entry.reason}` : ''})`).join(', ')}`)
+  }
   const buildFailures = d.perTickerSummary.filter((entry) => entry.bars === 0).map((entry) => entry.ticker)
   for (const ticker of buildFailures) droppedNames.add(ticker)
   if (buildFailures.length > 0) {
@@ -514,9 +830,22 @@ async function main() {
 
   let result: FullBacktestResult | null
   let checkpointReport: { dir: string; replayedWindows: number; computedWindows: number } | null = null
-  let peakRssMb = process.memoryUsage().rss / 1024 / 1024
-  const sampleRss = () => {
-    peakRssMb = Math.max(peakRssMb, process.memoryUsage().rss / 1024 / 1024)
+  // Peak resident memory, sampled by phase. The window loop is sampled
+  // after every window. The post-loop phase (served-model training, the
+  // regime step, the gate report and the diagnostics) is sampled after each
+  // of its steps, which is as often as synchronous work allows: a timer
+  // cannot fire inside one training call. The 200-name smoke of 2026-09-16
+  // showed the post-loop phase running well above the loop peak while only
+  // the loop was sampled; both peaks are now printed and recorded, so the
+  // projection's post-loop factor can be re-measured from a real run.
+  const rssNowMb = () => process.memoryUsage().rss / 1024 / 1024
+  const peakRss = { loop: rssNowMb(), postLoop: 0 }
+  let peakRssMb = peakRss.loop
+  const sampleRss = (phase: 'loop' | 'post-loop' = 'loop') => {
+    const now = rssNowMb()
+    if (phase === 'loop') peakRss.loop = Math.max(peakRss.loop, now)
+    else peakRss.postLoop = Math.max(peakRss.postLoop, now)
+    peakRssMb = Math.max(peakRssMb, now)
   }
   const walkForwardStarted = Date.now()
   let servedSeconds = 0
@@ -661,7 +990,7 @@ async function main() {
       correlation,
     })
     servedSeconds = (Date.now() - servedStarted) / 1000
-    sampleRss()
+    sampleRss('post-loop')
     result = pre.assembleFullResult({
       sorted,
       windows,
@@ -673,6 +1002,7 @@ async function main() {
       horizonDays: 20,
       hyperparameterSelection: 'frozen',
     })
+    sampleRss('post-loop')
   } else {
     // The nested search runs inside the core's single call; no checkpoint.
     console.log(
@@ -732,6 +1062,7 @@ async function main() {
   }
   const regimeLabels = labelStepsByRegime(result.steps, spyBars)
   const regimeBreakdown = summarizeStepsByRegime(result.steps, regimeLabels)
+  sampleRss('post-loop')
 
   const elapsed = ((Date.now() - started) / 1000).toFixed(0)
 
@@ -749,7 +1080,10 @@ async function main() {
   console.log(`hyperparameters: trees=${result.hyperparameters.numTrees} depth=${result.hyperparameters.depth} rate=${result.hyperparameters.learningRate} (${result.hyperparameterSelection})`)
   printGatePair(`Holdout split: windows starting before ${pre.HOLDOUT_CUTOFF_DATE} (${holdoutSteps.length} windows)` + (holdoutEvidence ? ':' : ' - n/a, fewer than two windows'), holdoutEvidence ?? { random: { ...evidence.random, ci95: null, ciClearOfZero: false, pairedStepCount: holdoutSteps.length, blockLength: null }, momentum: { ...evidence.momentum, ci95: null, ciClearOfZero: false, pairedStepCount: holdoutSteps.length, blockLength: null } })
   printGatePair(`All windows (${result.steps.length} windows):`, evidence)
-  console.log(`timing: dataset ${datasetSeconds.toFixed(0)}s · walk-forward ${walkForwardSeconds.toFixed(0)}s (served models ${servedSeconds.toFixed(0)}s of that) · total ${elapsed}s · peak RSS ${peakRssMb.toFixed(0)} MB (sampled after each window)`)
+  console.log(
+    `timing: dataset ${datasetSeconds.toFixed(0)}s · walk-forward ${walkForwardSeconds.toFixed(0)}s (served models ${servedSeconds.toFixed(0)}s of that) · total ${elapsed}s · ` +
+      `peak RSS ${peakRssMb.toFixed(0)} MB (window loop ${peakRss.loop.toFixed(0)} MB, sampled after each window; post-loop ${peakRss.postLoop.toFixed(0)} MB so far, sampled after the served models and the regime step)`,
+  )
   if (checkpointReport) {
     console.log(`checkpoint: ${checkpointReport.dir} · ${checkpointReport.replayedWindows} windows replayed · ${checkpointReport.computedWindows} scored this run`)
   }
@@ -955,7 +1289,20 @@ async function main() {
 
   // ALWAYS the unpruned samples: the diagnostics index raw features in
   // full column space; pruned arrays would silently misread.
-  const survivorship = analyzeSurvivorship(built.samples, result.steps)
+  const survivorship = analyzeSurvivorship(built.samples, result.steps, built.provenance.universeAttrition)
+  // The registered names that left the market are part of this picture
+  // whether or not the cohort diagnostics could be computed: the names that
+  // remain are more survivor-biased by at least that share.
+  const leftMarketLines = (attrition: import('../src/data/historicalBacktest').UniverseAttrition | undefined) => {
+    console.log('names that left the market (registered but excluded; no free source serves their price history):')
+    console.log(`  ${attrition?.statement ?? 'n/a (the dataset carries no attrition record)'}`)
+  }
+  if (!survivorship) {
+    console.log('')
+    console.log('--- Survivorship diagnostics ---')
+    console.log('  cohort, era and canary diagnostics not computed (no per-row test detail or pruned feature space).')
+    leftMarketLines(built.provenance.universeAttrition)
+  }
   if (survivorship) {
     console.log('')
     console.log('--- Survivorship diagnostics ---')
@@ -996,6 +1343,7 @@ async function main() {
     console.log(
       `  long quintile: ${f(survivorship.delistingBound.privilegedShareOfLongQuintile * 100, 1)}% privileged, ${f(survivorship.delistingBound.youngShareOfLongQuintile * 100, 1)}% young -> long-side haircut ~${f(survivorship.delistingBound.haircutPpPerWindow, 3)}pp/window; L/S net ${f(result.meanLongShortReturnNet, 2)}% -> ~${f(result.meanLongShortReturnNet - survivorship.delistingBound.haircutPpPerWindow, 2)}% adjusted`,
     )
+    leftMarketLines(survivorship.leftMarket)
   }
   console.log('')
   console.log('--- Permutation feature importance (mean IC drop) ---')
@@ -1020,15 +1368,26 @@ async function main() {
 
   // What the run went without, printed whether or not the artifact is
   // saved, so a --allow-missing run can never read as a complete one.
-  if (droppedNames.size > 0 || fundamentalsFailed.length > 0 || regimeHistoryMissing) {
+  if (droppedNames.size > 0 || fundamentalsFailed.length > 0 || regimeHistoryMissing || secMap == null) {
     console.log('')
     console.log('--- What went missing (--allow-missing; also recorded in the artifact provenance when persisted) ---')
-    if (droppedNames.size > 0) console.log(`  price history not fetched, names dropped from the universe: ${[...droppedNames].sort().join(', ')}`)
+    if (droppedNames.size > 0) console.log(`  price history not fetched or served as a stub, names dropped from the universe: ${[...droppedNames].sort().join(', ')}`)
+    for (const stub of warm.stubs) console.log(`  ${stub.line}`)
     if (fundamentalsFailed.length > 0) console.log(`  SEC fundamentals requests failed (rows built without fundamentals): ${fundamentalsFailed.join(', ')}`)
     if (regimeHistoryMissing) console.log('  SPY history unavailable: every window is labeled "unknown" in the regime table')
+    if (secMap == null) console.log('  SEC ticker map unavailable: the identity check used the Yahoo names and first-trade dates alone, with no CIKs')
   }
   console.log('')
-  console.log(`memory: heap ceiling ${heapLimitMb} MB · projected ${heap.projectedMb} MB for ${tickers.length} names · peak RSS ${peakRssMb.toFixed(0)} MB · flag for this size: node ${heap.flag}`)
+  // The whole run is done; one last sample closes the post-loop phase, and
+  // the measured ratio beside the assumed factor is what the next
+  // projection should be corrected with.
+  sampleRss('post-loop')
+  console.log(
+    `memory: heap ceiling ${heapLimitMb} MB · machine ${totalMemoryMb} MB total, ${freeMemoryMb} MB free at start · ` +
+      `projected ${heap.projectedMb} MB for ${tickers.length} names (loop line ${heap.loopProjectedMb} MB x ${heap.postLoopFactor} post-loop factor) · ` +
+      `peak RSS ${peakRssMb.toFixed(0)} MB (window loop ${peakRss.loop.toFixed(0)} MB; post-loop ${peakRss.postLoop.toFixed(0)} MB, sampled after the served models, the regime step and the report) · ` +
+      `measured peak / loop line = ${(peakRssMb / Math.max(1, heap.loopProjectedMb)).toFixed(2)} against the assumed ${heap.postLoopFactor} · flag for this size: node ${heap.flag}`,
+  )
 
   console.log('')
   console.log(`--- Model promotion assessment: ${promotion.status.toUpperCase()} ---`)
@@ -1075,7 +1434,30 @@ async function main() {
         tickersFile: tickersFile ?? '',
         allowMissing,
       },
-      universe: { requested: baseTickers.length, etfsExcluded, etfSource: etfUniverse.source, trained: tickers.length },
+      universe: {
+        requested: baseTickers.length,
+        etfsExcluded,
+        etfSource: etfUniverse.source,
+        registered: registeredTickers.length,
+        registeredButExcluded: plan.excluded.length,
+        excludedNames: plan.excluded.map(({ ticker, delistingDate, reason, recycledBy }) => ({ ticker, delistingDate, reason, ...(recycledBy != null ? { recycledBy } : {}) })),
+        renamed: plan.renamed.length,
+        renames: plan.renamed.map(({ original, fetchedAs }) => ({ original, fetchedAs })),
+        stubs: warm.stubs.map((stub) => ({ ...stub })),
+        identity: {
+          snapshotDate: identityLedger!.snapshotDate,
+          ledgerSha256: identitySha256,
+          checked: identity.checked,
+          matched: identity.matched,
+          renamedInPlace: identity.renamedInPlace,
+          recycled: identity.recycled,
+          unverified: identity.unverified,
+          unregistered: identity.unregistered,
+          notes: [...identityLines],
+        },
+        attrition: { ...plan.attrition },
+        trained: tickers.length,
+      },
       windows: {
         rule: { ...w.rule },
         built: w.windowsBuilt,
@@ -1101,7 +1483,18 @@ async function main() {
         fundamentalsFetchFailures: fundamentalsFailed,
         regimeHistoryMissing,
       },
-      memory: { heapCeilingMb: heapLimitMb, projectedMb: heap.projectedMb, recommendedFlag: heap.flag, peakRssMb: Math.round(peakRssMb) },
+      memory: {
+        heapCeilingMb: heapLimitMb,
+        projectedMb: heap.projectedMb,
+        recommendedFlag: heap.flag,
+        peakRssMb: Math.round(peakRssMb),
+        totalMemoryMb,
+        freeMemoryMb,
+        loopProjectedMb: heap.loopProjectedMb,
+        postLoopFactor: heap.postLoopFactor,
+        loopPeakRssMb: Math.round(peakRss.loop),
+        postLoopPeakRssMb: Math.round(peakRss.postLoop),
+      },
     }
     const horizonModels = result.horizonBundles.map((bundle) => ({
       horizon: bundle.horizon,

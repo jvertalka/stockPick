@@ -10,9 +10,12 @@ import {
   computeFeaturesAtDate,
   computeMomentum12to1AtDate,
   costTierMarketCapUsd,
+  DEFAULT_BACKTEST_TICKERS,
   DEFAULT_GATE_CORRELATION,
   DEFAULT_GATE_MOMENTUM_BASELINE,
   DEFAULT_WINDOW_RULE,
+  describeUniverseAttrition,
+  EXCLUDED_UNFETCHABLE,
   FROZEN_HYPERPARAMETERS,
   FundamentalsTimeline,
   HISTORICAL_FEATURE_NAMES,
@@ -21,16 +24,24 @@ import {
   measuredOverlapBlockLength,
   measureMomentumBlend,
   normalizeMomentum12to1ByDate,
+  planUniverseFetch,
+  renameContinuityProblem,
+  renameHasHistoryContinuity,
+  resolveFetchSymbol,
   resolveWindowRule,
   runWalkForwardBacktest,
   selectBlendWeight,
   spearmanCorrelation,
   summarizeCalendarWindows,
+  TICKER_RENAMES,
+  UNFETCHABLE_RESOLVED_ON,
+  unresolvedExclusion,
   walkForwardStep,
   windowRows,
   type BacktestDatasetQuality,
   type DailyBar,
   type HistoricalSample,
+  type TickerRename,
 } from './historicalBacktest'
 import {
   fitBaggedGradientBoosting,
@@ -2038,6 +2049,404 @@ export async function runHistoricalBacktestQualityTests(): Promise<TestResult[]>
           `listedLater=${listedLater?.[ageIdx]} noBoundary=${noBoundary?.[ageIdx]} expected=${trueAge} ` +
           `imputed=${samples[0].imputedMask?.[ageIdx]}/${samples[1].imputedMask?.[ageIdx]} filled=${samples[0].rawFeatures[ageIdx]}`,
     })
+  }
+
+  /* --- Names Yahoo no longer serves: the two ledgers ---------------------
+     The pre-registered list is never edited. Renamed names are fetched under
+     their successor and keep their own symbol; names that left the market
+     are set aside before any fetch and recorded as registered but excluded.
+     ----------------------------------------------------------------------- */
+  const isoDate = /^\d{4}-\d{2}-\d{2}$/
+
+  // The ledgers themselves: 18 renames and 50 exclusions, every one a
+  // registered name, none in both, no successor that is already registered
+  // (the same history would enter twice), every exclusion dated and reasoned.
+  {
+    const renamed = Object.keys(TICKER_RENAMES)
+    const excluded = EXCLUDED_UNFETCHABLE.map((entry) => entry.ticker)
+    const registered = new Set(DEFAULT_BACKTEST_TICKERS)
+    const overlap = renamed.filter((ticker) => excluded.includes(ticker))
+    const notRegistered = [...renamed, ...excluded].filter((ticker) => !registered.has(ticker))
+    const successorsRegistered = renamed.filter((ticker) => registered.has(TICKER_RENAMES[ticker].successor))
+    const undated = EXCLUDED_UNFETCHABLE.filter((entry) => entry.delistingDate == null || !isoDate.test(entry.delistingDate))
+    const unexplained = EXCLUDED_UNFETCHABLE.filter((entry) => entry.reason.trim().length === 0 || entry.evidence.trim().length === 0)
+    const passed =
+      renamed.length === 18 &&
+      excluded.length === 50 &&
+      new Set(excluded).size === 50 &&
+      overlap.length === 0 &&
+      notRegistered.length === 0 &&
+      successorsRegistered.length === 0 &&
+      undated.length === 0 &&
+      unexplained.length === 0
+    results.push({
+      name: 'unfetchable ledgers: 18 renames and 50 exclusions, all registered, none in both, no successor already registered, every exclusion dated and reasoned',
+      passed,
+      detail: passed ? undefined : JSON.stringify({ renamed: renamed.length, excluded: excluded.length, overlap, notRegistered, successorsRegistered, undated: undated.map((entry) => entry.ticker), unexplained: unexplained.map((entry) => entry.ticker) }),
+    })
+  }
+
+  // The two recycled symbols. PARA and B answer Yahoo with long charts, so
+  // neither stub rule sees them; each is excluded with the SEC Form 25 date
+  // of the registered company, a reason that says what happened to it, a
+  // `recycledBy` that names the company now holding the symbol (with its
+  // CIK), and evidence that cites both CIKs. PSKY is a new registrant, so
+  // PARA is a merger in the exclusion ledger, not a rename. Only these two
+  // carry `recycledBy`, and the fetch plan sets both aside before any fetch.
+  {
+    const excludedByTicker = new Map(EXCLUDED_UNFETCHABLE.map((entry) => [entry.ticker, entry]))
+    const para = excludedByTicker.get('PARA')
+    const b = excludedByTicker.get('B')
+    const withRecycledBy = EXCLUDED_UNFETCHABLE.filter((entry) => entry.recycledBy != null).map((entry) => entry.ticker)
+    const plan = planUniverseFetch(['WBD', 'PARA', 'AUR', 'B'])
+    const passed =
+      para != null &&
+      para.delistingDate === '2025-08-07' &&
+      /Paramount Skydance/.test(para.reason) && /Banzai/.test(para.reason) &&
+      /Banzai International/.test(para.recycledBy ?? '') && /1826011/.test(para.recycledBy ?? '') &&
+      /813828/.test(para.evidence) && /2041610/.test(para.evidence) && /Form 25-NSE filed 2025-08-07/.test(para.evidence) && /merger, not a rename/.test(para.evidence) &&
+      !(('PARA' in TICKER_RENAMES) || ('PSKY' in TICKER_RENAMES)) &&
+      b != null &&
+      b.delistingDate === '2025-01-27' &&
+      /Apollo/.test(b.reason) && /Barrick/.test(b.reason) &&
+      /Barrick Mining/.test(b.recycledBy ?? '') && /756894/.test(b.recycledBy ?? '') &&
+      /CIK 9984/.test(b.evidence) && /Form 25-NSE filed 2025-01-27/.test(b.evidence) && /Apollo Global Management/.test(b.evidence) &&
+      withRecycledBy.join(',') === 'PARA,B' &&
+      plan.fetch.map((entry) => entry.ticker).join(',') === 'WBD,AUR' &&
+      plan.excluded.map((entry) => `${entry.ticker}:${entry.recycledBy == null ? 'none' : 'recycled'}`).join(',') === 'PARA:recycled,B:recycled'
+    results.push({
+      name: 'recycled symbols: PARA (Paramount Global, merged 2025-08-07, now Banzai) and B (Barnes Group, taken private 2025-01-27, now Barrick) are dated, reasoned, cite both CIKs, carry recycledBy, and are set aside before any fetch',
+      passed,
+      detail: passed ? undefined : JSON.stringify({ para, b, withRecycledBy, fetch: plan.fetch, excluded: plan.excluded.map((entry) => entry.ticker) }),
+    })
+  }
+
+  // History continuity: every rename's successor chart starts no later than
+  // the company's own listing day (originalFirstTrade, from Alpha Vantage's
+  // listing dates, not the successor chart) and before the change took
+  // effect, at the first trade dates the resolution recorded, and the
+  // effective date is never after the day the names were resolved.
+  {
+    const expected: Record<string, [successor: string, firstTrade: string, originalFirstTrade: string]> = {
+      SQ: ['XYZ', '2015-11-19', '2015-11-19'], BK: ['BNY', '1973-05-03', '1973-05-03'], MMC: ['MRSH', '1973-02-21', '1987-12-30'], FI: ['FISV', '1986-09-25', '1990-03-26'],
+      BGNE: ['ONC', '2016-02-03', '2016-02-03'], IAC: ['PPLI', '1993-01-19', '1993-01-19'], ZI: ['GTM', '2020-06-04', '2020-06-04'], YY: ['JOYY', '2012-11-21', '2012-11-21'],
+      ATGE: ['CVSA', '1991-06-21', '1991-06-28'], KAR: ['OPLN', '2009-12-11', '2009-12-11'], VSCO: ['VSXY', '2021-07-21', '2021-07-21'], FDP: ['DMC', '1997-10-24', '1997-10-24'],
+      LANC: ['MZTI', '1980-03-17', '1990-03-26'], CSWI: ['CSW', '2015-09-30', '2015-10-01'], ERJ: ['EMBJ', '2000-07-21', '2000-07-21'], JBT: ['JBTM', '2008-07-22', '2008-07-22'],
+      EQR: ['VMRK', '1993-08-12', '1993-08-12'], SGMO: ['SGMOQ', '2000-04-06', '2000-04-06'],
+    }
+    const mismatched = Object.entries(expected).filter(([original, [successor, firstTrade, originalFirstTrade]]) => {
+      const rename = TICKER_RENAMES[original]
+      return rename == null || rename.successor !== successor || rename.successorFirstTrade !== firstTrade || rename.originalFirstTrade !== originalFirstTrade
+    }).map(([original]) => original)
+    const withoutContinuity = Object.entries(TICKER_RENAMES).filter(([, rename]) => !renameHasHistoryContinuity(rename)).map(([original]) => original)
+    const badEffectiveDate = Object.entries(TICKER_RENAMES)
+      .filter(([, rename]) => !isoDate.test(rename.effectiveDate) || rename.effectiveDate > UNFETCHABLE_RESOLVED_ON || rename.successorFirstTrade >= rename.effectiveDate)
+      .map(([original]) => original)
+    const badListingDate = Object.entries(TICKER_RENAMES)
+      .filter(([, rename]) => !isoDate.test(rename.originalFirstTrade) || rename.successorFirstTrade > rename.originalFirstTrade)
+      .map(([original]) => original)
+    const notApplied = Object.keys(TICKER_RENAMES).filter((original) => resolveFetchSymbol(original) !== TICKER_RENAMES[original].successor)
+    const untouched = resolveFetchSymbol('aapl') === 'AAPL'
+    const passed =
+      Object.keys(expected).length === 18 &&
+      Object.keys(TICKER_RENAMES).length === 18 &&
+      mismatched.length === 0 &&
+      withoutContinuity.length === 0 &&
+      badEffectiveDate.length === 0 &&
+      badListingDate.length === 0 &&
+      notApplied.length === 0 &&
+      untouched
+    results.push({
+      name: 'ticker renames: every successor history starts by the company\'s own listing day and before the rename took effect (the recorded dates), so each of the 18 is applied',
+      passed,
+      detail: passed ? undefined : JSON.stringify({ mismatched, withoutContinuity, badEffectiveDate, badListingDate, notApplied, untouched }),
+    })
+  }
+
+  // The two renames this pass added, and the eight names it excluded. SGMO
+  // is a Chapter 11 name whose shares keep trading under SGMOQ with the
+  // whole history: a rename, not an exclusion. EQR became VMRK under the
+  // same SEC registrant. The eight (seven acquired or taken private, plus
+  // WOLF, whose registered shares were cancelled) are excluded with a date
+  // and a reason that names what happened.
+  {
+    const excludedByTicker = new Map(EXCLUDED_UNFETCHABLE.map((entry) => [entry.ticker, entry]))
+    const sgmo = TICKER_RENAMES.SGMO
+    const eqr = TICKER_RENAMES.EQR
+    const eight: Record<string, [date: string, reasonPattern: RegExp]> = {
+      EA: ['2026-08-04', /Public Investment Fund/],
+      IAS: ['2025-12-23', /Novacap/],
+      CPRX: ['2026-07-16', /Angelini/],
+      NSA: ['2026-07-22', /Public Storage/],
+      AVB: ['2026-08-17', /Equity Residential|Vivmark/],
+      WBS: ['2026-08-20', /Santander/],
+      CRNX: ['2026-09-01', /Vertex/],
+      WOLF: ['2025-09-26', /Chapter 11/],
+    }
+    const wrongExclusions = Object.entries(eight).filter(([ticker, [date, pattern]]) => {
+      const entry = excludedByTicker.get(ticker)
+      return entry == null || entry.delistingDate !== date || !pattern.test(entry.reason) || !/8-K/.test(entry.evidence)
+    }).map(([ticker]) => ticker)
+    const passed =
+      sgmo != null &&
+      sgmo.successor === 'SGMOQ' &&
+      sgmo.note.startsWith('Chapter 11 2026-06-23; still files; history continues under SGMOQ') &&
+      sgmo.effectiveDate === '2026-06-23' &&
+      resolveFetchSymbol('SGMO') === 'SGMOQ' &&
+      !excludedByTicker.has('SGMO') &&
+      eqr != null &&
+      eqr.successor === 'VMRK' &&
+      /906107/.test(eqr.note) &&
+      resolveFetchSymbol('EQR') === 'VMRK' &&
+      !excludedByTicker.has('EQR') &&
+      wrongExclusions.length === 0 &&
+      planUniverseFetch(['EQR', 'AVB', 'SGMO', 'EA', 'WOLF']).fetch.map((entry) => `${entry.ticker}>${entry.fetchedAs}`).join(',') === 'EQR>VMRK,SGMO>SGMOQ'
+    results.push({
+      name: 'stub-probe resolution: SGMO -> SGMOQ and EQR -> VMRK are renames; EA, IAS, CPRX, NSA, AVB, WBS, CRNX and WOLF are dated, reasoned exclusions',
+      passed,
+      detail: passed ? undefined : JSON.stringify({ sgmo, eqr, wrongExclusions }),
+    })
+  }
+
+  // A rename whose successor chart starts on or after the change would be a
+  // fresh listing, not the same series; it is refused, not applied.
+  {
+    const fresh: TickerRename = {
+      successor: 'NEWCO',
+      effectiveDate: '2024-06-01',
+      effectiveDateBasis: 'sec-filing',
+      successorFirstTrade: '2024-06-03',
+      originalFirstTrade: '2024-06-03',
+      note: 'a listing that starts after the change',
+    }
+    let refused = ''
+    try {
+      planUniverseFetch(['OLDCO'], { renames: { OLDCO: fresh }, excluded: [] })
+    } catch (error) {
+      refused = (error as Error).message
+    }
+    const sameDay = renameHasHistoryContinuity({ successorFirstTrade: '2024-06-01', effectiveDate: '2024-06-01', originalFirstTrade: '2024-06-01' })
+    const dayBefore = renameHasHistoryContinuity({ successorFirstTrade: '2024-05-31', effectiveDate: '2024-06-01', originalFirstTrade: '2024-05-31' })
+    const malformed = renameHasHistoryContinuity({ successorFirstTrade: '2024/05/31', effectiveDate: '2024-06-01', originalFirstTrade: '2024-05-31' })
+    const passed = /continuity/.test(refused) && /NEWCO/.test(refused) && /fresh listing/.test(refused) && !sameDay && dayBefore && !malformed
+    results.push({
+      name: 'ticker renames: a successor whose history starts on or after the change is refused as a fresh listing',
+      passed,
+      detail: passed ? undefined : JSON.stringify({ refused, sameDay, dayBefore, malformed }),
+    })
+  }
+
+  // A recycled symbol: the successor's chart exists and starts before the
+  // resolution day, so the old "earlier than today" comparison would have
+  // let it through, but it starts a decade after the company's own listing
+  // (2015-11-19), so it cannot carry the history the original symbol would
+  // have contributed. It is refused, and the message says why.
+  {
+    const recycled: TickerRename = {
+      successor: 'RCYC',
+      effectiveDate: '2026-03-02',
+      effectiveDateBasis: 'sec-filing',
+      successorFirstTrade: '2026-01-05',
+      originalFirstTrade: '2015-11-19',
+      note: 'a symbol reused by a 2026 listing',
+    }
+    let refused = ''
+    try {
+      planUniverseFetch(['OLDCO'], { renames: { OLDCO: recycled }, excluded: [] })
+    } catch (error) {
+      refused = (error as Error).message
+    }
+    const problem = renameContinuityProblem(recycled) ?? ''
+    const oldGuardWouldPass = recycled.successorFirstTrade < UNFETCHABLE_RESOLVED_ON && recycled.successorFirstTrade < recycled.effectiveDate
+    const genuine = renameContinuityProblem({ successorFirstTrade: '2015-11-19', effectiveDate: '2026-03-02', originalFirstTrade: '2015-11-19' })
+    const passed =
+      /continuity/.test(refused) && /RCYC/.test(refused) && /recycled/.test(refused) && /2015-11-19/.test(refused) &&
+      /recycled/.test(problem) && oldGuardWouldPass && genuine == null && !renameHasHistoryContinuity(recycled)
+    results.push({
+      name: 'ticker renames: a recycled symbol (successor first trade 2026, company listed 2015) is refused, although it starts before today',
+      passed,
+      detail: passed ? undefined : JSON.stringify({ refused, problem, oldGuardWouldPass, genuine }),
+    })
+  }
+
+  // The fetch plan: excluded names are set aside with their status and
+  // reason (an unresolved one says when it was left open), renamed names
+  // fetch under the successor, everything else fetches as itself, and the
+  // registered list stays in its given order. Two names that would fetch
+  // the same symbol, or a name in both ledgers, are refused.
+  {
+    const ledger = {
+      renames: {
+        OLDA: { successor: 'NEWA', effectiveDate: '2025-01-02', effectiveDateBasis: 'sec-filing', successorFirstTrade: '2010-01-04', originalFirstTrade: '2010-01-04', note: 'test rename' },
+      } as Record<string, TickerRename>,
+      excluded: [
+        { ticker: 'GONE', delistingDate: '2025-03-03', reason: 'acquired by Test Co', evidence: 'test filing' },
+        unresolvedExclusion('lost', 'no answer from any source'),
+      ],
+    }
+    const plan = planUniverseFetch(['AAA', 'olda', 'GONE', 'LOST', 'ZZZZBOGUS'], ledger)
+    const fetchPairs = plan.fetch.map((entry) => `${entry.ticker}>${entry.fetchedAs}`).join(',')
+    const excludedNames = plan.excluded.map((entry) => `${entry.ticker}:${entry.status}:${entry.reason}`).join(',')
+    let collision = ''
+    try {
+      planUniverseFetch(['OLDA', 'NEWA'], ledger)
+    } catch (error) {
+      collision = (error as Error).message
+    }
+    let inBoth = ''
+    try {
+      planUniverseFetch(['AAA'], { renames: ledger.renames, excluded: [{ ticker: 'OLDA', delistingDate: null, reason: 'x', evidence: 'x' }] })
+    } catch (error) {
+      inBoth = (error as Error).message
+    }
+    const passed =
+      fetchPairs === 'AAA>AAA,OLDA>NEWA,ZZZZBOGUS>ZZZZBOGUS' &&
+      excludedNames === `GONE:registered but excluded:acquired by Test Co,LOST:registered but excluded:unresolved on ${UNFETCHABLE_RESOLVED_ON}` &&
+      plan.registered.join(',') === 'AAA,OLDA,GONE,LOST,ZZZZBOGUS' &&
+      plan.renamed.length === 1 &&
+      plan.renamed[0].original === 'OLDA' &&
+      plan.renamed[0].fetchedAs === 'NEWA' &&
+      plan.attrition.registeredNames === 5 &&
+      plan.attrition.excludedNames === 2 &&
+      Math.abs(plan.attrition.excludedShare - 0.4) < 1e-12 &&
+      /twice/.test(collision) &&
+      /both/.test(inBoth)
+    results.push({
+      name: 'fetch plan: excluded names are set aside with status and reason, renames fetch under the successor, collisions and double-listed names are refused',
+      passed,
+      detail: passed ? undefined : JSON.stringify({ fetchPairs, excludedNames, registered: plan.registered, renamed: plan.renamed, attrition: plan.attrition, collision, inBoth }),
+    })
+  }
+
+  // The attrition sentence the run prints and the artifact stores.
+  {
+    const attrition = describeUniverseAttrition(1073, 57)
+    const empty = describeUniverseAttrition(0, 0)
+    const passed =
+      attrition.statement ===
+        '57 of 1073 registered names (5.3%) left the market during the window and could not be included: no free source serves their price history, or the business continues only under a new SEC registrant; results are survivor-biased by at least this share.' &&
+      Math.abs(attrition.excludedShare - 57 / 1073) < 1e-12 &&
+      empty.excludedShare === 0 &&
+      empty.statement.startsWith('0 of 0 registered names (0.0%)')
+    results.push({ name: 'universe attrition is worded as the count, the share and the survivorship consequence', passed, detail: passed ? undefined : JSON.stringify({ attrition, empty }) })
+  }
+
+  // The dataset builder end to end, with the network replaced: an excluded
+  // name never reaches the fetch, a renamed name is requested under its
+  // successor and its rows keep the original symbol, and the provenance
+  // carries the registered list as given plus both ledgers' outcomes.
+  {
+    const originalFetch = globalThis.fetch
+    const requested: string[] = []
+    const chartPayload = (symbol: string, count: number) => {
+      // A gently trending random walk, seeded from the symbol so the two
+      // names differ and the cross-sectional steps have something to rank.
+      let state = 0
+      for (const char of symbol) state = (state * 31 + char.charCodeAt(0)) >>> 0
+      const next = () => {
+        state ^= state << 13
+        state ^= state >>> 17
+        state ^= state << 5
+        return (state >>> 0) / 0x1_0000_0000
+      }
+      const closes: number[] = []
+      let price = 100
+      for (let i = 0; i < count; i++) {
+        price *= 1 + (next() - 0.49) * 0.03
+        closes.push(Number(price.toFixed(4)))
+      }
+      const firstEpoch = Date.UTC(2022, 0, 3) / 1000
+      return {
+        chart: {
+          result: [{
+            timestamp: closes.map((_, index) => firstEpoch + index * 86_400),
+            indicators: {
+              quote: [{
+                open: closes.map((close) => close * 0.99),
+                high: closes.map((close) => close * 1.02),
+                low: closes.map((close) => close * 0.98),
+                close: closes,
+                volume: closes.map(() => 1_000_000),
+              }],
+              adjclose: [{ adjclose: closes }],
+            },
+          }],
+          error: null,
+        },
+      }
+    }
+    globalThis.fetch = async (input) => {
+      const url = String(input)
+      const upstream = new URL(url).searchParams.get('url') ?? url
+      requested.push(upstream)
+      const chart = upstream.match(/\/v8\/finance\/chart\/([^?]+)/)
+      if (chart) {
+        return new Response(JSON.stringify(chartPayload(decodeURIComponent(chart[1]), 420)), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      // Fundamentals: the backend's "files nothing" answer.
+      return new Response(null, { status: 404 })
+    }
+    try {
+      const built = await buildHistoricalDataset(['SQ', 'PXD', 'AAPL'], { range: 'max', minBars: 300 })
+      const asked = (pattern: RegExp) => requested.some((url) => pattern.test(url))
+      const excludedRecord = built.provenance.universeExcluded?.[0]
+      const renameRecord = built.provenance.universeRenames?.[0]
+      const tickersInRows = [...new Set(built.samples.map((sample) => sample.ticker))].sort().join(',')
+      const summary = built.diagnostics.perTickerSummary
+      const passed =
+        !asked(/chart\/PXD\?/) &&
+        !asked(/symbol=PXD/) &&
+        !asked(/chart\/SQ\?/) &&
+        !asked(/symbol=SQ(&|$)/) &&
+        asked(/chart\/XYZ\?/) &&
+        asked(/symbol=XYZ/) &&
+        asked(/chart\/AAPL\?/) &&
+        built.provenance.universeTickers.join(',') === 'SQ,PXD,AAPL' &&
+        built.provenance.universeExcluded?.length === 1 &&
+        excludedRecord?.ticker === 'PXD' &&
+        excludedRecord?.status === 'registered but excluded' &&
+        excludedRecord?.delistingDate === '2024-05-03' &&
+        excludedRecord?.reason === 'acquired by Exxon Mobil' &&
+        built.provenance.universeRenames?.length === 1 &&
+        renameRecord?.original === 'SQ' &&
+        renameRecord?.fetchedAs === 'XYZ' &&
+        built.provenance.universeAttrition?.registeredNames === 3 &&
+        built.provenance.universeAttrition?.excludedNames === 1 &&
+        built.diagnostics.tickersAttempted === 2 &&
+        built.diagnostics.tickersRenamed === 1 &&
+        built.diagnostics.excludedBeforeFetch?.map((entry) => entry.ticker).join(',') === 'PXD' &&
+        summary.map((entry) => entry.ticker).join(',') === 'SQ,AAPL' &&
+        summary[0].fetchedAs === 'XYZ' &&
+        summary[1].fetchedAs === undefined &&
+        built.samples.length > 0 &&
+        tickersInRows === 'AAPL,SQ' &&
+        built.quality.universe.intendedMemberCount === 3 &&
+        built.quality.universe.membersWithExplicitNoHistoryOutcome === 1 &&
+        built.quality.universe.memberOutcomeCoverage === 1 &&
+        built.quality.universe.limitation.includes('1 of 3 registered names (33.3%)')
+      results.push({
+        name: 'dataset build: an excluded name never reaches the fetch, a renamed name fetches under its successor and keeps its own symbol, and the provenance carries both ledgers',
+        passed,
+        detail: passed
+          ? undefined
+          : JSON.stringify({
+              requested,
+              universeTickers: built.provenance.universeTickers,
+              excluded: built.provenance.universeExcluded,
+              renames: built.provenance.universeRenames,
+              attrition: built.provenance.universeAttrition,
+              diagnostics: { ...built.diagnostics, perTickerSummary: summary },
+              samples: built.samples.length,
+              tickersInRows,
+              universe: built.quality.universe,
+            }),
+      })
+    } finally {
+      globalThis.fetch = originalFetch
+    }
   }
 
   return results
