@@ -127,7 +127,45 @@ whatever came out.
 - Names: every ticker in `DEFAULT_BACKTEST_TICKERS` (1,359 entries as of this
   draft, `historicalBacktest.ts:170`), subject to the exchange-traded-fund
   blank in section 4. With the runner's exchange-traded-fund exclusion at
-  its default (ON, `backtest-cli.ts:188`) that is 1,073 names.
+  its default (ON, `backtest-cli.ts:188`) that is 1,073 names before the two
+  ledgers below are applied. The registered list itself is never edited; the
+  ledgers sit next to it and are applied when the dataset is built.
+  - Renames (`TICKER_RENAMES`): a company that still trades under a new
+    symbol is fetched under that symbol and kept under its registered name.
+    A rename is only accepted when the successor's price history starts on
+    the same day the original did, so a symbol that merely reused the name
+    cannot pass as a continuation.
+  - Exclusions (`EXCLUDED_UNFETCHABLE`): names that no free source serves
+    any more, each with the delisting date, the reason (bankruptcy, merger,
+    taken private, and so on) and the evidence read. Two of these are
+    recycled symbols: `PARA` and `B` now belong to Banzai International and
+    Barrick Mining, companies with long histories of their own, so a bar
+    count or a first-trade date could never have caught them. Paramount
+    Global delisted on 2025-08-07 and Barnes Group on 2025-01-27.
+  - Identity pin (`tools/registered_identity.json`): for every remaining
+    name the run records who the symbol belonged to on 2026-09-16, by
+    Securities and Exchange Commission filer number where one exists and by
+    the provider's company name and first-trade date otherwise. The runner
+    checks every name against that record before training. A changed filer
+    number stops the run outright and cannot be waved through with a flag: a
+    symbol that now belongs to a different company is a wrong company, not a
+    missing one. The same filer number with a first-trade date that moved by
+    more than 30 days also stops the run, because the Securities and
+    Exchange Commission's ticker list can lag a symbol reassignment by weeks
+    while the price provider has already handed the symbol to its new
+    holder. A changed name under the same filer and the same first-trade
+    date is printed and allowed. A name the run cannot check at all (no
+    filer number, no readable provider record, or a chart that answered
+    under another symbol) also stops the run: an unknown company is not
+    missing data. The run records the SHA-256 of the identity file it was
+    checked against, so a later edit of that file cannot pass as the one
+    the run used.
+  Names dropped by the ledgers are a known hole in the panel: a company that
+  died is exactly the kind of name a survivorship-honest study wants to keep,
+  and these are lost only because no free source still serves their prices,
+  or because the business now files under a new registrant number.
+  The run reports how many registered names it could not fetch and treats the
+  measured result as survivor-flattered by that share.
 - Features: the eleven price-only features now in `PRUNED_FEATURE_NAMES`
   (`historicalBacktest.ts:4938`): `volatility_252d`, `volatility_60d`,
   `range_compression_20d`, `downside_vol_60d`, `volatility_20d`,

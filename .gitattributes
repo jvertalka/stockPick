@@ -1,0 +1,3 @@
+# The identity ledger is hashed byte-for-byte by the pre-registered runner, so it must
+# read the same on every machine: always line feeds, never converted on checkout.
+desktop-js/tools/registered_identity.json text eol=lf

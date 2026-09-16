@@ -345,6 +345,508 @@ export const DEFAULT_BACKTEST_TICKERS = [
   'SONY', 'MLI', 'AMCR', 'TPL', 'FCNCA', 'RELX', 'TM',
 ]
 
+/* =========================================================================
+   Names in the pre-registered list that Yahoo no longer serves
+   -------------------------------------------------------------------------
+   DEFAULT_BACKTEST_TICKERS is a pre-registered list and the artifact records
+   it word for word, so its entries are never edited. On 2026-09-16 a full
+   probe found 57 of its non-fund names answering HTTP 404 from Yahoo. A
+   second probe the same day, of every remaining name's last year of bars,
+   found nine more that Yahoo still answers with HTTP 200 but with a STUB in
+   place of the history: a single bar, a series that starts on 2026-07-17,
+   or (WOLF) a series that restarts at a 2025 re-listing of new shares. Each
+   of the 66 was then checked against the SEC's ticker map and filings,
+   Yahoo's own search and chart endpoints, and Alpha Vantage's delisted
+   list. They fall into two groups, kept in the two ledgers below:
+
+   1. TICKER_RENAMES: the company still trades, under a new symbol, and
+      Yahoo serves its WHOLE price history under that symbol (the chart
+      under the successor starts on the company's original listing day).
+      The dataset builder fetches under the successor and keeps the
+      original symbol as the sample's identity, so the universe in the
+      artifact stays comparable with earlier runs. Yahoo recycles symbols,
+      so a rename is accepted only when the SEC lists the successor under
+      the old company's own CIK, and it is applied only when the
+      successor's history starts no later than the company's own listing
+      day (originalFirstTrade, from a source other than the successor's
+      chart) and before the change took effect. A Chapter 11 name whose
+      shares keep trading under a "Q" symbol (SGMO -> SGMOQ) is a rename,
+      not an exclusion: its collapse is exactly the price path a
+      survivorship-honest sample must keep.
+
+   2. EXCLUDED_UNFETCHABLE: the company left the market (acquired, taken
+      private, merged, or its shares cancelled in a bankruptcy) and no free
+      source serves its price history. These are taken out of the universe
+      before any fetch is attempted, so the runner's fail-loud guard does
+      not fire on them, and they are recorded in the artifact as
+      "registered but excluded" with the date and reason. The names that
+      remain are MORE survivor-biased, not less, and the share is
+      reported with the survivorship diagnostics.
+
+   A name that is not in either ledger and still cannot be fetched is a
+   real failure, and the runner stops on it as before. So is a name that
+   comes back as a stub: the runner's warm-up (tools/preregistered-run.ts,
+   classifyStubSeries) flags a registered name whose series starts after
+   2025-01-01 or holds fewer than a year of bars, prints it, and stops.
+
+   A third way a symbol can lie, which neither of those rules can see: the
+   symbol was handed to a DIFFERENT company after the registered one left
+   the market, and the new holder's own chart is long enough to pass both
+   stub rules (PARA is now Banzai International, listed 2021; B is now
+   Barrick Mining, listed 1985). Such an entry carries `recycledBy`, and
+   the general guard is the identity ledger: tools/registered_identity.json
+   records, for every fetchable registered name, the SEC CIK and the Yahoo
+   long name and first-trade date the run is pre-registered against, and
+   the warm-up compares each name's live CIK and meta with it (checkIdentity
+   in tools/preregistered-run.ts). A different CIK is a wrong company and
+   stops the run whatever flags were given.
+   ========================================================================= */
+
+/** The day the 66 unserved names were resolved. Unresolved entries in the
+ * exclusion ledger carry this date in their reason. */
+export const UNFETCHABLE_RESOLVED_ON = '2026-09-16'
+
+/** A symbol change. The company is the same and Yahoo serves its whole
+ * price history under the new symbol, so the backtest fetches under the
+ * successor and keeps the original symbol as the sample's identity. */
+export type TickerRename = {
+  /** The symbol Yahoo serves the history under today. */
+  successor: string
+  /** When the old symbol stopped applying. With basis 'sec-filing' this is
+   * the date of the SEC filing that recorded the change. With basis
+   * 'latest-possible' the exact day is not in the evidence gathered, so
+   * this is the day the old symbol was confirmed to answer 404 and the
+   * change happened on or before it. */
+  effectiveDate: string
+  effectiveDateBasis: 'sec-filing' | 'latest-possible'
+  /** First bar of the successor's Yahoo chart. The rename is applied only
+   * when this is no later than originalFirstTrade (the successor carries
+   * the whole history) and predates effectiveDate (it is the same series
+   * continued, not a fresh listing that starts at the change). */
+  successorFirstTrade: string
+  /** The company's first trading day as a source other than the successor's
+   * chart records it: Alpha Vantage's listing date for the company (for
+   * listings older than 1990 that is often Alpha Vantage's own data floor,
+   * which only makes the test stricter), or the SEC-dated listing. This is
+   * the earliest date the original symbol could have contributed a bar, so
+   * a successor whose chart starts after it cannot be the same series. A
+   * recycled symbol, whose chart starts at its re-listing, fails here. */
+  originalFirstTrade: string
+  note: string
+}
+
+/** Old symbol -> where its history lives now. Resolved 2026-09-16. */
+export const TICKER_RENAMES: Readonly<Record<string, TickerRename>> = {
+  SQ: {
+    successor: 'XYZ',
+    effectiveDate: UNFETCHABLE_RESOLVED_ON,
+    effectiveDateBasis: 'latest-possible',
+    successorFirstTrade: '2015-11-19',
+    originalFirstTrade: '2015-11-19',
+    note: 'Square, Inc. became Block, Inc. Yahoo chart XYZ (Block, Inc.) starts on 2015-11-19, the Square IPO day, with adjusted closes; SEC CIK 1512673 (formerly Square, Inc.) lists ticker XYZ. The exact day the symbol switched is not in the evidence gathered; SQ was confirmed unserved on 2026-09-16. Alpha Vantage lists XYZ with listing date 2015-11-19.',
+  },
+  BK: {
+    successor: 'BNY',
+    effectiveDate: UNFETCHABLE_RESOLVED_ON,
+    effectiveDateBasis: 'latest-possible',
+    successorFirstTrade: '1973-05-03',
+    originalFirstTrade: '1973-05-03',
+    note: 'The Bank of New York Mellon Corporation. Yahoo chart BNY starts on 1973-05-03 with adjusted closes; SEC CIK 1390777 lists ticker BNY. The exact switch day is not in the evidence gathered; BK was confirmed unserved on 2026-09-16. Alpha Vantage lists BNY with listing date 1973-05-03.',
+  },
+  MMC: {
+    successor: 'MRSH',
+    effectiveDate: UNFETCHABLE_RESOLVED_ON,
+    effectiveDateBasis: 'latest-possible',
+    successorFirstTrade: '1973-02-21',
+    originalFirstTrade: '1987-12-30',
+    note: 'Marsh & McLennan Companies, Inc. Yahoo chart MRSH starts on 1973-02-21 with adjusted closes; SEC CIK 62709 lists ticker MRSH. The exact switch day is not in the evidence gathered; MMC was confirmed unserved on 2026-09-16. Alpha Vantage lists MRSH with listing date 1987-12-30 (its data floor; the Yahoo chart reaches further back).',
+  },
+  FI: {
+    successor: 'FISV',
+    effectiveDate: '2025-11-10',
+    effectiveDateBasis: 'sec-filing',
+    successorFirstTrade: '1986-09-25',
+    originalFirstTrade: '1990-03-26',
+    note: 'Fiserv, Inc. moved its listing from the NYSE back to Nasdaq under FISV: SEC CIK 798354 filed an 8-K on 2025-10-29 (item 3.01) and a Form 25 on 2025-11-10 recording the transfer. Yahoo chart FISV starts on 1986-09-25. Alpha Vantage lists FISV with listing date 1990-03-26 (its data floor; the Yahoo chart reaches further back).',
+  },
+  BGNE: {
+    successor: 'ONC',
+    effectiveDate: '2025-05-27',
+    effectiveDateBasis: 'sec-filing',
+    successorFirstTrade: '2016-02-03',
+    originalFirstTrade: '2016-02-03',
+    note: 'BeiGene, Ltd. became BeOne Medicines AG: SEC CIK 1651308 filed a Form 8-K12G3 successor-issuer notice on 2025-05-27 and lists ticker ONC. Yahoo chart ONC starts on 2016-02-03, the BeiGene IPO day. Alpha Vantage lists ONC with listing date 2016-02-03.',
+  },
+  IAC: {
+    successor: 'PPLI',
+    effectiveDate: '2026-06-02',
+    effectiveDateBasis: 'sec-filing',
+    successorFirstTrade: '1993-01-19',
+    originalFirstTrade: '1993-01-19',
+    note: 'IAC Inc. became People Inc: SEC CIK 1800227 records the rename on 2026-06-02 with ticker PPLI on Nasdaq. Yahoo chart PPLI (People Incorporated) starts on 1993-01-19, so the history predates the change. Alpha Vantage lists the company with listing date 1993-01-19 both as IACI (2015 listing status) and as PPLI today.',
+  },
+  ZI: {
+    successor: 'GTM',
+    effectiveDate: UNFETCHABLE_RESOLVED_ON,
+    effectiveDateBasis: 'latest-possible',
+    successorFirstTrade: '2020-06-04',
+    originalFirstTrade: '2020-06-04',
+    note: 'ZoomInfo Technologies Inc. Yahoo chart GTM starts on 2020-06-04, the ZoomInfo IPO day; SEC CIK 1794515 lists ticker GTM. The exact switch day is not in the evidence gathered; ZI was confirmed unserved on 2026-09-16. Alpha Vantage lists GTM with listing date 2020-06-04.',
+  },
+  YY: {
+    successor: 'JOYY',
+    effectiveDate: UNFETCHABLE_RESOLVED_ON,
+    effectiveDateBasis: 'latest-possible',
+    successorFirstTrade: '2012-11-21',
+    originalFirstTrade: '2012-11-21',
+    note: 'YY Inc. became JOYY Inc. Yahoo chart JOYY starts on 2012-11-21, the YY IPO day; SEC CIK 1530238 lists ticker JOYY. The exact switch day is not in the evidence gathered; YY was confirmed unserved on 2026-09-16. Alpha Vantage lists JOYY with listing date 2012-11-21.',
+  },
+  ATGE: {
+    successor: 'CVSA',
+    effectiveDate: '2026-01-28',
+    effectiveDateBasis: 'sec-filing',
+    successorFirstTrade: '1991-06-21',
+    originalFirstTrade: '1991-06-28',
+    note: 'Adtalem Global Education Inc. became Covista Inc.: SEC CIK 730464 records the rename on 2026-01-28 with ticker CVSA on the NYSE. Yahoo chart CVSA starts on 1991-06-21, the DeVry IPO. Alpha Vantage lists CVSA with listing date 1991-06-28 (a week after the first Yahoo bar).',
+  },
+  KAR: {
+    successor: 'OPLN',
+    effectiveDate: UNFETCHABLE_RESOLVED_ON,
+    effectiveDateBasis: 'latest-possible',
+    successorFirstTrade: '2009-12-11',
+    originalFirstTrade: '2009-12-11',
+    note: 'KAR Auction Services, Inc. became OPENLANE, Inc. Yahoo chart OPLN starts on 2009-12-11, the KAR IPO day; SEC CIK 1395942 lists ticker OPLN. The exact switch day is not in the evidence gathered; KAR was confirmed unserved on 2026-09-16. Alpha Vantage lists OPLN with listing date 2009-12-11.',
+  },
+  VSCO: {
+    successor: 'VSXY',
+    effectiveDate: UNFETCHABLE_RESOLVED_ON,
+    effectiveDateBasis: 'latest-possible',
+    successorFirstTrade: '2021-07-21',
+    originalFirstTrade: '2021-07-21',
+    note: "Victoria's Secret & Co. Yahoo chart VSXY starts on 2021-07-21, the 2021 spin-off; SEC CIK 1856437 lists ticker VSXY. The exact switch day is not in the evidence gathered; VSCO was confirmed unserved on 2026-09-16. Alpha Vantage lists VSXY with listing date 2021-07-21.",
+  },
+  FDP: {
+    successor: 'DMC',
+    effectiveDate: '2026-06-04',
+    effectiveDateBasis: 'sec-filing',
+    successorFirstTrade: '1997-10-24',
+    originalFirstTrade: '1997-10-24',
+    note: 'Fresh Del Monte Produce Inc became Del Monte Corp: SEC CIK 1047340 records the rename on 2026-06-04 with ticker DMC on the NYSE. Yahoo chart DMC starts on 1997-10-24, the Fresh Del Monte IPO. Alpha Vantage lists DMC with listing date 1997-10-24.',
+  },
+  LANC: {
+    successor: 'MZTI',
+    effectiveDate: '2025-05-16',
+    effectiveDateBasis: 'sec-filing',
+    successorFirstTrade: '1980-03-17',
+    originalFirstTrade: '1990-03-26',
+    note: 'Lancaster Colony Corp became The Marzetti Company: SEC CIK 57515 records the rename on 2025-05-16 with ticker MZTI on Nasdaq. Yahoo chart MZTI starts on 1980-03-17. Alpha Vantage lists MZTI with listing date 1990-03-26 (its data floor; the Yahoo chart reaches further back).',
+  },
+  CSWI: {
+    successor: 'CSW',
+    effectiveDate: '2025-06-06',
+    effectiveDateBasis: 'sec-filing',
+    successorFirstTrade: '2015-09-30',
+    originalFirstTrade: '2015-10-01',
+    note: 'CSW Industrials, Inc. moved its listing from Nasdaq to the NYSE under CSW: SEC CIK 1624794 filed an 8-K on 2025-05-01 (items 2.01, 3.01) and a Form 25 on 2025-06-06. Yahoo chart CSW starts on 2015-09-30, the 2015 spin-off. The Alpha Vantage row that shows CSWI as delisted on 2026-09-15 carries a snapshot placeholder date, not a real delisting. Alpha Vantage lists CSW with listing date 2015-10-01 (the day after the when-issued first Yahoo bar).',
+  },
+  ERJ: {
+    successor: 'EMBJ',
+    effectiveDate: UNFETCHABLE_RESOLVED_ON,
+    effectiveDateBasis: 'latest-possible',
+    successorFirstTrade: '2000-07-21',
+    originalFirstTrade: '2000-07-21',
+    note: 'Embraer S.A. (the NYSE ADR). Yahoo chart EMBJ starts on 2000-07-21, the ADR listing; SEC CIK 1355444 lists ticker EMBJ. The exact switch day is not in the evidence gathered; ERJ was confirmed unserved on 2026-09-16. Alpha Vantage lists EMBJ with listing date 2000-07-21.',
+  },
+  JBT: {
+    successor: 'JBTM',
+    effectiveDate: '2025-01-07',
+    effectiveDateBasis: 'sec-filing',
+    successorFirstTrade: '2008-07-22',
+    originalFirstTrade: '2008-07-22',
+    note: 'John Bean Technologies became JBT Marel Corporation after the Marel combination: SEC CIK 1433660 records the rename on 2024-12-20 and an 8-K on 2025-01-07 (item 2.01), and lists ticker JBTM. Yahoo chart JBTM starts on 2008-07-22, the John Bean spin-off. Alpha Vantage lists JBTM with listing date 2008-07-22.',
+  },
+  EQR: {
+    successor: 'VMRK',
+    effectiveDate: '2026-08-17',
+    effectiveDateBasis: 'sec-filing',
+    successorFirstTrade: '1993-08-12',
+    originalFirstTrade: '1993-08-12',
+    note: "Equity Residential changed its name to Vivmark Residential when it completed its acquisition of AvalonBay Communities: SEC CIK 906107 (formerly Equity Residential) filed an 8-K on 2026-08-17 (items 2.01, 5.03) saying the company changed its name, that its shares continue to trade on the NYSE and trade under VMRK from 2026-08-18, and that share certificates are unaffected; the SEC ticker map lists VMRK under that CIK. Yahoo chart VMRK starts on 1993-08-12, Equity Residential's listing day (Alpha Vantage lists VMRK with listing date 1993-08-12), with adjusted closes on all 8,330 daily bars, and its closes equal the EQR stub's closes on every shared day before the rename (69.00 on 2026-07-17, 63.66 on 2026-08-17) while the AVB stub's differ, so the series is Equity Residential's; Yahoo's longName on VMRK reads AvalonBay, a label error, and its shortName is Vivmark Residential. Yahoo still answers HTTP 200 for EQR with a stub from 2026-07-17 that freezes at 63.66 after the rename. AvalonBay itself is in the exclusion ledger.",
+  },
+  SGMO: {
+    successor: 'SGMOQ',
+    effectiveDate: '2026-06-23',
+    effectiveDateBasis: 'sec-filing',
+    successorFirstTrade: '2000-04-06',
+    originalFirstTrade: '2000-04-06',
+    note: 'Chapter 11 2026-06-23; still files; history continues under SGMOQ. Sangamo Therapeutics (SEC CIK 1001233) moved from Nasdaq to OTCQB on 2026-05-05 (8-K filed 2026-07-20, item 3.01, after the 2026-04-28 delisting determination), filed its Chapter 11 petition on 2026-06-23 (8-K filed 2026-06-23, item 1.03; Case 26-10989, D. Del.), and keeps filing (8-Ks of 2026-08-28 and 2026-09-08 on the court-approved asset sale); the SEC ticker map lists SGMOQ under that CIK. Yahoo chart SGMOQ starts on 2000-04-06, the Nasdaq IPO day, with adjusted closes on all 6,650 daily bars through 2026-09-16. A bankruptcy whose full price path is available is exactly what a survivorship-honest sample must keep. SGMO is absent from both Alpha Vantage delisted pulls, and Yahoo answers 404 for SGMO itself.',
+  },
+}
+
+/** A registered name that no free source serves any more. */
+export type ExcludedUnfetchable = {
+  ticker: string
+  /** The last trading day: Alpha Vantage's delisting date where it gives a
+   * real one, otherwise the SEC closing filing. Null for an unresolved name. */
+  delistingDate: string | null
+  reason: string
+  evidence: string
+  /** Set when the symbol has since been handed to a DIFFERENT company, so
+   * that a fetch under it comes back with someone else's history. Names
+   * the new holder (with its SEC CIK and where its chart starts), so the
+   * record explains why a symbol that Yahoo answers, with plenty of bars,
+   * is still excluded. A recycled symbol whose new holder has a long
+   * history passes both stub rules; only the identity check at warm-up
+   * (tools/preregistered-run.ts, checkIdentity, against the pre-registered
+   * identity ledger tools/registered_identity.json) catches it. */
+  recycledBy?: string
+}
+
+/** The entry an unresolved name gets: no date, and a reason that says when
+ * the question was left open, so a later pass knows what to revisit. */
+export function unresolvedExclusion(ticker: string, evidence: string): ExcludedUnfetchable {
+  return { ticker: ticker.trim().toUpperCase(), delistingDate: null, reason: `unresolved on ${UNFETCHABLE_RESOLVED_ON}`, evidence }
+}
+
+/** Registered names that left the market. Resolved 2026-09-16; every entry
+ * was delisted, and no name was left unresolved. Eight came from the stub
+ * probe: Yahoo answers HTTP 200 for them with a one-bar stub or a series
+ * that starts on 2026-07-17 (WOLF: at its 2025 re-listing), so the 404
+ * probe missed them and, unlisted, they would have passed the warm-up and
+ * dropped out of the build uncounted. The last two (PARA, B) came from the
+ * identity re-probe: their symbols now belong to other companies with long
+ * charts, so they pass both stub rules and only the CIK check tells. */
+export const EXCLUDED_UNFETCHABLE: readonly ExcludedUnfetchable[] = [
+  { ticker: 'PXD', delistingDate: '2024-05-03', reason: 'acquired by Exxon Mobil', evidence: "Alpha Vantage row 'PXD, Pioneer Natural Resources Company, NYSE, delisted 2024-05-03'; SEC 8-K filed 2024-05-03 (items 2.01, 3.01, 5.01) names Exxon Mobil Corporation as acquirer at 2.3234 XOM shares per share; Form 25-NSE 2024-05-03; Form 15-12G 2024-05-13." },
+  { ticker: 'CFLT', delistingDate: '2026-03-17', reason: 'acquired by International Business Machines (IBM)', evidence: "Alpha Vantage row 'CFLT, Confluent Inc Class A, NASDAQ, delisted 2026-03-17'; SEC 8-K filed 2026-03-17 (items 2.01, 3.01, 5.01) names International Business Machines Corporation (Corvo Merger Sub) as acquirer; Form 25-NSE 2026-03-17; Form 15-12G 2026-03-27." },
+  { ticker: 'CYBR', delistingDate: '2026-02-11', reason: 'acquired by Palo Alto Networks', evidence: "Alpha Vantage row 'CYBR, CyberArk Software Ltd, NASDAQ, delisted 2026-02-11'; SEC 6-K filed 2026-02-11 reports completion of the merger with Palo Alto Networks via Athens Strategies Ltd.; Form 25-NSE 2026-02-11; Form 15-12G 2026-02-23." },
+  { ticker: 'JNPR', delistingDate: '2025-07-02', reason: 'acquired by Hewlett Packard Enterprise', evidence: 'Not in either Alpha Vantage delisted pull; SEC 8-K filed 2025-07-02 (items 2.01, 3.01, 5.01) names Hewlett Packard Enterprise Company as Parent; Form 25-NSE 2025-07-02; Form 15-12G 2025-07-14.' },
+  { ticker: 'CMA', delistingDate: '2026-01-30', reason: 'acquired by Fifth Third Bancorp', evidence: "Alpha Vantage row 'CMA, Comerica Inc, NYSE, delisted 2026-01-30' (last trading day); SEC 8-K filed 2026-02-02 (items 2.01, 3.01, 5.01) records the 2026-02-01 closing with Comerica merged into Fifth Third Financial Corporation; Form 25-NSE 2026-02-02; Form 15-12G 2026-02-12." },
+  { ticker: 'DFS', delistingDate: '2025-05-16', reason: 'acquired by Capital One Financial', evidence: "Alpha Vantage row 'DFS, Discover Financial Services, NYSE, delisted 2025-05-16'; SEC 8-K filed 2025-05-19 (items 2.01, 3.01, 5.01) records the 2025-05-18 closing with Discover merged into Capital One Financial Corporation; Form 25-NSE 2025-05-19; Form 15-12G 2025-05-29." },
+  { ticker: 'EXAS', delistingDate: '2026-03-24', reason: 'acquired by Abbott Laboratories', evidence: "Alpha Vantage row 'EXAS, Exact Sciences Corp, NASDAQ, delisted 2026-03-24'; SEC 8-K filed 2026-03-23 (items 2.01, 3.01, 5.01) names Abbott Laboratories (Badger Merger Sub I) as acquirer; Form 25-NSE 2026-03-23; Form 15-12G 2026-04-02." },
+  { ticker: 'HOLX', delistingDate: '2026-04-07', reason: 'taken private by Blackstone and TPG', evidence: "Alpha Vantage row 'HOLX, Hologic Inc, NASDAQ, delisted 2026-04-07'; SEC 8-K filed 2026-04-07 (items 2.01, 3.01, 5.01) states Hopper Parent Inc. is an affiliate of funds managed by Blackstone Inc. and TPG Global; Form 25-NSE 2026-04-07; Form 15-12G 2026-04-17." },
+  { ticker: 'K', delistingDate: '2025-12-11', reason: 'acquired by Mars, Incorporated', evidence: "Alpha Vantage row 'K, Kellanova, NYSE, delisted 2025-12-11'; SEC 8-K filed 2025-12-11 (items 2.01, 3.01, 5.01) names Mars, Incorporated as Parent (Acquiror 10VB8, LLC); Form 25-NSE 2025-12-11; Form 15-12G 2025-12-22." },
+  { ticker: 'WBA', delistingDate: '2025-08-28', reason: 'taken private by Sycamore Partners', evidence: "Alpha Vantage row 'WBA, Walgreens Boots Alliance Inc, NASDAQ, delisted 2025-08-28'; SEC 8-K filed 2025-08-28 (items 2.01, 3.01, 5.01) states Blazing Star Parent LLC is an affiliate of funds managed by Sycamore Partners Management, with Schedule 13E-3 going-private filings; Form 25-NSE 2025-08-28; Form 15-12G 2025-09-08." },
+  { ticker: 'HES', delistingDate: '2025-07-18', reason: 'acquired by Chevron', evidence: 'Not in either Alpha Vantage delisted pull; SEC 8-K filed 2025-07-18 (items 2.01, 3.01, 5.01) names Chevron Corporation (Yankee Merger Sub) as acquirer and says NYSE trading was suspended on the closing date; Form 25-NSE 2025-07-18; Form 15-12G 2025-07-28.' },
+  { ticker: 'CTRA', delistingDate: '2026-05-06', reason: 'acquired by Devon Energy', evidence: "Alpha Vantage row 'CTRA, Coterra Energy Inc, NYSE, delisted 2026-05-06'; SEC 8-K filed 2026-05-07 (items 2.01, 3.01, 5.01) records the 2026-05-07 closing with each share converted into 0.70 Devon Energy shares; Form 25-NSE 2026-05-07; Form 15-12G 2026-05-19." },
+  { ticker: 'IPG', delistingDate: '2025-11-26', reason: 'acquired by Omnicom Group', evidence: "Alpha Vantage row 'IPG, Interpublic Group Of Cos. Inc, NYSE, delisted 2025-11-26'; SEC 8-K filed 2025-11-26 (items 2.01, 3.01, 5.01) records 0.344 Omnicom shares per share; Form 25-NSE 2025-11-28; Form 15-12G 2025-12-08." },
+  { ticker: 'INST', delistingDate: '2024-11-13', reason: 'taken private by KKR', evidence: "Alpha Vantage row 'INST, Instructure Holdings Inc, NYSE, delisted 2024-11-13'; SEC (CIK 1841804) 8-K filed 2024-11-13 (items 2.01, 3.01, 5.01) states Icon Parent Inc. is an affiliate of funds managed by Kohlberg Kravis Roberts; Form 25-NSE 2024-11-13; Form 15-12G 2024-11-25." },
+  { ticker: 'JAMF', delistingDate: '2026-01-30', reason: 'taken private by Francisco Partners', evidence: "Alpha Vantage row 'JAMF, Jamf Holding Corp, NASDAQ, delisted 2026-01-30'; SEC 8-K filed 2026-02-02 (items 2.01, 3.01, 5.01) records the 2026-01-30 closing with Jawbreaker Parent, an affiliate of Francisco Partners; Form 25-NSE 2026-01-30; Form 15-12G 2026-02-09." },
+  { ticker: 'SEMR', delistingDate: '2026-04-28', reason: 'acquired by Adobe', evidence: "Alpha Vantage row 'SEMR, SEMrush Holdings Inc - Class A, NYSE, delisted 2026-04-28'; SEC 8-K filed 2026-04-28 (items 2.01, 3.01, 5.01) states Adobe Inc. completed its acquisition; Form 25-NSE 2026-04-28; Form 15-12G 2026-05-08." },
+  { ticker: 'SMAR', delistingDate: '2025-01-22', reason: 'taken private by Blackstone, Vista Equity Partners and ADIA', evidence: "Alpha Vantage row 'SMAR, Smartsheet Inc - Class A, NYSE, delisted 2025-01-22'; SEC 8-K filed 2025-01-22 (items 2.01, 3.01, 5.01) states Einstein Parent was formed by affiliates of Blackstone, Vista Equity Partners and the Abu Dhabi Investment Authority; Form 25-NSE 2025-01-22." },
+  { ticker: 'EB', delistingDate: '2026-03-10', reason: 'acquired by Bending Spoons', evidence: "Alpha Vantage row 'EB, Eventbrite Inc - Class A, NYSE, delisted 2026-03-10'; SEC 8-K filed 2026-03-10 (items 2.01, 3.01, 5.01) names Bending Spoons US Inc., a subsidiary of Bending Spoons S.p.A.; Form 25-NSE 2026-03-10; Form 15-12G 2026-03-20." },
+  { ticker: 'AMED', delistingDate: '2025-08-14', reason: 'acquired by UnitedHealth Group', evidence: "Alpha Vantage row 'AMED, Amedisys Inc, NASDAQ, delisted 2025-08-14'; SEC 8-K filed 2025-08-14 (items 2.01, 3.01, 5.01) names UnitedHealth Group Incorporated at $101 cash per share; Form 25-NSE 2025-08-14; Form 15-12G 2025-08-25." },
+  { ticker: 'APLS', delistingDate: '2026-05-14', reason: 'acquired by Biogen', evidence: "Alpha Vantage row 'APLS, Apellis Pharmaceuticals Inc, NASDAQ, delisted 2026-05-14'; SEC 8-K filed 2026-05-14 (items 2.01, 3.01, 5.01) records completion of Biogen Inc.'s tender offer ($41 cash plus a CVR) with Nasdaq trading suspended after 2026-05-13; SC TO-T 2026-04-14; Form 25-NSE 2026-05-14; Form 15-12G 2026-05-26." },
+  { ticker: 'BPMC', delistingDate: '2025-07-18', reason: 'acquired by Sanofi', evidence: "Not in either Alpha Vantage delisted pull; SEC 8-K filed 2025-07-18 (items 2.01, 3.01, 5.01) records completion of Sanofi's tender offer (Aventis Inc. / Rothko Merger Sub) on 2025-07-17; Form 25-NSE 2025-07-18; Form 15-12G 2025-07-29." },
+  { ticker: 'FOLD', delistingDate: '2026-04-27', reason: 'acquired by BioMarin Pharmaceutical', evidence: "Alpha Vantage row 'FOLD, Amicus Therapeutics Inc, NASDAQ, delisted 2026-04-27'; SEC 8-K filed 2026-04-27 (items 2.01, 3.01, 5.01) names BioMarin Pharmaceutical Inc. (Lynx Merger Sub 1) as acquirer; Form 25-NSE 2026-04-27; Form 15-12G 2026-05-07." },
+  { ticker: 'ITCI', delistingDate: '2025-04-02', reason: 'acquired by Johnson & Johnson', evidence: "Alpha Vantage row 'ITCI, Intra-Cellular Therapies Inc, NASDAQ, delisted 2025-04-02'; SEC 8-K filed 2025-04-02 (items 2.01, 3.01, 5.01) names Johnson & Johnson (Fleming Merger Sub) as acquirer; Form 25-NSE 2025-04-02; Form 15-12G 2025-04-14." },
+  { ticker: 'NARI', delistingDate: '2025-02-19', reason: 'acquired by Stryker', evidence: "Alpha Vantage row 'NARI, Inari Medical Inc, NASDAQ, delisted 2025-02-19'; SEC (CIK 1531048) 8-K filed 2025-02-19 (items 2.01, 3.01, 5.01) records completion of Stryker Corporation's $80 cash tender offer; Form 25-NSE 2025-02-19; Form 15-12G 2025-03-03." },
+  { ticker: 'PDCO', delistingDate: '2025-04-17', reason: 'taken private by Patient Square Capital', evidence: "Alpha Vantage row 'PDCO, Patterson Companies Inc, NASDAQ, delisted 2025-04-17'; SEC 8-K filed 2025-04-17 (items 2.01, 3.01, 5.01) states Paradigm Parent LLC is a subsidiary of funds managed by Patient Square Capital ($31.35 cash per share); Form 25-NSE 2025-04-17; Form 15-12G 2025-04-28." },
+  { ticker: 'SNV', delistingDate: '2025-12-31', reason: 'merged into Pinnacle Financial Partners', evidence: "Alpha Vantage row 'SNV, Synovus Financial Corp, NYSE, delisted 2025-12-31'; SEC 8-K filed 2026-01-02 (items 2.01, 3.01, 5.01) records that on 2026-01-01 Synovus and Pinnacle both merged into Steel Newco Inc., renamed Pinnacle Financial Partners, Inc.; Form 25-NSE 2026-01-02; Form 15-12G 2026-01-12." },
+  { ticker: 'BECN', delistingDate: '2025-04-29', reason: 'acquired by QXO', evidence: "Alpha Vantage row 'BECN, Beacon Roofing Supply Inc - Class A, NASDAQ, delisted 2025-04-29'; the SEC registrant is now named QXO Building Products, Inc., and its 8-K filed 2025-04-29 (items 2.01, 3.01, 5.01) records completion of QXO, Inc.'s $124.35 cash tender offer; Form 25-NSE 2025-04-29; Form 15-12G 2025-05-09." },
+  { ticker: 'EVRI', delistingDate: '2025-07-01', reason: 'taken private by Apollo Global Management funds', evidence: "Alpha Vantage row 'EVRI, Everi Holdings Inc, NYSE, delisted 2025-07-01'; SEC 8-K filed 2025-07-01 (items 2.01, 3.01, 5.01) describes the combined purchase of Everi and IGT's gaming business by a buyer backed by Apollo Global Management funds; Form 25-NSE 2025-07-01; Form 15-12G 2025-07-11." },
+  { ticker: 'FL', delistingDate: '2025-09-08', reason: "acquired by DICK'S Sporting Goods", evidence: "The Alpha Vantage row for FL carries the snapshot placeholder date (2026-09-09 in the Sep 10 pull, 2026-09-15 in the Sep 16 pull), so the date comes from the SEC: 8-K filed 2025-09-08 (items 2.01, 3.01, 5.01) names DICK'S Sporting Goods (RJS Sub LLC) with closing on 2025-09-08; Form 25-NSE 2025-09-08; Form 15-12G 2025-09-18." },
+  { ticker: 'HBI', delistingDate: '2025-12-01', reason: 'acquired by Gildan Activewear', evidence: "The Alpha Vantage row for HBI carries the snapshot placeholder date (2026-09-15); SEC 8-K filed 2025-12-01 (items 2.01, 3.01, 5.01) records Gildan Activewear's acquisition on 2025-12-01 at 0.102 Gildan shares plus cash per share; Form 25-NSE 2025-12-01; Form 15-12G 2025-12-11." },
+  { ticker: 'JWN', delistingDate: '2025-05-20', reason: 'taken private by the Nordstrom family and El Puerto de Liverpool', evidence: "Alpha Vantage row 'JWN, Nordstrom Inc, NYSE, delisted 2025-05-20'; SEC 8-K filed 2025-05-20 (items 2.01, 3.01, 5.01) states Nordstrom Holdings, Inc. was formed by members of the Nordstrom family with Liverpool holding rollover shares, alongside Schedule 13E-3 going-private filings; Form 25-NSE 2025-05-21; Form 15-12G 2025-06-02." },
+  { ticker: 'SKX', delistingDate: '2025-09-12', reason: 'taken private by 3G Capital', evidence: "Alpha Vantage row 'SKX, Skechers U S A Inc - Class A, NYSE, delisted 2025-09-12'; SEC 8-K filed 2025-09-12 (items 2.01, 3.01, 5.01) states the buyer parties are affiliates of funds managed by 3G Capital Partners; Form 25-NSE 2025-09-12; Form 15-12G 2025-09-23." },
+  { ticker: 'KLG', delistingDate: '2025-09-25', reason: 'acquired by Ferrero', evidence: "Alpha Vantage row 'KLG, WK Kellogg Company, NYSE, delisted 2025-09-25'; SEC 8-K filed 2025-09-26 (items 2.01, 3.01, 5.01) names Ferrero International S.A. with closing on 2025-09-26; Form 25-NSE 2025-09-26; Form 15-12G 2025-10-06." },
+  { ticker: 'THS', delistingDate: '2026-02-11', reason: 'taken private (parent Industrial F&B Investments II, Inc.; sponsor not named in the closing 8-K)', evidence: "Alpha Vantage row 'THS, Treehouse Foods Inc, NYSE, delisted 2026-02-11'; SEC 8-K filed 2026-02-11 (items 2.01, 3.01, 5.01) records the merger into a subsidiary of Industrial F&B Investments II, Inc.; Form 25-NSE 2026-02-11; Form 15-12G 2026-02-23." },
+  { ticker: 'BERY', delistingDate: '2025-04-29', reason: 'acquired by Amcor', evidence: "Alpha Vantage row 'BERY, Berry Global Group Inc, NYSE, delisted 2025-04-29'; SEC 8-K filed 2025-04-30 (items 2.01, 3.01, 5.01) records 7.25 Amcor plc shares per share with closing on 2025-04-30; Form 25-NSE 2025-04-30; Form 15-12G 2025-05-12." },
+  { ticker: 'NEX', delistingDate: '2023-08-31', reason: 'merged into Patterson-UTI Energy', evidence: "Alpha Vantage row 'NEX, NexTier Oilfield Solutions Inc, NYSE, delisted 2023-08-31'; SEC 8-K filed 2023-09-01 (items 2.01, 3.01, 5.01) records the merger of equals with Patterson-UTI Energy completed 2023-09-01; Form 25-NSE 2023-09-01; Form 15-12G 2023-09-12." },
+  { ticker: 'LTHM', delistingDate: '2024-01-04', reason: 'merged into Arcadium Lithium (ALTM), which was itself delisted 2025-03-05', evidence: "Alpha Vantage row 'LTHM, Livent Corp, NYSE, delisted 2024-01-04'; SEC 8-K filed 2024-01-04 (items 3.01, 5.01) records the combination of Livent and Allkem under Arcadium Lithium plc; Form 25-NSE 2024-01-10; Form 15-12G 2024-01-22; Alpha Vantage also lists 'ALTM, Arcadium Lithium PLC, NYSE, delisted 2025-03-05' and Yahoo returns 404 for ALTM, so there is no live successor." },
+  { ticker: 'SEE', delistingDate: '2026-04-09', reason: 'taken private by Clayton, Dubilier & Rice', evidence: "Alpha Vantage row 'SEE, Sealed Air Corp, NYSE, delisted 2026-04-09'; SEC 8-K filed 2026-04-09 (items 2.01, 3.01, 5.01) states Sword Purchaser LLC is an affiliate of Clayton, Dubilier & Rice; Form 25-NSE 2026-04-09; Form 15-12G 2026-04-20." },
+  { ticker: 'ALE', delistingDate: '2025-12-15', reason: 'taken private (parent Alloy Parent LLC; sponsors not named in the closing 8-K)', evidence: 'The Alpha Vantage row for ALE carries the snapshot placeholder date (2026-09-15); SEC 8-K filed 2025-12-15 (items 2.01, 3.01, 5.01) records the cash merger into Alloy Parent LLC on 2025-12-15 at $67 per share; Form 25-NSE 2025-12-15; Form 15-12G 2025-12-29.' },
+  { ticker: 'PCH', delistingDate: '2026-02-02', reason: 'acquired by Rayonier', evidence: "Alpha Vantage row 'PCH, PotlatchDeltic Corp, NASDAQ, delisted 2026-02-02'; SEC 8-K filed 2026-02-02 (items 2.01, 3.01, 5.01) records the merger with Rayonier Inc. closed 2026-01-30 at 1.8185 Rayonier shares plus $0.61 cash per share; Form 15-12G 2026-02-12." },
+  { ticker: 'EA', delistingDate: '2026-08-04', reason: 'taken private by a consortium of the Public Investment Fund, Silver Lake and Affinity Partners', evidence: "Alpha Vantage row 'EA, Electronic Arts Inc, NASDAQ, delisted 2026-08-04'; SEC (CIK 712515) 8-K filed 2026-08-04 (items 2.01, 3.01, 5.01) records the merger with Oak-Eagle AcquireCo, formed by a consortium of the Public Investment Fund, Silver Lake and Affinity Partners, at $210 cash per share; DEFM14A 2025-11-20; Form 25-NSE 2026-08-04; Form 15-12G 2026-08-14; the SEC ticker map no longer lists EA. Yahoo answers HTTP 200 for EA with a one-bar stub dated 2026-08-04, which is why the 404 probe missed it." },
+  { ticker: 'IAS', delistingDate: '2025-12-23', reason: 'taken private by Novacap', evidence: "Not in either Alpha Vantage delisted pull; SEC (CIK 1842718) 8-K filed 2025-12-23 (items 2.01, 3.01, 5.01) records the merger with Igloo Group Parent, an affiliate of investment funds managed by Novacap Management Inc., at $10.30 cash per share; Form 25-NSE 2025-12-23; Form 15-12G 2026-01-02; the SEC ticker map no longer lists IAS. Yahoo answers HTTP 200 with a one-bar stub dated 2025-12-22." },
+  { ticker: 'CPRX', delistingDate: '2026-07-16', reason: 'acquired by Angelini Pharma', evidence: "Alpha Vantage row 'CPRX, Catalyst Pharmaceuticals Inc, NASDAQ, delisted 2026-07-16'; SEC (CIK 1369568) 8-K filed 2026-07-16 (items 2.01, 3.01, 5.01) records the 2026-07-15 merger with Angelini Cielo Inc., a subsidiary of Angelini Pharma S.p.A., at $31.50 cash per share; DEFM14A 2026-06-08; Form 25-NSE 2026-07-15; Form 15-12G 2026-07-24. Yahoo answers HTTP 200 with a one-bar stub dated 2026-07-14." },
+  { ticker: 'NSA', delistingDate: '2026-07-22', reason: 'acquired by Public Storage', evidence: "Alpha Vantage row 'NSA, National Storage Affiliates Trust, NYSE, delisted 2026-07-22'; SEC (CIK 1618563) 8-K filed 2026-07-22 (items 2.01, 3.01, 5.01) records completion of Public Storage's acquisition at 0.1400 Public Storage common shares per NSA share; DEFM14A 2026-06-12; Form 25-NSE 2026-07-22; Form 15-12G 2026-08-03; the SEC ticker map no longer lists NSA. Yahoo answers HTTP 200 with a one-bar stub dated 2026-07-21." },
+  { ticker: 'AVB', delistingDate: '2026-08-17', reason: 'acquired by Equity Residential (now Vivmark Residential, VMRK)', evidence: "Alpha Vantage row 'AVB, Avalonbay Communities Inc, NYSE, delisted 2026-08-17'; SEC (CIK 915912) 8-K filed 2026-08-17 (items 2.01, 3.01, 5.01) records the merger into a subsidiary of Equity Residential, renamed Vivmark Residential, at 2.793 Vivmark common shares per AvalonBay share; DEFM14A 2026-07-13; Form 25-NSE 2026-08-17; Form 15-12G 2026-08-27; the SEC ticker map no longer lists AVB. Yahoo answers HTTP 200 for AVB with a 43-bar stub from 2026-07-17 whose closes track the Vivmark series scaled by the exchange ratio, not AvalonBay's own history; the acquirer's history continues under VMRK (see the EQR rename)." },
+  { ticker: 'WBS', delistingDate: '2026-08-20', reason: 'acquired by Banco Santander', evidence: "Alpha Vantage row 'WBS, Webster Financial Corp, NYSE, delisted 2026-08-20'; SEC (CIK 801337) 8-K filed 2026-08-20 (items 2.01, 3.01, 5.01) records that Banco Santander, S.A. acquired all outstanding Webster common stock through a share exchange at 2.0548 Banco Santander American Depositary Shares plus $48.75 cash per share and contributed it to Santander Holdings USA; DEFM14A 2026-04-23; Form 25-NSE 2026-08-20; Form 15-12G 2026-08-31. Yahoo answers HTTP 200 with a 43-bar stub from 2026-07-17." },
+  { ticker: 'CRNX', delistingDate: '2026-09-01', reason: 'acquired by Vertex Pharmaceuticals', evidence: "Alpha Vantage row 'CRNX, Crinetics Pharmaceuticals Inc, NASDAQ, delisted 2026-09-01'; SEC (CIK 1658247) 8-K filed 2026-09-01 (items 2.01, 3.01, 5.01) records the merger with Clark Merger Sub, a subsidiary of Vertex Pharmaceuticals Incorporated, at $85.00 cash per share (about $10.0 billion in all); DEFM14A 2026-07-31; Form 25-NSE 2026-09-01; Form 15-12G 2026-09-11. Yahoo answers HTTP 200 with a 43-bar stub from 2026-07-17." },
+  { ticker: 'WOLF', delistingDate: '2025-09-26', reason: 'old common stock cancelled in Chapter 11; the WOLF listed on the NYSE since 2025-09-29 is a new security', evidence: "Alpha Vantage rows 'WOLF, Wolfspeed Inc, NASDAQ, delisted 2025-09-26' and 'WOLF, Wolfspeed Inc (New), NYSE, listed 2025-09-29'; SEC (CIK 895419) 8-K filed 2025-07-01 (items 1.03, 2.04) records the Chapter 11 petition, Form 8-A12B 2025-09-26 registers the new common stock on the NYSE, Form 25-NSE 2025-09-29 removes the old stock, and the 8-K filed 2025-09-30 (items 1.03, 3.03, 5.01, 5.03) records the plan's effectiveness on 2025-09-29 with the old shares cancelled and retired and 25,840,656 shares of new common stock issued. Yahoo serves only the new security under WOLF: 243 daily bars from 2025-09-29 and none of the registered company's 1993-2025 history, so the warm-up's stub rule flags it and the ledger sets it aside." },
+  // The two recycled symbols. Both left the market in 2025, and Yahoo and
+  // the SEC ticker map have since handed each symbol to a different company
+  // whose own chart is long enough to pass both stub rules, so the warm-up
+  // would have fetched the wrong company's history under the registered
+  // name without a word. The identity re-probe of 2026-09-16 (every
+  // fetchable name's SEC CIK and Yahoo meta against the catalog's sector
+  // placement) found them; the identity ledger and the warm-up identity
+  // check now catch any future case of the same kind.
+  {
+    ticker: 'PARA',
+    delistingDate: '2025-08-07',
+    reason: 'merged into Paramount Skydance (PSKY), a new SEC registrant; the symbol has since been reused by Banzai International',
+    recycledBy: 'Banzai International, Inc. (SEC CIK 1826011; Nasdaq; SIC 7372 prepackaged software; Yahoo chart under PARA from 2021-02-12)',
+    evidence:
+      "SEC (CIK 813828, Paramount Global; formerly ViacomCBS Inc., CBS Corp and Viacom Inc) 8-K filed 2025-08-07 (items 1.01, 1.02, 2.01, 3.01, 3.03, 5.01, 5.02, 5.03) records the closing of the Skydance Media transaction with Paramount Skydance Corporation (f/k/a New Pluto Global, Inc.) as the new parent, says trading in Paramount's Class A and Class B shares was halted at the close on 2025-08-06 and that the Form 25 delisting them from Nasdaq would be filed on 2025-08-07; Form 25-NSE filed 2025-08-07; Form 15-12G filed 2025-08-18; the SEC ticker map lists no ticker under CIK 813828. " +
+      'The combined company files under a NEW CIK, 2041610 (Paramount Skydance Corp, registered 2024-11-04 as New Pluto Global, Inc.; 8-K12B successor-issuer notice filed 2025-08-07; ticker PSKY on Nasdaq), so PSKY is a different registrant and the rename rule (the successor must sit under the company\'s own CIK) does not apply, although Yahoo\'s PSKY chart reaches back to 2005-12-05; this is a merger, not a rename. ' +
+      "Yahoo and the SEC ticker map now serve PARA as Banzai International, Inc. (CIK 1826011, Nasdaq, SIC 7372; 7GC & Co. Holdings Inc., a SPAC, until 2023-12-15; Yahoo chart from 2021-02-12, 1,404 daily bars on 2026-09-16), so the symbol passes both stub rules with the wrong company's history. The catalog filed PARA under Communications beside WBD, FOXA and NWSA, i.e. Paramount Global.",
+  },
+  {
+    ticker: 'B',
+    delistingDate: '2025-01-27',
+    reason: 'taken private by Apollo Global Management funds; the symbol has since been reused by Barrick Mining',
+    recycledBy: 'Barrick Mining Corporation (SEC CIK 756894, Barrick Gold Corp until 2025-04-29; NYSE; Yahoo chart under B with first-trade date 1985-02-13)',
+    evidence:
+      "SEC (CIK 9984, Barnes Group Inc.) 8-K filed 2025-01-27 (items 1.01, 1.02, 2.01, 2.03, 3.01, 3.03, 5.01, 5.02, 5.03, 8.01) records that Goat Holdco, LLC completed its acquisition of Barnes Group through Goat Merger Sub, Inc., that Parent and Merger Sub are affiliates of funds managed by affiliates of Apollo Global Management, Inc., and that NYSE trading was halted before the open on the closing date; Form 25-NSE filed 2025-01-27; Form 15-12G filed 2025-02-06; the SEC ticker map lists no ticker under CIK 9984, and Barnes's own price history is served nowhere. " +
+      "Yahoo and the SEC ticker map now serve B as Barrick Mining Corporation (CIK 756894, Barrick Gold Corp until 2025-04-29, NYSE; Yahoo meta first-trade date 1985-02-13, 10,076 daily bars on a 40-year fetch on 2026-09-16), so the symbol passes both stub rules with the wrong company's four decades of history. The catalog filed B under Industrials beside AUR and CCK, i.e. Barnes Group.",
+  },
+]
+
+/** Why a rename cannot be applied, in plain words, or null when the
+ * successor's chart carries the history the original symbol would have
+ * contributed. Two things must hold:
+ *
+ *   1. The successor's chart starts no later than the company's own first
+ *      trading day (originalFirstTrade). That day is the earliest sample
+ *      the original symbol could contribute to any run, whatever its range
+ *      or burn-in (for names older than the run's first sample date the
+ *      run's own floor is later still), so a successor that starts after it
+ *      would be missing history the original would have had. A recycled
+ *      symbol, whose chart starts at its 2026 re-listing, fails here.
+ *   2. The successor's chart starts before the change took effect, so it
+ *      is the same series continued and not a fresh listing that starts at
+ *      the change.
+ *
+ * The earlier version of this guard compared the successor's first bar with
+ * the resolution day (in effect "today") for renames whose exact switch day
+ * was unknown, which any existing chart passes; it could not have caught a
+ * recycled symbol. All three dates must be ISO calendar dates. */
+export function renameContinuityProblem(rename: Pick<TickerRename, 'successorFirstTrade' | 'effectiveDate' | 'originalFirstTrade'>): string | null {
+  const isoDate = /^\d{4}-\d{2}-\d{2}$/
+  const dates: Array<[string, unknown]> = [
+    ['successorFirstTrade', rename.successorFirstTrade],
+    ['effectiveDate', rename.effectiveDate],
+    ['originalFirstTrade', rename.originalFirstTrade],
+  ]
+  for (const [field, value] of dates) {
+    if (typeof value !== 'string' || !isoDate.test(value)) return `${field} is not an ISO calendar date (${String(value)})`
+  }
+  if (rename.successorFirstTrade > rename.originalFirstTrade) {
+    return (
+      `the successor's first trade (${rename.successorFirstTrade}) is after the company's own first trading day (${rename.originalFirstTrade}), ` +
+      'so its chart cannot be the same series: it looks like a recycled symbol or a fresh listing'
+    )
+  }
+  if (rename.successorFirstTrade >= rename.effectiveDate) {
+    return `the successor's first trade (${rename.successorFirstTrade}) does not predate the rename (${rename.effectiveDate}), so its chart would be a fresh listing, not the same series`
+  }
+  return null
+}
+
+/** True when renameContinuityProblem finds nothing wrong. */
+export function renameHasHistoryContinuity(rename: Pick<TickerRename, 'successorFirstTrade' | 'effectiveDate' | 'originalFirstTrade'>): boolean {
+  return renameContinuityProblem(rename) == null
+}
+
+/** The symbol a registered name's history is fetched under: its successor
+ * when the rename ledger has one with a continuous history, otherwise the
+ * name itself. */
+export function resolveFetchSymbol(
+  ticker: string,
+  renames: Readonly<Record<string, TickerRename>> = TICKER_RENAMES,
+): string {
+  const normalized = ticker.trim().toUpperCase()
+  const rename = renames[normalized]
+  if (rename == null) return normalized
+  const problem = renameContinuityProblem(rename)
+  if (problem != null) {
+    throw new Error(`Ticker rename ${normalized} -> ${rename.successor} lacks history continuity: ${problem}.`)
+  }
+  return rename.successor.trim().toUpperCase()
+}
+
+/** How much of the registered universe left the market and could not be
+ * included, in the words the run prints and the artifact stores. */
+export type UniverseAttrition = {
+  registeredNames: number
+  excludedNames: number
+  /** excludedNames / registeredNames; 0 when nothing was registered. */
+  excludedShare: number
+  statement: string
+}
+
+export function describeUniverseAttrition(registeredNames: number, excludedNames: number): UniverseAttrition {
+  const excludedShare = registeredNames > 0 ? excludedNames / registeredNames : 0
+  return {
+    registeredNames,
+    excludedNames,
+    excludedShare,
+    statement:
+      `${excludedNames} of ${registeredNames} registered names (${(excludedShare * 100).toFixed(1)}%) left the market during the window ` +
+      'and could not be included: no free source serves their price history, or the business continues only under a new SEC registrant; results are survivor-biased by at least this share.',
+  }
+}
+
+export type UniverseFetchPlan = {
+  /** The registered names, normalized, in the order given. */
+  registered: string[]
+  /** What will actually be fetched, in registered order: the sample keeps
+   * `ticker` as its identity and the request goes out under `fetchedAs`. */
+  fetch: Array<{ ticker: string; fetchedAs: string }>
+  renamed: Array<{ original: string; fetchedAs: string; effectiveDate: string; note: string }>
+  excluded: Array<ExcludedUnfetchable & { status: 'registered but excluded' }>
+  attrition: UniverseAttrition
+}
+
+/**
+ * Splits a registered ticker list into what gets fetched (and under which
+ * symbol) and what is set aside as registered but excluded. The ledgers
+ * default to the two above; tests pass their own. Refuses a ledger that
+ * lists a name as both renamed and excluded, a rename without history
+ * continuity, and two registered names that would fetch the same symbol
+ * (the same history twice would double-weight one company).
+ */
+export function planUniverseFetch(
+  tickers: readonly string[],
+  ledger: { renames?: Readonly<Record<string, TickerRename>>; excluded?: readonly ExcludedUnfetchable[] } = {},
+): UniverseFetchPlan {
+  const renames = ledger.renames ?? TICKER_RENAMES
+  const excludedLedger = ledger.excluded ?? EXCLUDED_UNFETCHABLE
+  const excludedByTicker = new Map(excludedLedger.map((entry) => [entry.ticker.trim().toUpperCase(), entry]))
+  for (const original of Object.keys(renames)) {
+    if (excludedByTicker.has(original.trim().toUpperCase())) {
+      throw new Error(`Ticker ${original} is listed both as renamed and as excluded; the ledgers must disagree on nothing.`)
+    }
+  }
+  const registered = tickers.map((ticker) => ticker.trim().toUpperCase())
+  const fetch: UniverseFetchPlan['fetch'] = []
+  const renamed: UniverseFetchPlan['renamed'] = []
+  const excluded: UniverseFetchPlan['excluded'] = []
+  for (const ticker of registered) {
+    const exclusion = excludedByTicker.get(ticker)
+    if (exclusion != null) {
+      excluded.push({ ...exclusion, ticker, status: 'registered but excluded' })
+      continue
+    }
+    const fetchedAs = resolveFetchSymbol(ticker, renames)
+    if (fetchedAs !== ticker) {
+      const rename = renames[ticker]
+      renamed.push({ original: ticker, fetchedAs, effectiveDate: rename.effectiveDate, note: rename.note })
+    }
+    fetch.push({ ticker, fetchedAs })
+  }
+  const seenFetchSymbols = new Map<string, string>()
+  for (const entry of fetch) {
+    const providerSymbol = normalizeYahooSymbol(entry.fetchedAs)
+    const earlier = seenFetchSymbols.get(providerSymbol)
+    if (earlier != null) {
+      throw new Error(
+        `Registered names ${earlier} and ${entry.ticker} would both fetch ${entry.fetchedAs}; one company's history would enter the dataset twice.`,
+      )
+    }
+    seenFetchSymbols.set(providerSymbol, entry.ticker)
+  }
+  return {
+    registered,
+    fetch,
+    renamed,
+    excluded,
+    attrition: describeUniverseAttrition(registered.length, excluded.length),
+  }
+}
+
 export type HorizonKey = 5 | 20 | 60 | 120
 
 export type HistoricalSample = {
@@ -1581,6 +2083,19 @@ export type BacktestDatasetProvenance = {
         delistedSecuritySource: string
         delistingReturnSource: string
       }
+  /** Registered names whose history was fetched under a successor symbol
+   * (TICKER_RENAMES). The sample keeps the original symbol as its identity.
+   * Optional only so that older artifacts still validate; every dataset this
+   * module builds fills it in, empty when nothing was renamed. */
+  universeRenames?: Array<{ original: string; fetchedAs: string; effectiveDate: string; note: string }>
+  /** Registered names taken out before any fetch because no free source
+   * serves their history (EXCLUDED_UNFETCHABLE). They stay in
+   * universeTickers, which is the list as registered; this is the ledger of
+   * why they are not in the samples. */
+  universeExcluded?: Array<ExcludedUnfetchable & { status: 'registered but excluded' }>
+  /** The excluded names as a share of the registered names, worded as the
+   * survivorship diagnostics print it. */
+  universeAttrition?: UniverseAttrition
   /** Where the company-type descriptors came from, recorded so an auditor
    * never has to take it on trust. Optional only so that model artifacts
    * written before these columns existed still validate; every dataset this
@@ -1702,8 +2217,16 @@ export type DatasetBuildResult = {
      * age is unknown (NaN, then imputed and flagged) rather than measured
      * from a cut-off history. See listingAgeYears. */
     tickersAtFetchBoundary?: number
+    /** Names fetched under a successor symbol (see TICKER_RENAMES). */
+    tickersRenamed?: number
+    /** Registered names set aside before any fetch (see EXCLUDED_UNFETCHABLE).
+     * They are not counted in tickersAttempted and never appear in
+     * perTickerSummary, because nothing was attempted for them. */
+    excludedBeforeFetch?: Array<{ ticker: string; delistingDate: string | null; reason: string }>
     perTickerSummary: Array<{
       ticker: string
+      /** Present when the history was fetched under a successor symbol. */
+      fetchedAs?: string
       bars: number
       samplesGenerated: number
       reason?: string
@@ -2094,6 +2617,12 @@ export async function buildHistoricalDataset(
     throw new Error('Historical dataset universe contains duplicate Yahoo provider aliases.')
   }
   tickers = normalizedTickers
+  // The registered list is kept as given for the artifact. Names that left
+  // the market are set aside here, before anything is fetched, and renamed
+  // names are fetched under their successor while keeping their own symbol
+  // as the sample's identity (see the ledgers next to DEFAULT_BACKTEST_TICKERS).
+  const plan = planUniverseFetch(tickers)
+  const fetchPlan = plan.fetch
   const cadence = options.cadenceDays ?? 10
   const minBars = options.minBars ?? 400  // 252 history + 120 forward + buffer
   const range = options.range ?? '5y'
@@ -2139,13 +2668,16 @@ export async function buildHistoricalDataset(
   const fundamentalStartIndex = HISTORICAL_FEATURE_NAMES.indexOf('fund_revenue_growth_yoy')
   const fundamentalEndIndex = fundamentalStartIndex + FUNDAMENTAL_FEATURE_COUNT
 
-  for (let t = 0; t < tickers.length; t++) {
-    const ticker = tickers[t]
-    options.onProgress?.(t, tickers.length, ticker)
+  for (let t = 0; t < fetchPlan.length; t++) {
+    const { ticker, fetchedAs } = fetchPlan[t]
+    // Every row in the per-name summary names the sample identity, and says
+    // which symbol the request went out under when that differs.
+    const summaryBase = fetchedAs !== ticker ? { ticker, fetchedAs } : { ticker }
+    options.onProgress?.(t, fetchPlan.length, ticker)
     let bars: DailyBar[]
     let adjustmentSummary: DailyBarAdjustmentSummary | undefined
     try {
-      const fetched = await cachedFetchDailyBars(ticker, fetchRange)
+      const fetched = await cachedFetchDailyBars(fetchedAs, fetchRange)
       bars = fetched
       adjustmentSummary = fetched.adjustment
     } catch {
@@ -2170,13 +2702,13 @@ export async function buildHistoricalDataset(
     }
     if (bars.length === 0) {
       tickersWithZeroBars++
-      perTickerSummary.push({ ticker, bars: 0, samplesGenerated: 0, reason: 'fetch failed or empty' })
+      perTickerSummary.push({ ...summaryBase, bars: 0, samplesGenerated: 0, reason: 'fetch failed or empty' })
       continue
     }
     if ((adjustmentSummary?.rejectedBars ?? 0) > 0) {
       tickersBelowMinBars++
       perTickerSummary.push({
-        ticker,
+        ...summaryBase,
         bars: bars.length,
         samplesGenerated: 0,
         reason: `${adjustmentSummary!.rejectedBars} incomplete/unaligned provider rows; series rejected fail-closed`,
@@ -2186,7 +2718,7 @@ export async function buildHistoricalDataset(
     if (bars.length < minBars) {
       tickersBelowMinBars++
       perTickerSummary.push({
-        ticker,
+        ...summaryBase,
         bars: bars.length,
         samplesGenerated: 0,
         reason: `< ${minBars} bars`,
@@ -2200,7 +2732,9 @@ export async function buildHistoricalDataset(
     barsObserved += bars.length
     for (const bar of bars) tradingDateSet.add(bar.date)
     barsWithAdjustedCloseAvailable += bars.filter(hasTotalReturnPriceBasis).length
-    const fundamentals = await fetchFundamentalsTimeline(ticker)
+    // SEC's ticker map knows only the current symbol, so a renamed name
+    // asks for its filings under the successor as well.
+    const fundamentals = await fetchFundamentalsTimeline(fetchedAs)
     if (fundamentals) tickersWithFundamentals++
     let generated = 0
     // Need 252 bars history (for 252d momentum, vol, moments) + 120 future
@@ -2258,7 +2792,7 @@ export async function buildHistoricalDataset(
       generated++
     }
     tickersWithUsableBars++
-    perTickerSummary.push({ ticker, bars: bars.length, samplesGenerated: generated })
+    perTickerSummary.push({ ...summaryBase, bars: bars.length, samplesGenerated: generated })
   }
 
   // Impute missing values with per-date cross-sectional medians (must run
@@ -2312,6 +2846,9 @@ export async function buildHistoricalDataset(
         delistedSecuritySource: null,
         delistingReturnSource: null,
       },
+      universeRenames: plan.renamed.map((entry) => ({ ...entry })),
+      universeExcluded: plan.excluded.map((entry) => ({ ...entry })),
+      universeAttrition: { ...plan.attrition },
       companyDescriptors: {
         basis: 'derived-point-in-time-from-price-and-filing-history',
         presentDaySectorLabelsUsed: false,
@@ -2339,10 +2876,14 @@ export async function buildHistoricalDataset(
         survivorshipBiasControlled: false,
         intendedMemberCount: tickers.length,
         membersWithUsablePriceHistory: tickersWithUsableBars,
-        membersWithExplicitNoHistoryOutcome: 0,
-        memberOutcomeCoverage: ratio(tickersWithUsableBars, tickers.length),
+        // The names set aside before the fetch have a known outcome (they
+        // left the market, with the date and reason in universeExcluded);
+        // what is missing is their price history, not the fact of it.
+        membersWithExplicitNoHistoryOutcome: plan.excluded.length,
+        memberOutcomeCoverage: ratio(tickersWithUsableBars + plan.excluded.length, tickers.length),
         limitation:
-          'The caller supplies symbols that exist today; historical constituents, dead symbols, and delisting returns are absent, so absolute performance is survivorship-biased.',
+          'The caller supplies symbols that exist today; historical constituents, dead symbols, and delisting returns are absent, so absolute performance is survivorship-biased. ' +
+          plan.attrition.statement,
       },
       returns: {
         labelPriceField: 'close',
@@ -2402,12 +2943,18 @@ export async function buildHistoricalDataset(
       },
     },
     diagnostics: {
-      tickersAttempted: tickers.length,
+      tickersAttempted: fetchPlan.length,
       tickersWithUsableBars,
       tickersWithZeroBars,
       tickersBelowMinBars,
       tickersWithFundamentals,
       tickersAtFetchBoundary,
+      tickersRenamed: plan.renamed.length,
+      excludedBeforeFetch: plan.excluded.map((entry) => ({
+        ticker: entry.ticker,
+        delistingDate: entry.delistingDate,
+        reason: entry.reason,
+      })),
       perTickerSummary,
     },
   }
@@ -5134,6 +5681,11 @@ export type SurvivorshipReport = {
     youngShareOfLongQuintile: number
     haircutPpPerWindow: number
   }
+  /** Registered names that left the market during the window and could not
+   * be included at all (EXCLUDED_UNFETCHABLE). The names that remain are
+   * more survivor-biased, not less, by at least this share. Present when
+   * the caller passes the dataset's attrition record. */
+  leftMarket?: UniverseAttrition
 }
 
 /** Deposit/policy-reserve-heavy financials in the default universe.
@@ -5151,6 +5703,10 @@ const CANARY_EXCLUDED_FINANCIALS = new Set([
 export function analyzeSurvivorship(
   samples: HistoricalSample[],
   steps: WalkForwardResult[],
+  /** The dataset's record of registered names that left the market
+   * (provenance.universeAttrition); reported alongside the other
+   * diagnostics when given. */
+  leftMarket?: UniverseAttrition,
 ): SurvivorshipReport | null {
   // Raw-feature lookups below index into FULL feature space — pruned
   // sample arrays would silently misread, so refuse them outright.
@@ -5286,5 +5842,6 @@ export function analyzeSurvivorship(
       youngShareOfLongQuintile: youngShare,
       haircutPpPerWindow,
     },
+    ...(leftMarket ? { leftMarket: { ...leftMarket } } : {}),
   }
 }
