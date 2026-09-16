@@ -290,3 +290,37 @@ export const SIZE_TIERED_BORROW_FEE_ANNUAL = [
   { minMarketCapUsd: 2e9, annualBps: 100 },
   { minMarketCapUsd: 0, annualBps: 350 },     // small / hard-to-borrow
 ] as const
+
+/**
+ * How the cost model sizes a name that has NO filed market cap.
+ *
+ * Filed market caps come from SEC XBRL filings, which only reach back to
+ * about 2009, and exchange-traded funds never file one. Until 2026-09-16
+ * every such name fell into the bottom, most expensive tier of the table
+ * above, so the early decades of a 40-year run charged microcap costs to
+ * names like IBM and Exxon (the 25-name smoke run paid about 268 bps a
+ * window in those years). The stand-in used instead is the trailing 20-day
+ * average dollar volume, the same price-derived number the Amihud
+ * illiquidity feature is built from. It is turned into a market-cap
+ * equivalent by dividing by a typical daily turnover rate, and that
+ * equivalent is then looked up in the SAME two tier tables.
+ *
+ * The turnover rate is anchored to Chordia, Roll and Subrahmanyam (2011),
+ * "Recent trends in trading activity and market quality", Journal of
+ * Financial Economics 101(2), who report NYSE annual share turnover rising
+ * from roughly 50 percent in the early 1990s to roughly 250 to 300 percent
+ * by 2008, which is about 1 percent of a company's shares on a typical
+ * recent day. Lo and Wang (2000), "Trading Volume: Definitions, Data
+ * Analysis, and Implications of Portfolio Theory", Review of Financial
+ * Studies 13(2), put earlier decades well below that. Using the HIGH end
+ * (1 percent a day) for every era deliberately UNDER-states the cap of a
+ * 1980s name, which can only push it toward a MORE expensive tier, so the
+ * proxy over-charges when it errs and never makes costs look cheaper than a
+ * filed cap would. In dollar-volume terms the breakpoints therefore read:
+ * mega at or above $500M a day, large at or above $100M, mid at or above
+ * $20M, small at or above $3M, micro below that.
+ */
+export const DOLLAR_VOLUME_SIZE_PROXY = {
+  /** Share of a company's market cap that trades on a typical day. */
+  dailyTurnoverOfMarketCap: 0.01,
+} as const

@@ -406,8 +406,19 @@ function hasSupportedDatasetQuality(value: unknown): value is BacktestDatasetQua
 function hasValidBaselineEvidence(value: unknown): boolean {
   if (!isRecord(value)) return false
   if (value.method !== 'paired moving-block bootstrap (Kunsch 1989; Politis-Romano 1994)' || value.confidenceLevel !== 0.95) return false
-  const validComparison = (candidate: unknown, baseline: 'random' | 'momentum_252d'): boolean => {
-    if (!isRecord(candidate) || candidate.baseline !== baseline || candidate.metric !== 'information-coefficient') return false
+  // The momentum slot may carry either twelve-month definition: the 12-0
+  // column ('momentum_252d', every record before 2026-09-16) or the 12-1
+  // form that skips the latest month ('momentum_12_1', the default gate
+  // since then). Any further optional fields on the record (gate,
+  // momentumByDefinition, alternatives, correlation) are report lines the
+  // authority check does not read, so they are neither required nor
+  // rejected here.
+  const validComparison = (
+    candidate: unknown,
+    baselines: ReadonlyArray<'random' | 'momentum_252d' | 'momentum_12_1'>,
+  ): boolean => {
+    if (!isRecord(candidate) || candidate.metric !== 'information-coefficient') return false
+    if (!baselines.includes(candidate.baseline as 'random' | 'momentum_252d' | 'momentum_12_1')) return false
     if (!isNonNegativeInteger(candidate.pairedStepCount)) return false
     const pairedStepCount = candidate.pairedStepCount as number
     if (pairedStepCount === 0 ? candidate.meanDifference !== null : !isFiniteNumber(candidate.meanDifference)) return false
@@ -423,7 +434,10 @@ function hasValidBaselineEvidence(value: unknown): boolean {
     if (Math.abs((mean as number) - (candidate.meanDifference as number)) > 1e-12) return false
     return candidate.ciClearOfZero === ((lower as number) > 0)
   }
-  return validComparison(value.random, 'random') && validComparison(value.momentum, 'momentum_252d')
+  return (
+    validComparison(value.random, ['random']) &&
+    validComparison(value.momentum, ['momentum_252d', 'momentum_12_1'])
+  )
 }
 
 function samePromotionAudit(

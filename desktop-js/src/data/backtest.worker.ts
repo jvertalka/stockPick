@@ -3,10 +3,13 @@
 import {
   PRUNED_FEATURE_NAMES,
   assessModelPromotion,
+  buildCalendarWindows,
   buildHistoricalDataset,
   computeFeatureStats,
   pruneSampleFeatures,
+  resolveWindowRule,
   runWalkForwardBacktest,
+  summarizeCalendarWindows,
   type DatasetBuildResult,
   type FullBacktestResult,
   type ModelPromotionAssessment,
@@ -91,19 +94,32 @@ ctx.onmessage = async (event: MessageEvent<RunMessage>) => {
     // with zero/negative permutation importance.
     const pruned = pruneSampleFeatures(built.samples, PRUNED_FEATURE_NAMES)
 
-    // Test window ≈ one cross-sectional date so quintile long-short
-    // portfolios are formed within a date, and the step count stays
-    // manageable as the universe widens.
-    const testSize = Math.max(60, built.diagnostics.tickersWithUsableBars)
+    // Test windows are cut on the trading calendar by the SAME rule and the
+    // SAME defaults the CLI uses (DEFAULT_WINDOW_RULE), so the app and the
+    // CLI report the same window count on the same data. Each window holds
+    // every name formed inside its 20 trading days, so quintile long-short
+    // portfolios are still formed within one holding period.
+    const windowRule = resolveWindowRule()
     const result = runWalkForwardBacktest(pruned.samples, {
-      initialTrainSize: Math.floor(pruned.samples.length * 0.6),
-      testSize,
-      stepSize: testSize,
+      ...windowRule,
+      tradingDates: built.tradingDates,
       modelOptions,
       baselineMomentumFeatureIndex: pruned.featureNames.indexOf('momentum_252d'),
     })
     if (!result) {
-      const err: WorkerOutbound = { type: 'error', message: 'Walk-forward validation produced no usable steps.' }
+      const attempted = summarizeCalendarWindows(
+        pruned.samples,
+        buildCalendarWindows(pruned.samples, { ...windowRule, tradingDates: built.tradingDates }),
+        windowRule,
+        0,
+      )
+      const err: WorkerOutbound = {
+        type: 'error',
+        message:
+          `Walk-forward validation produced no usable steps: ${attempted.windowsBuilt} test window(s) from samples dated ` +
+          `${attempted.firstSampleDate} to ${attempted.lastSampleDate} after the ${windowRule.burnInYears}-year burn-in. ` +
+          'Choose a longer history range.',
+      }
       ctx.postMessage(err)
       return
     }

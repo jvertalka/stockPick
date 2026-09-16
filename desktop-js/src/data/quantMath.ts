@@ -2481,6 +2481,13 @@ export function predictGradientBoosting(
  * gain, and the standard first upgrade over any single tree model.
  * A degenerate subsample (too few rows) falls back to the full data so a
  * member can never be nonsense.
+ *
+ * `onMemberRows` is an optional listener that receives, for each member,
+ * the row indices that member was fitted on, or null when it fell back to
+ * the full data. A caller can use it to score training rows only with the
+ * members that never saw them, which is Breiman's out-of-bag estimate
+ * (Breiman 1996, "Out-of-bag estimation", technical report, UC Berkeley).
+ * The listener changes nothing about the fit.
  */
 export function fitBaggedGradientBoosting(
   features: number[][],
@@ -2493,6 +2500,7 @@ export function fitBaggedGradientBoosting(
     depth?: number
     learningRate?: number
     quantile?: number
+    onMemberRows?: (memberIndex: number, rowIndices: number[] | null) => void
   } = {},
 ): GradientBoostingModel[] {
   const bags = Math.max(1, options.bags ?? 5)
@@ -2506,8 +2514,10 @@ export function fitBaggedGradientBoosting(
     }
     if (indices.length < 100) {
       members.push(fitGradientBoosting(features, targets, options))
+      options.onMemberRows?.(b, null)
       continue
     }
+    options.onMemberRows?.(b, indices)
     members.push(
       fitGradientBoosting(
         indices.map((i) => features[i]),
@@ -2580,4 +2590,346 @@ export function kalmanTimeVaryingBeta(
     series.push(beta)
   }
   return { beta, betaVariance: p, betaSeries: series }
+}
+
+/* =========================================================================
+   26. Ridge regression (Hoerl and Kennard 1970) — the penalised linear baseline
+   -------------------------------------------------------------------------
+   Source: Hoerl, A.E. and Kennard, R.W. (1970), "Ridge Regression: Biased
+   Estimation for Nonorthogonal Problems", Technometrics 12(1): 55-67.
+   Unpenalised intercept by centring the inputs: Hastie, Tibshirani and
+   Friedman (2009), The Elements of Statistical Learning (ESL), 2nd ed.,
+   section 3.4.1. Exact leave-one-out error of a linear smoother from the
+   hat-matrix diagonal: Allen (1974), "The Relationship Between Variable
+   Selection and Data Augmentation and a Method for Prediction",
+   Technometrics 16(1): 125-127 (the PRESS statistic), and ESL 2nd ed.
+   equation 7.64. Bayesian reading of the penalty: Lindley and Smith (1972),
+   "Bayes Estimates for the Linear Model", JRSS-B 34(1): 1-41.
+
+   Why this exists. The boosted-tree model needs a straight-line yardstick
+   fitted on exactly the same rows, so any lift over it means the trees
+   found something a linear combination of the same features could not.
+   Ridge is the standard linear choice when features are correlated, which
+   cross-sectional stock features always are: plain least squares becomes
+   unstable as X'X approaches singular, and the penalty keeps it well
+   behaved.
+
+   The fit is closed form. With Xc and yc the mean-centred inputs and
+   targets, beta = (Xc'Xc + lambda I)^-1 Xc'yc, and the intercept is
+   mean(y) - mean(x)'beta, which is the ordinary least-squares intercept
+   and is never shrunk. The p-by-p system is solved by Cholesky
+   factorisation, the numerically stable route for a symmetric
+   positive-definite matrix, with no external library.
+
+   Features arrive already cross-sectionally standardised (the trainer
+   does that before any model sees them), so nothing is rescaled here.
+   ========================================================================= */
+
+/**
+ * Lambda grid, in units of p (the number of features), searched by exact
+ * leave-one-out when the caller does not supply a lambda.
+ *
+ * Why the grid is measured in units of p. Ridge is the posterior mode
+ * under an independent Gaussian prior on each coefficient, with
+ * lambda = (noise variance) / (prior coefficient variance) (Lindley and
+ * Smith 1972; ESL section 3.4.1). If a signal explains a share R2 of the
+ * target's variance and is spread across p standardised features, the
+ * prior coefficient variance is R2 * var(y) / p and the noise variance is
+ * (1 - R2) * var(y), so lambda = p * (1 - R2) / R2. The multipliers below
+ * therefore stand for prior signal shares of about 91%, 50%, 9%, 1% and
+ * 0.1%. The top of the range is the one that matters here: monthly
+ * cross-sectional stock-return prediction reaches an out-of-sample R2 of
+ * roughly 0.1% to 0.4% (Gu, Kelly and Xiu 2020, "Empirical Asset Pricing
+ * via Machine Learning", Review of Financial Studies 33(5), Table 1),
+ * which sits between 100p and 1000p. The decade spacing follows the
+ * log-linear lambda paths used by glmnet (Friedman, Hastie and Tibshirani
+ * 2010, Journal of Statistical Software 33(1)). Leave-one-out then picks
+ * the grid point from the training rows themselves, so the shrinkage
+ * level is measured from the data rather than assumed.
+ */
+export const RIDGE_LAMBDA_GRID_MULTIPLIERS: readonly number[] = [0.1, 1, 10, 100, 1000]
+
+export type RidgeLambdaSelection =
+  | { method: 'given' }
+  | { method: 'none'; reason: string }
+  | { method: 'leave-one-out'; grid: Array<{ lambda: number; leaveOneOutMse: number }> }
+
+export type RidgeModel = {
+  /** Constant term. Equals mean(y) - mean(x)'coefficients and is never shrunk. */
+  intercept: number
+  /** One slope per feature column, in the order the columns were supplied. */
+  coefficients: number[]
+  numFeatures: number
+  /** The penalty actually used for the fit. */
+  lambda: number
+  /** How lambda was chosen, with every leave-one-out score when it was searched. */
+  lambdaSelection: RidgeLambdaSelection
+  /** Prediction for one feature row of the same width as the training rows. */
+  predict: (row: number[]) => number
+}
+
+/**
+ * Prediction from the serialisable part of a ridge model. Kept separate
+ * from the predict closure so a model that was saved as JSON (which drops
+ * functions) can still be scored.
+ */
+export function predictRidge(model: { intercept: number; coefficients: number[] }, row: number[]): number {
+  const p = model.coefficients.length
+  if (row.length !== p) {
+    throw new Error(`predictRidge: row has ${row.length} features but the model was fitted on ${p}.`)
+  }
+  let value = model.intercept
+  for (let j = 0; j < p; j++) value += model.coefficients[j] * row[j]
+  return value
+}
+
+/**
+ * Cholesky factorisation A = L L' of a symmetric matrix (Golub and Van
+ * Loan 2013, Matrix Computations, 4th ed., algorithm 4.2.1). Returns the
+ * lower triangle L, or null when a pivot is not strictly positive, which
+ * means the matrix is not positive definite.
+ */
+function choleskyLower(matrix: number[][]): number[][] | null {
+  const p = matrix.length
+  const lower: number[][] = Array.from({ length: p }, () => new Array(p).fill(0))
+  for (let j = 0; j < p; j++) {
+    let diagonal = matrix[j][j]
+    for (let k = 0; k < j; k++) diagonal -= lower[j][k] * lower[j][k]
+    if (!(diagonal > 0) || !Number.isFinite(diagonal)) return null
+    const root = Math.sqrt(diagonal)
+    lower[j][j] = root
+    for (let i = j + 1; i < p; i++) {
+      let sum = matrix[i][j]
+      for (let k = 0; k < j; k++) sum -= lower[i][k] * lower[j][k]
+      lower[i][j] = sum / root
+    }
+  }
+  return lower
+}
+
+/** Forward substitution: solves L z = b for a lower-triangular L. */
+function forwardSubstitute(lower: number[][], b: number[]): number[] {
+  const p = lower.length
+  const z = new Array(p).fill(0)
+  for (let i = 0; i < p; i++) {
+    let sum = b[i]
+    for (let k = 0; k < i; k++) sum -= lower[i][k] * z[k]
+    z[i] = sum / lower[i][i]
+  }
+  return z
+}
+
+/** Back substitution: solves L' x = z for a lower-triangular L. */
+function backSubstituteTranspose(lower: number[][], z: number[]): number[] {
+  const p = lower.length
+  const x = new Array(p).fill(0)
+  for (let i = p - 1; i >= 0; i--) {
+    let sum = z[i]
+    for (let k = i + 1; k < p; k++) sum -= lower[k][i] * x[k]
+    x[i] = sum / lower[i][i]
+  }
+  return x
+}
+
+/**
+ * Gauss-Jordan elimination with partial pivoting, used only at lambda = 0
+ * where collinear features make the system singular. A column whose best
+ * available pivot falls below the rank tolerance is treated as aliased and
+ * its coefficient is set to zero, the same convention R's lm() follows
+ * when it reports NA for an aliased term. The tolerance, p times machine
+ * epsilon times the largest diagonal entry, is the default cut-off of
+ * LAPACK's pivoted Cholesky routine dpstrf (Lucas 2004, "LAPACK-Style
+ * Codes for Level 2 and 3 Pivoted Cholesky Factorizations").
+ */
+function solveWithPivoting(matrix: number[][], b: number[]): number[] {
+  const p = matrix.length
+  const augmented = matrix.map((row, i) => [...row, b[i]])
+  let largestDiagonal = 0
+  for (let j = 0; j < p; j++) largestDiagonal = Math.max(largestDiagonal, Math.abs(matrix[j][j]))
+  const tolerance = p * Number.EPSILON * largestDiagonal
+  const pivotRowOfColumn: number[] = new Array(p).fill(-1)
+  let nextRow = 0
+  for (let col = 0; col < p && nextRow < p; col++) {
+    let best = nextRow
+    for (let i = nextRow + 1; i < p; i++) {
+      if (Math.abs(augmented[i][col]) > Math.abs(augmented[best][col])) best = i
+    }
+    if (Math.abs(augmented[best][col]) <= tolerance) continue
+    const swap = augmented[nextRow]
+    augmented[nextRow] = augmented[best]
+    augmented[best] = swap
+    const pivotRow = augmented[nextRow]
+    for (let i = 0; i < p; i++) {
+      if (i === nextRow) continue
+      const factor = augmented[i][col] / pivotRow[col]
+      if (factor === 0) continue
+      for (let k = col; k <= p; k++) augmented[i][k] -= factor * pivotRow[k]
+    }
+    pivotRowOfColumn[col] = nextRow
+    nextRow++
+  }
+  const solution = new Array(p).fill(0)
+  for (let col = 0; col < p; col++) {
+    const row = pivotRowOfColumn[col]
+    if (row >= 0) solution[col] = augmented[row][p] / augmented[row][col]
+  }
+  return solution
+}
+
+/** Returns a copy of the Gram matrix with lambda added to its diagonal. */
+function penalisedGram(gram: number[][], lambda: number): number[][] {
+  return gram.map((row, j) => row.map((value, k) => (j === k ? value + lambda : value)))
+}
+
+/**
+ * Solves (Xc'Xc + lambda I) beta = Xc'yc. Cholesky when lambda > 0, since
+ * the matrix is then positive definite by construction. At lambda = 0
+ * collinear features make it singular and a Cholesky pivot can land on
+ * either side of zero by rounding alone, so that case goes straight to
+ * pivoted elimination.
+ */
+function solveRidgeSystem(gram: number[][], moment: number[], lambda: number): number[] {
+  const system = penalisedGram(gram, lambda)
+  if (lambda > 0) {
+    const lower = choleskyLower(system)
+    if (lower) return backSubstituteTranspose(lower, forwardSubstitute(lower, moment))
+  }
+  return solveWithPivoting(system, moment)
+}
+
+function makeRidgeModel(
+  intercept: number,
+  coefficients: number[],
+  lambda: number,
+  lambdaSelection: RidgeLambdaSelection,
+): RidgeModel {
+  const serialisable = { intercept, coefficients, numFeatures: coefficients.length, lambda, lambdaSelection }
+  return { ...serialisable, predict: (row: number[]) => predictRidge(serialisable, row) }
+}
+
+/**
+ * Fits ridge regression with an unpenalised intercept.
+ *
+ * `features` is one row per observation, already standardised by the
+ * caller; `targets` is the matching outcome per row. When `lambda` is
+ * given it is used as is. When it is omitted, the penalty is chosen by
+ * exact leave-one-out cross-validation over RIDGE_LAMBDA_GRID_MULTIPLIERS
+ * times the number of features, and the score of every grid point is
+ * returned in `lambdaSelection` so the choice can be audited.
+ *
+ * Throws on ragged rows, mismatched lengths, non-finite values or a
+ * negative lambda, because a silent zero would corrupt every downstream
+ * comparison that uses this fit as a baseline.
+ */
+export function fitRidge(features: number[][], targets: number[], lambda?: number): RidgeModel {
+  const n = features.length
+  if (n !== targets.length) {
+    throw new Error(`fitRidge: ${n} feature rows but ${targets.length} targets.`)
+  }
+  if (lambda !== undefined && !(Number.isFinite(lambda) && lambda >= 0)) {
+    throw new Error(`fitRidge: lambda must be a finite non-negative number, received ${lambda}.`)
+  }
+  const p = n > 0 ? features[0].length : 0
+  for (let i = 0; i < n; i++) {
+    const row = features[i]
+    if (row.length !== p) {
+      throw new Error(`fitRidge: row ${i} has ${row.length} features but row 0 has ${p}.`)
+    }
+    for (let j = 0; j < p; j++) {
+      if (!Number.isFinite(row[j])) throw new Error(`fitRidge: feature ${j} of row ${i} is not a finite number.`)
+    }
+    if (!Number.isFinite(targets[i])) throw new Error(`fitRidge: target ${i} is not a finite number.`)
+  }
+
+  let meanY = 0
+  for (let i = 0; i < n; i++) meanY += targets[i]
+  meanY = n > 0 ? meanY / n : 0
+
+  // With no feature columns only the intercept exists, and with a single
+  // row the slopes are not identified, so the fit is the target mean alone.
+  if (p === 0 || n < 2) {
+    const reason = p === 0 ? 'no feature columns' : 'fewer than two rows'
+    return makeRidgeModel(meanY, new Array(p).fill(0), lambda ?? 0, { method: 'none', reason })
+  }
+
+  // Centre the inputs so the intercept stays out of the penalty (ESL 3.4.1).
+  const meanX: number[] = new Array(p).fill(0)
+  for (let i = 0; i < n; i++) {
+    for (let j = 0; j < p; j++) meanX[j] += features[i][j]
+  }
+  for (let j = 0; j < p; j++) meanX[j] /= n
+  const centred: number[][] = features.map((row) => row.map((value, j) => value - meanX[j]))
+  const centredTargets = targets.map((value) => value - meanY)
+
+  // Gram matrix Xc'Xc and moment vector Xc'yc, built once and reused for
+  // every candidate lambda.
+  const gram: number[][] = Array.from({ length: p }, () => new Array(p).fill(0))
+  const moment: number[] = new Array(p).fill(0)
+  for (let i = 0; i < n; i++) {
+    const row = centred[i]
+    const y = centredTargets[i]
+    for (let j = 0; j < p; j++) {
+      moment[j] += row[j] * y
+      for (let k = j; k < p; k++) gram[j][k] += row[j] * row[k]
+    }
+  }
+  for (let j = 0; j < p; j++) {
+    for (let k = 0; k < j; k++) gram[j][k] = gram[k][j]
+  }
+
+  const interceptFor = (coefficients: number[]): number => {
+    let shift = 0
+    for (let j = 0; j < p; j++) shift += meanX[j] * coefficients[j]
+    return meanY - shift
+  }
+
+  if (lambda !== undefined) {
+    const coefficients = solveRidgeSystem(gram, moment, lambda)
+    return makeRidgeModel(interceptFor(coefficients), coefficients, lambda, { method: 'given' })
+  }
+
+  // Exact leave-one-out over the grid. For a linear smoother with fitted
+  // values S y, the error of the fit that omits row i, evaluated at row i,
+  // is (y_i - fitted_i) / (1 - S_ii) (Allen 1974; ESL equation 7.64).
+  // Here S_ii = 1/n + xc_i' (Xc'Xc + lambda I)^-1 xc_i: the 1/n is the
+  // intercept's share of the leverage and the second term equals the
+  // squared length of L^-1 xc_i for the Cholesky factor L, so one forward
+  // substitution per row gives it without forming any inverse.
+  const grid: Array<{ lambda: number; leaveOneOutMse: number }> = []
+  let best: { lambda: number; mse: number; coefficients: number[] } | null = null
+  for (const multiplier of RIDGE_LAMBDA_GRID_MULTIPLIERS) {
+    const candidate = multiplier * p
+    const lower = choleskyLower(penalisedGram(gram, candidate))
+    if (!lower) continue
+    const coefficients = backSubstituteTranspose(lower, forwardSubstitute(lower, moment))
+    let press = 0
+    for (let i = 0; i < n; i++) {
+      const row = centred[i]
+      const whitened = forwardSubstitute(lower, row)
+      let leverage = 1 / n
+      let residual = centredTargets[i]
+      for (let j = 0; j < p; j++) {
+        leverage += whitened[j] * whitened[j]
+        residual -= row[j] * coefficients[j]
+      }
+      // Leverage is strictly below 1 for any positive lambda; the floor only
+      // guards the division against rounding on a near-singular fit.
+      const heldOutResidual = residual / Math.max(Number.EPSILON, 1 - leverage)
+      press += heldOutResidual * heldOutResidual
+    }
+    const mse = press / n
+    grid.push({ lambda: candidate, leaveOneOutMse: mse })
+    // A tie goes to the larger lambda: the same held-out error with more
+    // shrinkage is the more conservative fit.
+    if (Number.isFinite(mse) && (best === null || mse <= best.mse)) {
+      best = { lambda: candidate, mse, coefficients }
+    }
+  }
+  if (best === null) {
+    throw new Error('fitRidge: leave-one-out could not score any lambda on the grid.')
+  }
+  return makeRidgeModel(interceptFor(best.coefficients), best.coefficients, best.lambda, {
+    method: 'leave-one-out',
+    grid,
+  })
 }

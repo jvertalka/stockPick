@@ -7,14 +7,17 @@ import {
 import {
   fitBaggedGradientBoosting,
   fitGradientBoosting,
+  fitRidge,
   predictBaggedGradientBoosting,
   fitMarkovRegime,
   logReturns,
   predictGradientBoosting,
+  predictRidge,
   pearsonCorrelation,
   type GradientBoostingModel,
 } from './quantMath'
 import {
+  DOLLAR_VOLUME_SIZE_PROXY,
   SIZE_TIERED_BORROW_FEE_ANNUAL,
   SIZE_TIERED_TRADING_COST,
   TRADING_DAYS_PER_YEAR,
@@ -30,10 +33,55 @@ export type { DailyBar }
 export const HISTORICAL_FEATURE_PIPELINE_VERSION =
   'finance-oracle-feature-pipeline-v4-company-descriptors-2026-09-10' as const
 
+/** Where the market cap that placed a name in a cost tier came from.
+ * 'filed-cap' is a point-in-time SEC filing; 'dollar-volume-proxy' is the
+ * trailing 20-day average dollar volume turned into a cap equivalent
+ * (quantConfig DOLLAR_VOLUME_SIZE_PROXY); 'unavailable' means neither
+ * existed and the name was charged the bottom, most expensive tier. */
+export type CostTierBasis = 'filed-cap' | 'dollar-volume-proxy' | 'unavailable'
+
+/**
+ * The market cap the cost tables are read with, and where it came from.
+ *
+ * A filed cap always wins. Without one (every row before SEC XBRL coverage
+ * begins around 2009, and every exchange-traded fund), the trailing 20-day
+ * average dollar volume, which the feature builder already computes as the
+ * input to the Amihud illiquidity feature, stands in for it: dollar volume
+ * divided by a typical daily turnover rate gives a cap equivalent that is
+ * looked up in the same tier tables. The turnover rate and its sources are
+ * documented on DOLLAR_VOLUME_SIZE_PROXY; the rate is chosen at the high
+ * end of the historical range so the proxy can only err toward a MORE
+ * expensive tier. Until 2026-09-16 every unfiled name was charged the
+ * bottom tier outright, and on the 25-name 40-year smoke run that meant
+ * about 268 bps a window in the early years.
+ *
+ * What this touches: the net long-short return, the Sharpe ratio built on
+ * it, and the cost report lines. What it does NOT touch: the information
+ * coefficient, which is measured on predictions and outcomes before any
+ * cost is subtracted, and which is the number the promotion gate reads.
+ */
+export function costTierMarketCapUsd(
+  marketCapUsd: number,
+  avgDollarVolume20d: number | undefined,
+): { capUsd: number; basis: CostTierBasis } {
+  if (Number.isFinite(marketCapUsd) && marketCapUsd > 0) {
+    return { capUsd: marketCapUsd, basis: 'filed-cap' }
+  }
+  if (avgDollarVolume20d != null && Number.isFinite(avgDollarVolume20d) && avgDollarVolume20d > 0) {
+    return {
+      capUsd: avgDollarVolume20d / DOLLAR_VOLUME_SIZE_PROXY.dailyTurnoverOfMarketCap,
+      basis: 'dollar-volume-proxy',
+    }
+  }
+  return { capUsd: Number.NaN, basis: 'unavailable' }
+}
+
 /** One-way effective trading cost (bps) for a name of the given market
  * cap, per the size-tiered table (Frazzini-Israel-Moskowitz 2018;
  * Novy-Marx-Velikov 2016). Unknown cap uses the table's most conservative
- * observed tier; an uncited synthetic cap must never make costs look cheaper. */
+ * observed tier; an uncited synthetic cap must never make costs look cheaper.
+ * Callers resolve the cap through costTierMarketCapUsd first, so "unknown"
+ * here means neither a filed cap nor a dollar-volume proxy existed. */
 function oneWayCostBps(marketCapUsd: number): number {
   if (!Number.isFinite(marketCapUsd)) {
     return SIZE_TIERED_TRADING_COST[SIZE_TIERED_TRADING_COST.length - 1].oneWayBps
@@ -84,12 +132,23 @@ function meanOf(values: number[]): number {
  *      a buffer of days between train and test to prevent serial-correlation
  *      leakage.
  *
- *   4. BASELINE COMPARISONS: every walk-forward step also evaluates
- *      naive baselines (random, 12-month momentum, equal-weight) so IC
- *      numbers have context.
+ *   4. BASELINE COMPARISONS: every walk-forward step also scores, on the
+ *      identical purged training rows and identical test rows, the
+ *      yardsticks the tree model has to beat: a random ranking (its
+ *      expected IC is exactly zero), twelve-month momentum in both the
+ *      12-1 form (skips the latest month, Jegadeesh-Titman 1993) and the
+ *      12-0 form (includes it), a ridge regression on the same feature
+ *      columns, and a blend of trees and momentum whose mix is measured on
+ *      training rows only. Paired differences carry moving-block bootstrap
+ *      intervals so IC numbers have context.
  *
- *   5. TRANSACTION COST MODELING: long-short returns are reported both
- *      gross AND net of a configurable per-trade cost (default 10 bps).
+ *   5. TRANSACTION COST MODELLING: long-short returns are reported both
+ *      gross AND net of a size-tiered cost. Every window rebalances the
+ *      whole book, so each side pays a one-way cost on entry AND on exit
+ *      (four legs in all), tiered by each constituent's market cap
+ *      (quantConfig SIZE_TIERED_TRADING_COST), and the short side also
+ *      pays a borrow fee pro-rated over the holding period
+ *      (SIZE_TIERED_BORROW_FEE_ANNUAL). There is no flat per-trade rate.
  *
  *   6. DRAWDOWN METRICS: max drawdown, time-under-water computed from
  *      the cumulative long-short return series.
@@ -333,6 +392,13 @@ export type HistoricalSample = {
    * pruning — it must not depend on fund_log_market_cap staying in the
    * model's column set. */
   logMarketCap: number
+  /** Trailing 20-day average dollar volume at formation (raw exchange price
+   * times shares, the same number the Amihud feature is built from), kept
+   * beside logMarketCap so the cost model can size a name that has no filed
+   * cap (see costTierMarketCapUsd). Absent on rows built before 2026-09-16
+   * and on synthetic fixtures, in which case an unfiled name falls to the
+   * bottom tier as before. */
+  avgDollarVolume20d?: number
   /** True when a real SEC snapshot was available at formation. Kept separate
    * from capped filing age: a stale-but-real snapshot and the no-data sentinel
    * can both equal FUNDAMENTAL_MISSING_AGE_DAYS. */
@@ -344,6 +410,16 @@ export type HistoricalSample = {
    *  'core' = established-then. 'noFundamentals' = ETFs/non-filers,
    *  excluded from cohort diagnostics. */
   cohort?: 'core' | 'survivorPrivileged' | 'noFundamentals'
+  /** Twelve-month momentum that SKIPS the most recent month: close 21 bars
+   * before formation over close 252 bars before, minus one, in percent. This
+   * is the Jegadeesh-Titman (1993) "12-1" convention. It is kept OUT of the
+   * feature vector so the model's inputs do not change; it exists only as
+   * the momentum yardstick the model is compared against. Raw as computed
+   * from the bars; `momentum12to1` is the same number Z-scored within its
+   * date exactly as the feature columns are. Absent on rows built before
+   * this field existed, in which case the 12-1 baseline reads unavailable. */
+  momentum12to1Raw?: number
+  momentum12to1?: number
 }
 
 export const ENSEMBLE_HORIZONS: HorizonKey[] = [5, 20, 60, 120]
@@ -523,6 +599,13 @@ export function computeFeaturesAtDate(
     /** First bar of the FULL (untrimmed) history, for listing age when
      * `bars` was trimmed to a backtest window. Defaults to bars[0]. */
     firstBarDateMs?: number
+    /** Start of the fetch window the bars came from (the 40-year boundary
+     * of a 'max' fetch). A name whose first bar sits on this boundary was
+     * not listed there, its history was CUT there, so its listing age is
+     * unknown and reads as the missing sentinel (NaN), which the causal
+     * imputation later fills and flags. Leave unset (the live path does)
+     * and the first bar is taken at face value. */
+    fetchWindowStartMs?: number
   },
 ): number[] | null {
   if (dateIndex < 252) return null  // need 252 bars for the 1-year features
@@ -758,6 +841,7 @@ export function computeFeaturesAtDate(
     listingAgeYears(
       options?.firstBarDateMs ?? Date.parse(bars[0].date),
       bars[dateIndex].date,
+      options?.fetchWindowStartMs,
     ),
     Math.log(Math.max(0.01, rawLastClose)),
     // Fundamentals (13) — point-in-time as of this bar's date
@@ -774,8 +858,104 @@ export function computeFeaturesAtDate(
   ]
 }
 
-function listingAgeYears(firstBarDateMs: number, isoDate: string): number {
+/**
+ * Twelve-month momentum measured the way the momentum literature measures
+ * it: the return from twelve months ago to ONE month ago, skipping the most
+ * recent month. Jegadeesh and Titman (1993, "Returns to Buying Winners and
+ * Selling Losers", Journal of Finance 48(1)) form their portfolios on the
+ * past J-month return and leave a month between formation and holding; the
+ * skip is standard because the latest month carries short-term reversal
+ * (Jegadeesh 1990, Journal of Finance 45(3)). The feature column
+ * momentum_252d is the 12-0 form, close today over close 252 bars ago, which
+ * INCLUDES that reversal month.
+ *
+ * Same windowing as computeFeaturesAtDate: only bars strictly before
+ * `dateIndex` are read, and 21 bars stands for one month. Returns null when
+ * fewer than 252 bars precede the date, the rule the features use. When the
+ * bar 252 back is missing or non-positive the value is 0, mirroring the
+ * feature's own ret() convention so the two definitions share every quirk.
+ */
+export function computeMomentum12to1AtDate(bars: DailyBar[], dateIndex: number): number | null {
+  if (dateIndex < 252) return null
+  const window = bars.slice(0, dateIndex)
+  const start = window[window.length - 1 - 252]?.close
+  const oneMonthBack = window[window.length - 1 - 21]?.close
+  if (!start || start <= 0 || !oneMonthBack || oneMonthBack <= 0) return 0
+  return (oneMonthBack / start - 1) * 100
+}
+
+/** Years of history a 'max' fetch asks for. Mirrors RANGE_YEARS.max in
+ * marketData.ts, which is not exported; the two must move together. */
+const MAX_FETCH_RANGE_YEARS = 40
+
+/**
+ * Trailing 20-day average dollar volume before `dateIndex`: the mean of
+ * volume times raw exchange close over bars[dateIndex - 20 .. dateIndex - 1],
+ * exactly the twenty bars and the price basis the Amihud illiquidity feature
+ * reads inside computeFeaturesAtDate. It is a size stand-in for the cost
+ * model (see costTierMarketCapUsd), not a feature, so it lives beside the
+ * vector rather than in it. Zero when no bar in the span traded.
+ */
+function averageDollarVolume20d(bars: DailyBar[], dateIndex: number): number {
+  const start = Math.max(0, dateIndex - 20)
+  let sum = 0
+  let count = 0
+  for (let i = start; i < dateIndex; i++) {
+    const bar = bars[i]
+    const price = bar.rawClose ?? bar.close
+    const dollars = bar.volume * price
+    if (Number.isFinite(dollars) && dollars > 0) {
+      sum += dollars
+      count++
+    }
+  }
+  return count > 0 ? sum / count : 0
+}
+
+/**
+ * How far past the fetch boundary a first bar may sit and still count as
+ * sitting ON it. The boundary is a clock time, not a trading day, so the
+ * first bar of a name older than the fetch window lands on the first
+ * session at or after it, up to a weekend plus a holiday later; and the
+ * boundary is recomputed from the clock when the dataset is built, a little
+ * after the bars were fetched. A week covers both. A name that genuinely
+ * listed inside that week is treated as unknown too, which is disclosed
+ * here and is the price of not knowing the fetch's exact timestamp.
+ */
+const FETCH_BOUNDARY_TOLERANCE_MS = 7 * 86_400_000
+
+/**
+ * Years since the first bar, capped at 25, or NaN when the first bar sits
+ * on the fetch boundary.
+ *
+ * The NaN branch fires ONLY at the fetch boundary: when the caller passes
+ * `fetchWindowStartMs` and the first bar is at or within a week after it.
+ * On a 40-year fetch every name listed before the boundary starts its
+ * history on the boundary's first session, so all of them would otherwise
+ * read as listed on the same day and then, once past 25, as the same capped
+ * age. The doc's pre-registered default (docs/EVIDENCE_QUALITY.md, "Listing-
+ * age treatment on a 40-year fetch") is to call that age unknown instead.
+ * NaN is the missing sentinel the rest of the pipeline already understands:
+ * imputeMissingWithDateMedians replaces it with the date's median from
+ * names whose age IS known and records the cell in imputedMask, and the
+ * survivorship cohort never calls an imputed age "young". The feature name
+ * and its slot in the vector are unchanged. Without `fetchWindowStartMs`
+ * (the live scoring path) the first bar is taken at face value.
+ */
+function listingAgeYears(
+  firstBarDateMs: number,
+  isoDate: string,
+  fetchWindowStartMs?: number,
+): number {
   const dateMs = Date.parse(isoDate)
+  if (
+    fetchWindowStartMs != null &&
+    Number.isFinite(fetchWindowStartMs) &&
+    Number.isFinite(firstBarDateMs) &&
+    firstBarDateMs <= fetchWindowStartMs + FETCH_BOUNDARY_TOLERANCE_MS
+  ) {
+    return Number.NaN
+  }
   if (!Number.isFinite(firstBarDateMs) || !Number.isFinite(dateMs)) return 0
   // Cap at 25y — beyond that age is not a differentiator (FF2004's
   // new-list failure risk is front-loaded in the first decade).
@@ -1272,23 +1452,81 @@ function filingDescriptorsAt(
  * evicted so backend/SEC recovery heals the live feature path. */
 const fundamentalsCache = new Map<string, Promise<FundamentalsTimeline | null>>()
 
+/**
+ * How long the client waits for /fundamentals/history. The backend gives a
+ * cold SEC companyfacts download 20 seconds (tool/backend_cache_server.dart,
+ * the `/api/xbrl/companyfacts/` policy at line 1232) on top of an 8-second
+ * connection timeout (line 136). This client used to give up after 8 seconds
+ * (the old literal on the setTimeout line below), so on a cold backend the
+ * request was abandoned while the backend was still working, and the row was
+ * built with no fundamentals as though the company filed none. Thirty
+ * seconds covers the backend's whole budget with room to spare.
+ */
+export const FUNDAMENTALS_FETCH_TIMEOUT_MS = 30_000
+
+/** How the latest /fundamentals/history request for a name ended. "failed"
+ * is a request that timed out, could not connect, or got a server error; it
+ * is a lost fetch, not a fact about the company, and the pre-registered
+ * runner treats it like a lost price fetch. "not-a-filer" is the backend's
+ * own answer that there are no SEC filings for the name (a fund or a foreign
+ * filer); the backend gives that same answer when its own SEC download
+ * failed, which this client cannot tell apart. */
+export type FundamentalsFetchOutcome =
+  | { kind: 'timeline' }
+  | { kind: 'not-a-filer'; detail: string }
+  | { kind: 'failed'; detail: string }
+
+const fundamentalsFetchOutcomes = new Map<string, FundamentalsFetchOutcome>()
+
+/** The outcome of the latest fundamentals request for a name, or null when
+ * none was made in this process. */
+export function fundamentalsFetchOutcome(ticker: string): FundamentalsFetchOutcome | null {
+  return fundamentalsFetchOutcomes.get(ticker) ?? null
+}
+
+/** Names whose latest fundamentals request failed (timed out or errored), sorted. */
+export function fundamentalsFetchFailures(): string[] {
+  return [...fundamentalsFetchOutcomes.entries()]
+    .filter(([, outcome]) => outcome.kind === 'failed')
+    .map(([ticker]) => ticker)
+    .sort()
+}
+
 export function fetchFundamentalsTimeline(ticker: string): Promise<FundamentalsTimeline | null> {
   const cached = fundamentalsCache.get(ticker)
   if (cached) return cached
   const promise = (async () => {
     const controller = new AbortController()
-    const timer = window.setTimeout(() => controller.abort(), 8000)
+    const timer = window.setTimeout(() => controller.abort(), FUNDAMENTALS_FETCH_TIMEOUT_MS)
     try {
       const base = import.meta.env.VITE_ORACLE_BACKEND_URL ?? 'http://127.0.0.1:8787'
       const response = await fetch(
         `${base}/fundamentals/history?symbol=${encodeURIComponent(ticker)}`,
         { headers: { Accept: 'application/json' }, signal: controller.signal },
       )
-      if (!response.ok) return null
+      if (!response.ok) {
+        // 404 is the backend saying "no SEC filings for this name"; anything
+        // else (a 500, a 502 from a proxy) is a request that did not work.
+        if (response.status === 404) {
+          fundamentalsFetchOutcomes.set(ticker, { kind: 'not-a-filer', detail: 'backend answered 404: no SEC companyfacts' })
+        } else {
+          fundamentalsFetchOutcomes.set(ticker, { kind: 'failed', detail: `backend answered HTTP ${response.status}` })
+        }
+        return null
+      }
       const payload = (await response.json()) as Parameters<typeof FundamentalsTimeline.fromHistory>[0]
       const timeline = FundamentalsTimeline.fromHistory(payload)
-      return timeline.size > 0 ? timeline : null
-    } catch {
+      if (timeline.size > 0) {
+        fundamentalsFetchOutcomes.set(ticker, { kind: 'timeline' })
+        return timeline
+      }
+      fundamentalsFetchOutcomes.set(ticker, { kind: 'not-a-filer', detail: 'backend answered with an empty filing history' })
+      return null
+    } catch (error) {
+      const detail = controller.signal.aborted
+        ? `timed out after ${FUNDAMENTALS_FETCH_TIMEOUT_MS} ms`
+        : (error as Error)?.message ?? 'request failed'
+      fundamentalsFetchOutcomes.set(ticker, { kind: 'failed', detail })
       return null
     } finally {
       window.clearTimeout(timer)
@@ -1446,6 +1684,11 @@ export type BacktestDatasetQuality = {
 
 export type DatasetBuildResult = {
   samples: HistoricalSample[]
+  /** Every trading day seen in any usable name's bars, sorted. This is the
+   * calendar the walk-forward windows are cut on (see buildCalendarWindows):
+   * samples are formed only every tenth bar, so the sample dates alone are
+   * one trading day in ten and cannot define a 20-trading-day window. */
+  tradingDates: string[]
   provenance: BacktestDatasetProvenance
   quality: BacktestDatasetQuality
   diagnostics: {
@@ -1455,6 +1698,10 @@ export type DatasetBuildResult = {
     tickersBelowMinBars: number
     /** Names whose samples carry real point-in-time EDGAR fundamentals. */
     tickersWithFundamentals?: number
+    /** Names whose first bar sits on the fetch boundary, so their listing
+     * age is unknown (NaN, then imputed and flagged) rather than measured
+     * from a cut-off history. See listingAgeYears. */
+    tickersAtFetchBoundary?: number
     perTickerSummary: Array<{
       ticker: string
       bars: number
@@ -1585,6 +1832,9 @@ export function imputeMissingWithDateMedians(samples: HistoricalSample[]): void 
 /** Index helpers for survivorship cohort assignment. */
 const LISTING_AGE_FEATURE_INDEX = HISTORICAL_FEATURE_NAMES.indexOf('listing_age_years')
 const LOG_MKTCAP_FEATURE_INDEX = HISTORICAL_FEATURE_NAMES.indexOf('fund_log_market_cap')
+/** Column of the 12-0 momentum feature in the FULL feature list. Callers
+ * that prune features must pass their own index (see walkForwardStep). */
+const MOMENTUM_252D_FEATURE_INDEX = HISTORICAL_FEATURE_NAMES.indexOf('momentum_252d')
 
 /**
  * Tag each sample's survivorship cohort AT ITS FORMATION DATE:
@@ -1633,7 +1883,11 @@ function assignSurvivorshipCohorts(samples: HistoricalSample[]): void {
         sample.cohort = 'noFundamentals'
         continue
       }
-      const young = sample.rawFeatures[LISTING_AGE_FEATURE_INDEX] < 3
+      // An imputed listing age (a name whose history was cut at the fetch
+      // boundary, see listingAgeYears) is unknown, not young: the median it
+      // was filled with says nothing about this name.
+      const ageImputed = sample.imputedMask?.[LISTING_AGE_FEATURE_INDEX] === true
+      const young = !ageImputed && sample.rawFeatures[LISTING_AGE_FEATURE_INDEX] < 3
       const capImputed = sample.imputedMask?.[LOG_MKTCAP_FEATURE_INDEX] === true
       const smallThen =
         !capImputed && sample.rawFeatures[LOG_MKTCAP_FEATURE_INDEX] <= quintileCut
@@ -1754,6 +2008,52 @@ export function applyCrossSectionalNormalization(samples: HistoricalSample[]): v
   }
 }
 
+/**
+ * Z-score the 12-1 momentum yardstick within each formation date by the
+ * same rule applyCrossSectionalNormalization applies to every feature
+ * column: a dense date (five or more names) uses its own cross-section, a
+ * sparse date uses the expanding pool of dates at or before it, so no
+ * statistic can see the future. The 12-0 baseline the gate read until now
+ * is the Z-scored momentum_252d column, so the two definitions get the
+ * identical treatment and their ICs can be read side by side. Rows that
+ * carry no raw value (built before the field existed) are left without one.
+ */
+export function normalizeMomentum12to1ByDate(samples: HistoricalSample[]): void {
+  const byDate = new Map<string, number[]>()
+  samples.forEach((sample, idx) => {
+    if (!Number.isFinite(sample.momentum12to1Raw)) return
+    const arr = byDate.get(sample.asOf) ?? []
+    arr.push(idx)
+    byDate.set(sample.asOf, arr)
+  })
+  const MIN_GROUP_FOR_ZSCORE = 5
+  let runningSum = 0
+  let runningSumSq = 0
+  let runningCount = 0
+  for (const date of [...byDate.keys()].sort()) {
+    const indices = byDate.get(date)!
+    const values = indices.map((idx) => samples[idx].momentum12to1Raw as number)
+    for (const value of values) {
+      runningSum += value
+      runningSumSq += value * value
+    }
+    runningCount += values.length
+    let mean: number
+    let variance: number
+    if (values.length < MIN_GROUP_FOR_ZSCORE) {
+      mean = runningSum / runningCount
+      variance = Math.max(0, runningSumSq / runningCount - mean * mean)
+    } else {
+      mean = values.reduce((sum, value) => sum + value, 0) / values.length
+      variance = values.reduce((sum, value) => sum + (value - mean) ** 2, 0) / values.length
+    }
+    const sigma = Math.sqrt(Math.max(1e-12, variance))
+    indices.forEach((idx, position) => {
+      samples[idx].momentum12to1 = (values[position] - mean) / sigma
+    })
+  }
+}
+
 /** The canonical Yahoo adapter marks `close` as adjusted-total-return. Keep the
  * conventional adjusted-close aliases as a compatibility inventory for custom
  * importers, but only the canonical marker proves that `close` itself is on the
@@ -1806,8 +2106,18 @@ export async function buildHistoricalDataset(
   }
   const fetchRange = 'max'
   const trimBars = trimByRange[range] ?? null
+  // The 'max' fetch reaches back MAX_FETCH_RANGE_YEARS from today (the
+  // period1 that marketData.fetchDailyBars sends). A name whose first bar
+  // sits on that boundary has a cut-off history, not a listing date, so its
+  // listing age is unknown; computeFeaturesAtDate turns that into the
+  // missing sentinel (see listingAgeYears). Only this boundary case fires.
+  const fetchWindowStartMs = Date.now() - MAX_FETCH_RANGE_YEARS * 365.25 * 86_400_000
+  let tickersAtFetchBoundary = 0
   const samples: HistoricalSample[] = []
   const perTickerSummary: DatasetBuildResult['diagnostics']['perTickerSummary'] = []
+  // Union of the bar dates of every usable name: the trading calendar the
+  // walk-forward windows are cut on.
+  const tradingDateSet = new Set<string>()
   let tickersWithUsableBars = 0
   let tickersWithZeroBars = 0
   let tickersBelowMinBars = 0
@@ -1849,6 +2159,12 @@ export async function buildHistoricalDataset(
     // Listing age must come from the FULL history even when the backtest
     // window is trimmed — a 1998 listing trimmed to 15y is still old.
     const firstBarDateMs = bars.length > 0 ? Date.parse(bars[0].date) : Number.NaN
+    if (
+      Number.isFinite(firstBarDateMs) &&
+      firstBarDateMs <= fetchWindowStartMs + FETCH_BOUNDARY_TOLERANCE_MS
+    ) {
+      tickersAtFetchBoundary++
+    }
     if (trimBars != null && bars.length > trimBars) {
       bars = bars.slice(-trimBars)
     }
@@ -1882,6 +2198,7 @@ export async function buildHistoricalDataset(
     // Coverage describes bars eligible to enter model features/labels, not
     // short/failed ticker histories excluded before sample creation.
     barsObserved += bars.length
+    for (const bar of bars) tradingDateSet.add(bar.date)
     barsWithAdjustedCloseAvailable += bars.filter(hasTotalReturnPriceBasis).length
     const fundamentals = await fetchFundamentalsTimeline(ticker)
     if (fundamentals) tickersWithFundamentals++
@@ -1889,8 +2206,14 @@ export async function buildHistoricalDataset(
     // Need 252 bars history (for 252d momentum, vol, moments) + 120 future
     // (longest horizon in the ensemble)
     for (let i = 252; i < bars.length - 120; i += cadence) {
-      const features = computeFeaturesAtDate(bars, i, fundamentals, { firstBarDateMs })
-      if (!features) continue
+      const features = computeFeaturesAtDate(bars, i, fundamentals, {
+        firstBarDateMs,
+        fetchWindowStartMs,
+      })
+      // The 12-1 momentum yardstick rides alongside the features, never
+      // inside them, so the feature vector itself is untouched.
+      const momentum12to1Raw = computeMomentum12to1AtDate(bars, i)
+      if (!features || momentum12to1Raw == null) continue
       const fwd5 = computeForwardReturn(bars, i, 5)
       const fwd20 = computeForwardReturn(bars, i, 20)
       const fwd60 = computeForwardReturn(bars, i, 60)
@@ -1926,7 +2249,11 @@ export async function buildHistoricalDataset(
         // Raw log market cap (NaN if no fundamentals) — full-feature index,
         // captured before pruning so the cost model always has it.
         logMarketCap: features[LOG_MKTCAP_FEATURE_INDEX],
+        // The size stand-in for names with no filed cap (pre-2009 rows,
+        // ETFs), read from the same 20 bars the Amihud feature reads.
+        avgDollarVolume20d: averageDollarVolume20d(bars, i),
         pitFundamentalsObserved: hasPointInTimeSnapshot,
+        momentum12to1Raw,
       })
       generated++
     }
@@ -1941,6 +2268,7 @@ export async function buildHistoricalDataset(
   imputeMissingWithDateMedians(samples)
   assignSurvivorshipCohorts(samples)
   applyCrossSectionalNormalization(samples)
+  normalizeMomentum12to1ByDate(samples)
   applyCrossSectionalReturnDemeaning(samples)
   // NOTE (2026-06-21): target transforms were tested and REVERTED. Both
   // ±3-MAD winsorization AND Gaussian rank-transform of the Rel target HURT on
@@ -1968,6 +2296,7 @@ export async function buildHistoricalDataset(
 
   return {
     samples,
+    tradingDates: [...tradingDateSet].sort(),
     provenance: {
       schemaVersion: 2,
       builtAt: new Date().toISOString(),
@@ -2078,6 +2407,7 @@ export async function buildHistoricalDataset(
       tickersWithZeroBars,
       tickersBelowMinBars,
       tickersWithFundamentals,
+      tickersAtFetchBoundary,
       perTickerSummary,
     },
   }
@@ -2163,14 +2493,67 @@ export type WalkForwardResult = {
   hitRate: number
   longShortReturnGross: number
   longShortReturnNet: number   // net of size-tiered trading + borrow costs
-  /** Total cost (bps) actually subtracted this step: long entry + short
-   * entry + short borrow, size-tiered by constituent market cap. */
+  /** Total cost (bps) actually subtracted this step: long entry + long
+   * exit + short entry + short exit + short borrow, size-tiered by
+   * constituent market cap. */
   realizedCostBps: number
+  /** The four trading legs and the borrow fee that add up to
+   * realizedCostBps, each in bps. */
+  costBreakdownBps?: {
+    longEntry: number
+    longExit: number
+    shortEntry: number
+    shortExit: number
+    shortBorrow: number
+  }
+  /** How the names actually charged this window (the long and the short
+   * basket together) were placed in a cost tier: by a filed market cap, by
+   * the dollar-volume proxy, or by neither (bottom tier). The proxy count is
+   * the number of names whose net-return cost rests on the stand-in rather
+   * than a filing; see costTierMarketCapUsd. */
+  costTierBasis?: {
+    filedCap: number
+    dollarVolumeProxy: number
+    unavailable: number
+    chargedNames: number
+  }
   longShortSharpe: number
   predictedDecileReturns: number[]
   // Baseline comparisons
   baselineRandomIc: number
+  /** 12-0 momentum (the momentum_252d feature column, close today over
+   * close 252 bars ago), Pearson IC against the relative 20-day return.
+   * NaN when the column is not in the feature set. */
   baselineMomentumIc: number
+  /** The same 12-0 baseline as a Spearman (rank) IC. */
+  baselineMomentumSpearmanIc?: number
+  /** 12-1 momentum (skips the latest month; HistoricalSample.momentum12to1),
+   * Pearson and Spearman ICs. NaN when the rows carry no 12-1 value. */
+  baselineMomentum12to1Ic?: number
+  baselineMomentum12to1SpearmanIc?: number
+  /** Ridge regression fitted on the identical purged training rows and
+   * scored on the identical test rows, both correlations, with the penalty
+   * leave-one-out picked it. NaN when the fit was skipped or failed;
+   * `ridgeFailure` says why. */
+  ridgeIc?: number
+  ridgeSpearmanIc?: number
+  ridgeLambda?: number | null
+  ridgeFailure?: string
+  /** Trees-plus-momentum blend scored on the test rows, both correlations.
+   * NaN when no blend could be formed. */
+  blendIc?: number
+  blendSpearmanIc?: number
+  /** Weight on momentum in the blend, from BLEND_MOMENTUM_WEIGHT_GRID; null
+   * when no weight could be measured. */
+  blendWeight?: number | null
+  /** 'out-of-bag': the weight was scored on training rows using only the bag
+   * members that never trained on each row. 'unavailable': too few such
+   * rows, or no momentum values, so no blend was formed. */
+  blendWeightBasis?: 'out-of-bag' | 'unavailable'
+  /** Training rows the weight was scored on. */
+  blendWeightRows?: number
+  /** Which momentum definition the blend was built on. */
+  blendMomentumBaseline?: MomentumBaselineDefinition
   // Drawdown
   cumulativeReturn: number
   maxDrawdown: number
@@ -2200,30 +2583,292 @@ export type WalkForwardResult = {
 }
 
 /**
- * Days since the same ticker's earliest sample, used for purging + embargo
- * decisions. We pre-compute and cache it on the sample.
+ * The sample list sorted by formation date, with each row's position in that
+ * order kept on the row. Every walk-forward window reads rows from this order.
  */
-type IndexedSample = HistoricalSample & { sortIndex: number }
+export type IndexedSample = HistoricalSample & { sortIndex: number }
 
-function indexSamples(samples: HistoricalSample[]): IndexedSample[] {
+export function indexSamples(samples: HistoricalSample[]): IndexedSample[] {
   const sorted = [...samples].sort((a, b) => a.asOf.localeCompare(b.asOf))
   return sorted.map((sample, idx) => ({ ...sample, sortIndex: idx }))
 }
 
+/* -------------------------------------------------------------------------
+   Calendar-defined walk-forward windows
+   ------------------------------------------------------------------------- */
+
 /**
- * Run a single walk-forward step with PURGE + EMBARGO.
- *   - Train set: samples with sortIndex < splitIndex
- *   - Test set:  samples with splitIndex ≤ sortIndex < splitIndex + testSize
- *   - Purge:     drop training samples whose forward-return window OVERLAPS
- *                the earliest test sample's date
- *   - Embargo:   drop training samples within `embargoDays` of test start
+ * The three numbers that decide where the walk-forward test windows fall.
+ * They describe the trading CALENDAR, never the row count, so adding names
+ * to the universe adds rows to each window and never changes how many
+ * windows there are. The CLI and the in-app worker both start from this one
+ * object, so the two produce the same windows on the same data.
+ */
+export type WindowRule = {
+  /** Trading days per test window. Twenty matches the 20-day label, so one
+   * window is one non-overlapping holding period. */
+  stepTradingDays: number
+  /** Years of history, counted from the first sample date, that are used for
+   * training only before the first test window opens. */
+  burnInYears: number
+  /** Trading days dropped from the end of the training set right before each
+   * test window opens (Lopez de Prado 2018). Counted on the trading calendar.
+   * The value 5 was carried over from the old rule, where it meant five
+   * CALENDAR days, so the embargo is now a little longer than it was. */
+  embargoTradingDays: number
+}
+
+export const DEFAULT_WINDOW_RULE: Readonly<WindowRule> = Object.freeze({
+  stepTradingDays: 20,
+  burnInYears: 10,
+  embargoTradingDays: 5,
+})
+
+/**
+ * Fill in the defaults for whichever window settings the caller left out and
+ * refuse values that cannot describe a window.
+ */
+export function resolveWindowRule(overrides: Partial<WindowRule> = {}): WindowRule {
+  const rule: WindowRule = {
+    stepTradingDays: overrides.stepTradingDays ?? DEFAULT_WINDOW_RULE.stepTradingDays,
+    burnInYears: overrides.burnInYears ?? DEFAULT_WINDOW_RULE.burnInYears,
+    embargoTradingDays: overrides.embargoTradingDays ?? DEFAULT_WINDOW_RULE.embargoTradingDays,
+  }
+  if (!Number.isInteger(rule.stepTradingDays) || rule.stepTradingDays < 1) {
+    throw new Error(`stepTradingDays must be a whole number of at least 1 (got ${rule.stepTradingDays}).`)
+  }
+  if (!Number.isFinite(rule.burnInYears) || rule.burnInYears < 0) {
+    throw new Error(`burnInYears must be zero or more (got ${rule.burnInYears}).`)
+  }
+  if (!Number.isInteger(rule.embargoTradingDays) || rule.embargoTradingDays < 0) {
+    throw new Error(
+      `embargoTradingDays must be a whole number of zero or more (got ${rule.embargoTradingDays}).`,
+    )
+  }
+  return rule
+}
+
+/** One test window, described entirely by dates. */
+export type CalendarWindow = {
+  /** Position in date order, starting at zero. */
+  index: number
+  /** First and last trading day of the test block, inclusive. */
+  testStartDate: string
+  testEndDate: string
+  /** Trading days the block spans; always equal to stepTradingDays. */
+  tradingDayCount: number
+  /** Latest formation date a training row may carry once the embargo is
+   * taken off. Null when the embargo reaches back past the first trading
+   * day, which leaves no training rows at all. */
+  trainAsOfCutoff: string | null
+  /** Rows and distinct names formed inside the block. */
+  testRowCount: number
+  testNameCount: number
+}
+
+/** The ISO date `years` after `isoDate`. Whole years keep the month and day;
+ * a fractional part is added as days. */
+function addYearsIso(isoDate: string, years: number): string {
+  const [year, month, day] = isoDate.split('-').map(Number)
+  const wholeYears = Math.floor(years)
+  const extraDays = Math.round((years - wholeYears) * 365.25)
+  return new Date(Date.UTC(year + wholeYears, month - 1, day + extraDays)).toISOString().slice(0, 10)
+}
+
+/**
+ * Cut the walk-forward test windows on the trading calendar.
+ *
+ * The calendar is the sorted list of distinct trading days. When the caller
+ * passes `tradingDates` (the dataset builder collects every bar date it saw),
+ * that list is the calendar, with any sample date that is somehow missing
+ * from it added in. Without it, the distinct sample dates stand in for the
+ * calendar. That is exact only when samples are formed on every trading day;
+ * with the ten-day sampling cadence and a universe whose histories all start
+ * on the same day, the sample dates are one trading day in ten and a
+ * "20-day" window would really span 200, so pass the real calendar whenever
+ * it is available.
+ *
+ * Steps: the first `burnInYears` after the first sample date are training
+ * only. From the first trading day on or after that point, consecutive
+ * blocks of `stepTradingDays` trading days each become one test window that
+ * holds every sample formed inside it, across all names. A trailing block
+ * shorter than a full step is dropped so every window covers the same span,
+ * and a block that holds no samples is dropped because there is nothing to
+ * score. The training set for each window is expanding: every row formed
+ * before the window, minus the purge and the embargo (see windowRows).
+ */
+export function buildCalendarWindows(
+  samples: readonly HistoricalSample[],
+  options: Partial<WindowRule> & { tradingDates?: readonly string[] } = {},
+): CalendarWindow[] {
+  const rule = resolveWindowRule(options)
+  if (samples.length === 0) return []
+
+  // Rows and names per formation date, so each block can report its size
+  // without a second pass over the samples.
+  const rowsByDate = new Map<string, { rows: number; names: Set<string> }>()
+  for (const sample of samples) {
+    const entry = rowsByDate.get(sample.asOf) ?? { rows: 0, names: new Set<string>() }
+    entry.rows++
+    entry.names.add(sample.ticker)
+    rowsByDate.set(sample.asOf, entry)
+  }
+  const dateSet = new Set<string>(options.tradingDates ?? [])
+  for (const date of rowsByDate.keys()) dateSet.add(date)
+  const dates = [...dateSet].sort()
+  const sampleDates = [...rowsByDate.keys()].sort()
+  const firstSampleDate = sampleDates[0]
+  const lastSampleDate = sampleDates[sampleDates.length - 1]
+
+  const burnInEnd = addYearsIso(firstSampleDate, rule.burnInYears)
+  let start = dates.findIndex((date) => date >= burnInEnd)
+  if (start < 0) return []
+
+  const windows: CalendarWindow[] = []
+  for (; start + rule.stepTradingDays <= dates.length; start += rule.stepTradingDays) {
+    const testStartDate = dates[start]
+    if (testStartDate > lastSampleDate) break
+    const testEndDate = dates[start + rule.stepTradingDays - 1]
+    let testRowCount = 0
+    const names = new Set<string>()
+    for (let i = start; i < start + rule.stepTradingDays; i++) {
+      const entry = rowsByDate.get(dates[i])
+      if (!entry) continue
+      testRowCount += entry.rows
+      for (const name of entry.names) names.add(name)
+    }
+    if (testRowCount === 0) continue
+    // The embargo removes the `embargoTradingDays` trading days right before
+    // the window, so the last allowed training date sits one day earlier.
+    const cutoffIndex = start - rule.embargoTradingDays - 1
+    windows.push({
+      index: windows.length,
+      testStartDate,
+      testEndDate,
+      tradingDayCount: rule.stepTradingDays,
+      trainAsOfCutoff: cutoffIndex >= 0 ? dates[cutoffIndex] : null,
+      testRowCount,
+      testNameCount: names.size,
+    })
+  }
+  return windows
+}
+
+/** First index whose formation date is on or after `date`; the list must be
+ * sorted by formation date. */
+function lowerBoundByDate(sorted: readonly HistoricalSample[], date: string): number {
+  let low = 0
+  let high = sorted.length
+  while (low < high) {
+    const mid = (low + high) >>> 1
+    if (sorted[mid].asOf < date) low = mid + 1
+    else high = mid
+  }
+  return low
+}
+
+/** First index whose formation date is after `date`; the list must be sorted
+ * by formation date. */
+function upperBoundByDate(sorted: readonly HistoricalSample[], date: string): number {
+  let low = 0
+  let high = sorted.length
+  while (low < high) {
+    const mid = (low + high) >>> 1
+    if (sorted[mid].asOf <= date) low = mid + 1
+    else high = mid
+  }
+  return low
+}
+
+/**
+ * The rows one window trains on and tests on, taken from the date-sorted
+ * sample list. Test rows are every sample formed inside the block. Training
+ * rows are every sample formed before the block, minus two cuts that keep the
+ * test outcomes out of training: the PURGE drops rows whose 20-trading-day
+ * label closes on or after the window opens (compared in label space, on
+ * real bar dates, because 20 trading days span about 28 calendar days and
+ * calendar arithmetic would under-purge), and the EMBARGO drops rows formed
+ * within the last `embargoTradingDays` trading days before the window opens
+ * (Lopez de Prado 2018).
+ */
+export function windowRows<T extends HistoricalSample>(
+  sortedSamples: readonly T[],
+  window: CalendarWindow,
+): { train: T[]; test: T[] } {
+  const testStart = lowerBoundByDate(sortedSamples, window.testStartDate)
+  const testEnd = upperBoundByDate(sortedSamples, window.testEndDate)
+  const test = sortedSamples.slice(testStart, testEnd)
+  const cutoff = window.trainAsOfCutoff
+  const train: T[] = []
+  if (cutoff != null) {
+    for (let i = 0; i < testStart; i++) {
+      const sample = sortedSamples[i]
+      if (sample.asOf <= cutoff && sample.labelEnd20d < window.testStartDate) train.push(sample)
+    }
+  }
+  return { train, test }
+}
+
+/** The window rule plus what it produced, for the run report. */
+export type CalendarWindowSummary = {
+  rule: WindowRule
+  windowsBuilt: number
+  /** Windows that produced a scored step. A window with fewer than 10 test
+   * rows or fewer than 50 training rows after the purge is skipped. */
+  windowsScored: number
+  namesPerWindow: { min: number; median: number; max: number }
+  rowsPerWindow: { min: number; median: number; max: number }
+  firstTestDate: string | null
+  lastTestDate: string | null
+  /** Where the samples start and end, which explains a low window count. */
+  firstSampleDate: string | null
+  lastSampleDate: string | null
+}
+
+function minMedianMax(values: readonly number[]): { min: number; median: number; max: number } {
+  if (values.length === 0) return { min: 0, median: 0, max: 0 }
+  const sorted = [...values].sort((a, b) => a - b)
+  const middle = sorted.length >> 1
+  const median =
+    sorted.length % 2 === 1 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2
+  return { min: sorted[0], median, max: sorted[sorted.length - 1] }
+}
+
+export function summarizeCalendarWindows(
+  samples: readonly HistoricalSample[],
+  windows: readonly CalendarWindow[],
+  rule: WindowRule,
+  windowsScored: number = windows.length,
+): CalendarWindowSummary {
+  let firstSampleDate: string | null = null
+  let lastSampleDate: string | null = null
+  for (const sample of samples) {
+    if (firstSampleDate == null || sample.asOf < firstSampleDate) firstSampleDate = sample.asOf
+    if (lastSampleDate == null || sample.asOf > lastSampleDate) lastSampleDate = sample.asOf
+  }
+  return {
+    rule: { ...rule },
+    windowsBuilt: windows.length,
+    windowsScored,
+    namesPerWindow: minMedianMax(windows.map((window) => window.testNameCount)),
+    rowsPerWindow: minMedianMax(windows.map((window) => window.testRowCount)),
+    firstTestDate: windows[0]?.testStartDate ?? null,
+    lastTestDate: windows[windows.length - 1]?.testEndDate ?? null,
+    firstSampleDate,
+    lastSampleDate,
+  }
+}
+
+/**
+ * Run a single walk-forward step on one calendar window with PURGE + EMBARGO.
+ *   - Test set:  every sample formed inside the window, across all names
+ *   - Train set: every sample formed before the window, after the
+ *                label-space purge and the trading-day embargo (windowRows)
  */
 export function walkForwardStep(
   samples: IndexedSample[],
-  splitIndex: number,
-  testSize: number,
+  window: CalendarWindow,
   options: {
-    embargoDays?: number
     horizonDays?: number
     txCostBps?: number
     modelOptions?: { numTrees?: number; depth?: number; learningRate?: number }
@@ -2231,39 +2876,41 @@ export function walkForwardStep(
      * extra GBT fits). Default true; the nested-CV inner loop turns it
      * off for speed. */
     computeIntervals?: boolean
-    /** Column of the long-horizon momentum feature used as the naive
-     * baseline. Callers that prune/reorder features MUST pass the real
+    /** Column of the 12-0 momentum feature (momentum_252d) used as the
+     * naive baseline. Callers that prune/reorder features MUST pass the real
      * index (featureNames.indexOf('momentum_252d')) or the "edge over
-     * momentum" metric silently compares against the wrong feature. */
+     * momentum" metric silently compares against the wrong feature. Defaults
+     * to the column's position in the full, unpruned feature list. */
     baselineMomentumFeatureIndex?: number
+    /** Which momentum definition feeds the trees-plus-momentum blend. Both
+     * definitions are always scored as baselines; this only picks the one
+     * the blend is built on, and defaults to the gate's definition. */
+    momentumBaseline?: MomentumBaselineDefinition
+    /** Correlation used to pick the blend weight on training rows. Defaults
+     * to the gate's correlation. */
+    correlation?: CorrelationKind
+    /** Fit the ridge and blend alternatives on this window. Default true;
+     * the nested hyperparameter search turns it off because it only needs
+     * the tree IC. */
+    computeAlternatives?: boolean
     /** Keep per-test-sample (cohort, prediction, actual) for survivorship
      * diagnostics. Off by default (memory). */
     captureTestDetails?: boolean
   } = {},
 ): WalkForwardResult | null {
-  if (splitIndex <= 0 || splitIndex + testSize > samples.length) return null
-  const embargoDays = options.embargoDays ?? 5
   const horizonDays = options.horizonDays ?? 20
+  const momentumBaseline = options.momentumBaseline ?? DEFAULT_GATE_MOMENTUM_BASELINE
+  const correlation = options.correlation ?? DEFAULT_GATE_CORRELATION
+  const computeAlternatives = options.computeAlternatives !== false
   // txCostBps is retained on the options for API/back-compat but no longer
   // sets the cost — costs are size-tiered per constituent (see below).
 
-  const testSamples = samples.slice(splitIndex, splitIndex + testSize)
+  // The window carries the purge and embargo; windowRows applies them
+  // (label-space purge against the window's first trading day, embargo
+  // counted in trading days).
+  const { train: trainSamples, test: testSamples } = windowRows(samples, window)
   if (testSamples.length < 10) return null
-  const testStartDate = testSamples[0].asOf
-  const testStartTime = new Date(testStartDate).getTime()
-
-  // PURGE in LABEL space: drop train samples whose 20-trading-day label
-  // window (labelEnd20d, an actual bar date) reaches the test start —
-  // calendar arithmetic on horizonDays under-purges because 20 trading
-  // days span ~28 calendar days. EMBARGO: additionally drop samples
-  // formed within embargoDays of the test start (López de Prado 2018).
-  const candidateTrain = samples.slice(0, splitIndex)
-  const embargoCutoff = testStartTime - embargoDays * 24 * 3600 * 1000
-  const trainSamples = candidateTrain.filter(
-    (sample) =>
-      sample.labelEnd20d < testStartDate &&
-      new Date(sample.asOf).getTime() <= embargoCutoff,
-  )
+  const testStartDate = window.testStartDate
   if (trainSamples.length < 50) return null
 
   const trainFeatures = trainSamples.map((sample) => sample.features)
@@ -2273,11 +2920,23 @@ export function walkForwardStep(
   // Bagged ensemble per fold (5 members × 80% row subsamples, fold-seeded)
   // so the walk-forward measures the SAME object that ships live — the
   // ensemble mean — not a single model the app then doesn't use.
+  // Each member's row set is kept as a byte mask so the blend below can score
+  // training rows with the members that never trained on them (out-of-bag).
+  const memberRowMasks: Array<Uint8Array | null> = []
   const bag = fitBaggedGradientBoosting(trainFeatures, trainTargets, {
     ...(options.modelOptions ?? {}),
     bags: 5,
     sampleFraction: 0.8,
     seed: (Date.parse(testStartDate) / 86_400_000) | 0,
+    onMemberRows: (memberIndex, rowIndices) => {
+      if (rowIndices == null) {
+        memberRowMasks[memberIndex] = null
+        return
+      }
+      const mask = new Uint8Array(trainSamples.length)
+      for (const row of rowIndices) mask[row] = 1
+      memberRowMasks[memberIndex] = mask
+    },
   })
 
   const predictions = testSamples.map((sample) =>
@@ -2359,11 +3018,23 @@ export function walkForwardStep(
   // Long-short quintile portfolio — sorted by the (relative) prediction
   // but earning RAW returns (the actual tradeable spread). Carry each
   // name's market cap so the trading + borrow cost can be size-tiered.
-  const indexed = predictions.map((value, idx) => ({
-    pred: value,
-    actual: testSamples[idx].forwardReturn20d, // RAW — the return earned
-    marketCapUsd: Math.exp(testSamples[idx].logMarketCap),  // NaN-safe: exp(NaN)=NaN
-  }))
+  // The cap the tier tables are read with comes from the filing when there
+  // is one, and otherwise from the dollar-volume proxy (costTierMarketCapUsd).
+  // The tier only reaches the net return, the Sharpe built on it and the
+  // cost report lines; the IC the gate reads is computed above, before any
+  // cost exists, and does not see this.
+  const indexed = predictions.map((value, idx) => {
+    const tier = costTierMarketCapUsd(
+      Math.exp(testSamples[idx].logMarketCap), // NaN-safe: exp(NaN)=NaN
+      testSamples[idx].avgDollarVolume20d,
+    )
+    return {
+      pred: value,
+      actual: testSamples[idx].forwardReturn20d, // RAW — the return earned
+      marketCapUsd: tier.capUsd,
+      costTierBasis: tier.basis,
+    }
+  })
   indexed.sort((left, right) => right.pred - left.pred)
   const quintileSize = Math.max(1, Math.floor(indexed.length / 5))
   const topQ = indexed.slice(0, quintileSize)
@@ -2371,19 +3042,43 @@ export function walkForwardStep(
   const topMean = topQ.reduce((sum, item) => sum + item.actual, 0) / topQ.length
   const bottomMean = bottomQ.reduce((sum, item) => sum + item.actual, 0) / bottomQ.length
   const longShortReturnGross = topMean - bottomMean
-  // SIZE-TIERED COSTS (replaces the flat 2×10bps). Each leg pays a one-way
-  // entry cost set by its constituents' market caps; the SHORT leg also
-  // pays a stock-borrow fee pro-rated over the holding horizon. A flat
-  // rate understated costs for any small-cap tilt — see quantConfig
+  // SIZE-TIERED COSTS (replaces the flat 2×10bps). Every window rebalances
+  // the whole book: the names bought when the window opens are sold when it
+  // closes, and the names shorted are bought back. So each side pays the
+  // one-way cost TWICE, on entry and on exit, tiered by its constituents'
+  // market caps, and the SHORT side also pays a stock-borrow fee pro-rated
+  // over the holding horizon. Until 2026-09-16 only the two entry legs were
+  // charged, which understated every round trip by half. A flat rate
+  // understated costs for any small-cap tilt — see quantConfig
   // SIZE_TIERED_TRADING_COST / SIZE_TIERED_BORROW_FEE_ANNUAL for sources.
   const longEntryBps = meanOf(topQ.map((item) => oneWayCostBps(item.marketCapUsd)))
+  const longExitBps = meanOf(topQ.map((item) => oneWayCostBps(item.marketCapUsd)))
   const shortEntryBps = meanOf(bottomQ.map((item) => oneWayCostBps(item.marketCapUsd)))
+  const shortExitBps = meanOf(bottomQ.map((item) => oneWayCostBps(item.marketCapUsd)))
   const shortBorrowBps = meanOf(
     bottomQ.map(
       (item) => borrowFeeAnnualBps(item.marketCapUsd) * (horizonDays / TRADING_DAYS_PER_YEAR),
     ),
   )
-  const realizedCostBps = longEntryBps + shortEntryBps + shortBorrowBps
+  const costBreakdownBps = {
+    longEntry: longEntryBps,
+    longExit: longExitBps,
+    shortEntry: shortEntryBps,
+    shortExit: shortExitBps,
+    shortBorrow: shortBorrowBps,
+  }
+  // Per window, how many of the charged names were sized by a filing, by
+  // the dollar-volume proxy, or by neither, so a reader of the net-return
+  // line can see how much of the cost rests on the stand-in.
+  const costTierBasis = { filedCap: 0, dollarVolumeProxy: 0, unavailable: 0, chargedNames: 0 }
+  for (const item of [...topQ, ...bottomQ]) {
+    costTierBasis.chargedNames++
+    if (item.costTierBasis === 'filed-cap') costTierBasis.filedCap++
+    else if (item.costTierBasis === 'dollar-volume-proxy') costTierBasis.dollarVolumeProxy++
+    else costTierBasis.unavailable++
+  }
+  const realizedCostBps =
+    longEntryBps + longExitBps + shortEntryBps + shortExitBps + shortBorrowBps
   const longShortReturnNet = longShortReturnGross - realizedCostBps / 100
   const meanActual = actuals.reduce((sum, value) => sum + value, 0) / actuals.length
   const stdActual = Math.sqrt(
@@ -2409,19 +3104,89 @@ export function walkForwardStep(
   // one lucky random draw change a model's promotion result.
   const baselineRandomIc = 0
 
-  // BASELINE: long-horizon momentum ranking (Jegadeesh-Titman). NaN when
-  // the momentum feature isn't in the (possibly pruned) set — better an
-  // honest "n/a" than silently scoring whatever sits in column 0, which
-  // would mislabel an unrelated feature's IC as the momentum baseline.
-  const momentumIndex = options.baselineMomentumFeatureIndex ?? 2
+  // BASELINE: twelve-month momentum, scored two ways on the same test rows.
+  //   12-0: the momentum_252d feature column, close today over close 252
+  //         bars ago, which includes the most recent month. NaN when the
+  //         column isn't in the (possibly pruned) set — better an honest
+  //         "n/a" than silently scoring an unrelated column as momentum.
+  //   12-1: close one month ago over close twelve months ago, the
+  //         Jegadeesh-Titman (1993) convention that skips the reversal-prone
+  //         latest month (HistoricalSample.momentum12to1, Z-scored within
+  //         its date like the column). NaN when the rows carry no value.
+  // Both get a Pearson and a Spearman IC; computeBaselineEvidence decides
+  // which definition and which correlation the gate reads.
+  const momentumIndex = options.baselineMomentumFeatureIndex ?? MOMENTUM_252D_FEATURE_INDEX
   const featureWidth = testSamples[0]?.features.length ?? 0
-  const baselineMomentumIc =
+  const momentum12to0Test =
     momentumIndex >= 0 && momentumIndex < featureWidth
-      ? pearsonCorrelation(
-          testSamples.map((sample) => sample.features[momentumIndex]),
-          actuals,
-        )
-      : Number.NaN
+      ? testSamples.map((sample) => sample.features[momentumIndex])
+      : null
+  const momentum12to1Test = testSamples.every((sample) => Number.isFinite(sample.momentum12to1))
+    ? testSamples.map((sample) => sample.momentum12to1 as number)
+    : null
+  const baselineMomentumIc = momentum12to0Test
+    ? pearsonCorrelation(momentum12to0Test, actuals)
+    : Number.NaN
+  const baselineMomentumSpearmanIc = momentum12to0Test
+    ? spearmanCorrelation(momentum12to0Test, actuals)
+    : Number.NaN
+  const baselineMomentum12to1Ic = momentum12to1Test
+    ? pearsonCorrelation(momentum12to1Test, actuals)
+    : Number.NaN
+  const baselineMomentum12to1SpearmanIc = momentum12to1Test
+    ? spearmanCorrelation(momentum12to1Test, actuals)
+    : Number.NaN
+
+  // ALTERNATIVE MODEL: ridge regression (quantMath fitRidge) on the SAME
+  // purged training rows and the SAME feature columns, scored on the SAME
+  // test rows. Any lift the trees show over it is lift a straight line
+  // through the same inputs could not produce. The penalty is chosen by
+  // leave-one-out inside the training rows, so nothing here sees the test
+  // window. A fit that cannot be formed is recorded, never silently zeroed.
+  let ridgeIc = Number.NaN
+  let ridgeSpearmanIc = Number.NaN
+  let ridgeLambda: number | null = null
+  let ridgeFailure: string | undefined
+  if (computeAlternatives) {
+    try {
+      const ridge = fitRidge(trainFeatures, trainTargets)
+      const ridgePredictions = testSamples.map((sample) => predictRidge(ridge, sample.features))
+      ridgeIc = pearsonCorrelation(ridgePredictions, actuals)
+      ridgeSpearmanIc = spearmanCorrelation(ridgePredictions, actuals)
+      ridgeLambda = ridge.lambda
+    } catch (error) {
+      ridgeFailure = error instanceof Error ? error.message : String(error)
+    }
+  }
+
+  // ALTERNATIVE MODEL: trees blended with momentum. The momentum weight is
+  // measured on this window's TRAINING rows only (see measureMomentumBlend)
+  // and then applied to the test rows.
+  const momentumOf = (sample: HistoricalSample): number | undefined =>
+    momentumBaseline === '12-1'
+      ? sample.momentum12to1
+      : momentumIndex >= 0 && momentumIndex < sample.features.length
+        ? sample.features[momentumIndex]
+        : undefined
+  const blend: BlendMeasurement = computeAlternatives
+    ? measureMomentumBlend({
+        trainSamples,
+        trainTargets,
+        bag,
+        memberRowMasks,
+        testSamples,
+        testTreePredictions: predictions,
+        momentumOf,
+        correlation,
+        seedSalt: (Date.parse(testStartDate) / 86_400_000) | 0,
+      })
+    : { weight: null, basis: 'unavailable', rows: 0, testPredictions: null }
+  const blendIc = blend.testPredictions
+    ? pearsonCorrelation(blend.testPredictions, actuals)
+    : Number.NaN
+  const blendSpearmanIc = blend.testPredictions
+    ? spearmanCorrelation(blend.testPredictions, actuals)
+    : Number.NaN
 
   // DRAWDOWN: cumulative L/S return path through the test window
   // (approximate — assumes equal weighting at each test point)
@@ -2471,7 +3236,7 @@ export function walkForwardStep(
     trainSize: trainSamples.length,
     testSize: testSamples.length,
     testStartDate,
-    testEndDate: testSamples[testSamples.length - 1].asOf,
+    testEndDate: window.testEndDate,
     testLabelEndDate: testSamples.reduce(
       (latest, sample) => sample.labelEnd20d > latest ? sample.labelEnd20d : latest,
       testSamples[0].labelEnd20d,
@@ -2482,10 +3247,25 @@ export function walkForwardStep(
     longShortReturnGross,
     longShortReturnNet,
     realizedCostBps,
+    costBreakdownBps,
+    costTierBasis,
     longShortSharpe,
     predictedDecileReturns: decileReturns,
     baselineRandomIc,
     baselineMomentumIc,
+    baselineMomentumSpearmanIc,
+    baselineMomentum12to1Ic,
+    baselineMomentum12to1SpearmanIc,
+    ridgeIc,
+    ridgeSpearmanIc,
+    ridgeLambda,
+    ridgeFailure,
+    blendIc,
+    blendSpearmanIc,
+    blendWeight: blend.weight,
+    blendWeightBasis: blend.basis,
+    blendWeightRows: blend.rows,
+    blendMomentumBaseline: momentumBaseline,
     cumulativeReturn,
     maxDrawdown: maxDD,
     featureImportance,
@@ -2505,7 +3285,179 @@ export function walkForwardStep(
   }
 }
 
-function spearmanCorrelation(x: number[], y: number[]): number {
+/**
+ * Weights on momentum tried for the trees-plus-momentum blend, from "trees
+ * only" (0) to "momentum only" (1) in quarter steps. The grid is coarse on
+ * purpose: the weight is read off a training-row correlation whose noise is
+ * about 1/sqrt(rows) (see BLEND_WEIGHT_MAX_TRAINING_ROWS), and quarter steps
+ * are about the finest spacing that noise can still tell apart. It is fine
+ * enough to say whether the trees add a little, a lot, or nothing on top of
+ * momentum, which is the question the blend exists to answer
+ * (docs/EVIDENCE_QUALITY.md, outcome (b) of the pre-registered rule).
+ */
+export const BLEND_MOMENTUM_WEIGHT_GRID: readonly number[] = [0, 0.25, 0.5, 0.75, 1]
+
+/**
+ * Cap on the training rows the blend weight is scored on. The standard error
+ * of a sample correlation is close to 1/sqrt(n) (Fisher 1921, "On the
+ * probable error of a coefficient of correlation deduced from a small
+ * sample", Metron 1(4)), so 20,000 rows pin every candidate weight's
+ * training-row IC to about +/-0.007, comfortably inside what the quarter-step
+ * grid has to resolve, while the out-of-bag scoring stays negligible next to
+ * the tree fits on a million-row window. It is a compute budget, not a model
+ * parameter: a larger cap returns the same weight to within that error.
+ */
+export const BLEND_WEIGHT_MAX_TRAINING_ROWS = 20_000
+
+export type BlendMeasurement = {
+  weight: number | null
+  basis: 'out-of-bag' | 'unavailable'
+  rows: number
+  /** Blended score per test row, or null when no blend could be formed. */
+  testPredictions: number[] | null
+}
+
+/**
+ * Pick the momentum weight from BLEND_MOMENTUM_WEIGHT_GRID: score every
+ * candidate mix of the two standardised signals against the targets with
+ * the chosen correlation and keep the best. Ties go to MORE momentum: the
+ * grid runs from "all trees" to "all momentum" and a later candidate
+ * replaces an earlier one when it scores the same, because momentum is the
+ * yardstick and a tie means the trees added nothing the correlation could
+ * see. Null when no candidate produced a finite score. Exported so the tie
+ * rule can be pinned on an exact fixture.
+ */
+export function selectBlendWeight(
+  zTree: readonly number[],
+  zMomentum: readonly number[],
+  targets: readonly number[],
+  correlation: CorrelationKind,
+): { weight: number; score: number } | null {
+  const correlate = correlation === 'spearman' ? spearmanCorrelation : pearsonCorrelation
+  let best: { weight: number; score: number } | null = null
+  for (const weight of BLEND_MOMENTUM_WEIGHT_GRID) {
+    const combined = zTree.map((value, k) => (1 - weight) * value + weight * zMomentum[k])
+    const score = correlate(combined, [...targets])
+    if (!Number.isFinite(score)) continue
+    if (best === null || score >= best.score) best = { weight, score }
+  }
+  return best
+}
+
+function meanAndStd(values: readonly number[]): { mean: number; std: number } {
+  const n = values.length
+  if (n === 0) return { mean: 0, std: 0 }
+  const mean = values.reduce((sum, value) => sum + value, 0) / n
+  const variance = values.reduce((sum, value) => sum + (value - mean) ** 2, 0) / n
+  return { mean, std: Math.sqrt(variance) }
+}
+
+/** Values as Z-scores over themselves, or null when they do not vary. */
+function standardize(values: readonly number[]): number[] | null {
+  const { mean, std } = meanAndStd(values)
+  if (!(std > 0)) return null
+  return values.map((value) => (value - mean) / std)
+}
+
+/**
+ * Measure how much momentum to mix into the trees, using this window's
+ * TRAINING rows only, then form the blended score for the test rows.
+ *
+ * The weight comes from the training rows, so it cannot peek at the test
+ * window: a weight chosen on the outcomes the test rows will later reveal
+ * would be selection on the test set. But the trees' own predictions on the
+ * rows they trained on are over-fitted, and scoring the weight on those
+ * would hand the trees the win before the test starts. So each training row
+ * is scored only by the bag members that never trained on it, Breiman's
+ * out-of-bag estimate (Breiman 1996, "Out-of-bag estimation", UC Berkeley
+ * technical report; the same device random forests use for their error
+ * rate, Breiman 2001, Machine Learning 45(1)). Tree scores and momentum are
+ * each standardised, every grid weight is scored by the chosen correlation
+ * against the training targets, and ties go to MORE momentum, because
+ * momentum is the yardstick and a tie means the trees added nothing the
+ * correlation could see.
+ *
+ * On the test rows the two signals are standardised over the test window
+ * (their own predictions and momentum values, never their outcomes) and
+ * combined with the chosen weight.
+ *
+ * Exported so a test can hand it the same bag with the real out-of-bag
+ * masks and with masks that admit every member, and check that the weight
+ * walkForwardStep reports is the out-of-bag one.
+ */
+export function measureMomentumBlend(input: {
+  trainSamples: readonly HistoricalSample[]
+  trainTargets: readonly number[]
+  bag: GradientBoostingModel[]
+  memberRowMasks: ReadonlyArray<Uint8Array | null>
+  testSamples: readonly HistoricalSample[]
+  testTreePredictions: readonly number[]
+  momentumOf: (sample: HistoricalSample) => number | undefined
+  correlation: CorrelationKind
+  seedSalt: number
+}): BlendMeasurement {
+  const unavailable: BlendMeasurement = {
+    weight: null,
+    basis: 'unavailable',
+    rows: 0,
+    testPredictions: null,
+  }
+  const n = input.trainSamples.length
+  if (n === 0 || input.bag.length === 0) return unavailable
+
+  // Thin to the row budget with a draw seeded by the training targets and
+  // the window, so the same window always scores the same rows.
+  const keepProbability = Math.min(1, BLEND_WEIGHT_MAX_TRAINING_ROWS / n)
+  const random = deterministicRandom(input.trainTargets, input.seedSalt ^ 0x626c6e64)
+  const treeScores: number[] = []
+  const momentumScores: number[] = []
+  const targets: number[] = []
+  for (let i = 0; i < n; i++) {
+    if (keepProbability < 1 && random() >= keepProbability) continue
+    const momentum = input.momentumOf(input.trainSamples[i])
+    if (momentum == null || !Number.isFinite(momentum)) continue
+    let sum = 0
+    let members = 0
+    for (let b = 0; b < input.bag.length; b++) {
+      const mask = input.memberRowMasks[b]
+      if (mask == null || mask[i] === 1) continue
+      sum += predictGradientBoosting(input.bag[b], input.trainSamples[i].features)
+      members++
+    }
+    if (members === 0) continue
+    treeScores.push(sum / members)
+    momentumScores.push(momentum)
+    targets.push(input.trainTargets[i])
+  }
+  if (treeScores.length < 2) return unavailable
+  const zTree = standardize(treeScores)
+  const zMomentum = standardize(momentumScores)
+  if (!zTree || !zMomentum) return unavailable
+
+  const best = selectBlendWeight(zTree, zMomentum, targets, input.correlation)
+  if (best === null) return unavailable
+  const chosen = best.weight
+  const measured = { weight: chosen, basis: 'out-of-bag' as const, rows: treeScores.length }
+
+  const testMomentum = input.testSamples.map((sample) => input.momentumOf(sample))
+  if (testMomentum.some((value) => value == null || !Number.isFinite(value))) {
+    return { ...measured, testPredictions: null }
+  }
+  const zTestTree = standardize(input.testTreePredictions)
+  const zTestMomentum = standardize(testMomentum as number[])
+  if (!zTestTree || !zTestMomentum) return { ...measured, testPredictions: null }
+  return {
+    ...measured,
+    testPredictions: zTestTree.map((value, k) => (1 - chosen) * value + chosen * zTestMomentum[k]),
+  }
+}
+
+/**
+ * Spearman rank correlation: Pearson on the ranks of each series. Ranks
+ * are positions in sort order, so tied values receive neighbouring ranks
+ * in the order the sort left them rather than a shared average rank.
+ */
+export function spearmanCorrelation(x: number[], y: number[]): number {
   const n = x.length
   if (n === 0 || x.length !== y.length) return 0
   const xRanks = ranks(x)
@@ -2525,9 +3477,39 @@ function ranks(values: number[]): number[] {
 
 export type ConfidenceInterval = { lower: number; mean: number; upper: number }
 
+/** Which correlation an information coefficient is measured with. Pearson
+ * is the linear correlation of prediction and outcome; Spearman is the same
+ * thing on ranks, so it ignores how big each prediction is and reads only
+ * the ordering. */
+export type CorrelationKind = 'pearson' | 'spearman'
+
+/** The two twelve-month momentum definitions. '12-1' skips the most recent
+ * month (Jegadeesh-Titman 1993, the literature standard); '12-0' includes it
+ * (the momentum_252d feature column, the gate's baseline until 2026-09-16). */
+export type MomentumBaselineDefinition = '12-1' | '12-0'
+
+/** Defaults for the promotion gate. Both can be overridden per run through
+ * the runWalkForwardBacktest / computeBaselineEvidence options, and both
+ * momentum definitions and both correlations are always reported side by
+ * side, so changing the gate never hides the other reading. */
+export const DEFAULT_GATE_MOMENTUM_BASELINE: MomentumBaselineDefinition = '12-1'
+export const DEFAULT_GATE_CORRELATION: CorrelationKind = 'pearson'
+
+/** The name a momentum definition carries in the evidence record. */
+export function momentumBaselineName(
+  definition: MomentumBaselineDefinition,
+): 'momentum_12_1' | 'momentum_252d' {
+  return definition === '12-1' ? 'momentum_12_1' : 'momentum_252d'
+}
+
 export type BaselineComparisonEvidence = {
-  baseline: 'random' | 'momentum_252d'
+  /** 'momentum_252d' is the 12-0 definition (the feature column);
+   * 'momentum_12_1' skips the latest month. */
+  baseline: 'random' | 'momentum_252d' | 'momentum_12_1'
   metric: 'information-coefficient'
+  /** Correlation the paired ICs were measured with. Records written before
+   * 2026-09-16 omit it and were Pearson. */
+  correlation?: CorrelationKind
   /** Differences are paired by the same out-of-sample walk-forward window:
    * model IC minus baseline IC. */
   pairedStepCount: number
@@ -2538,11 +3520,58 @@ export type BaselineComparisonEvidence = {
   ciClearOfZero: boolean
 }
 
+/** A paired difference between two of the models scored in every window,
+ * built by the same block bootstrap as the gate comparisons. */
+export type ModelComparisonEvidence = Omit<BaselineComparisonEvidence, 'baseline' | 'correlation'> & {
+  comparison: 'trees-minus-ridge' | 'trees-minus-momentum' | 'blend-minus-momentum'
+  correlation: CorrelationKind
+  /** Momentum definition on the right-hand side; null for the ridge comparison. */
+  momentumBaseline: MomentumBaselineDefinition | null
+}
+
+/** Report lines only: the alternative models fitted alongside the trees in
+ * every window. Nothing in here decides promotion. */
+export type AlternativeModelEvidence = {
+  /** Mean IC per model over the windows where that model produced one,
+   * under both correlations. */
+  models: Array<{
+    model: 'trees' | 'ridge' | 'momentum_12_1' | 'momentum_252d' | 'blend'
+    windows: number
+    meanPearsonIc: number | null
+    meanSpearmanIc: number | null
+  }>
+  comparisons: ModelComparisonEvidence[]
+  ridge: {
+    lambdaRule: string
+    medianLambda: number | null
+    failedWindows: number
+  }
+  blend: {
+    momentumBaseline: MomentumBaselineDefinition
+    weightGrid: number[]
+    weightBasis: 'out-of-bag'
+    meanMomentumWeight: number | null
+    windowsWithWeight: number
+  }
+}
+
 export type BaselineEvidence = {
   method: 'paired moving-block bootstrap (Kunsch 1989; Politis-Romano 1994)'
   confidenceLevel: 0.95
   random: BaselineComparisonEvidence
+  /** The gate's momentum comparison, under gate.momentumBaseline and
+   * gate.correlation. */
   momentum: BaselineComparisonEvidence
+  /** What the two gate comparisons above were measured with. Records
+   * written before 2026-09-16 omit it: Pearson against the 12-0 column. */
+  gate?: { correlation: CorrelationKind; momentumBaseline: MomentumBaselineDefinition }
+  /** Trees minus momentum under BOTH definitions, at the gate correlation,
+   * so the owner can see the difference the definition makes. One of the
+   * two is the `momentum` comparison above. */
+  momentumByDefinition?: Record<MomentumBaselineDefinition, BaselineComparisonEvidence>
+  /** Ridge, momentum-only and blend alternatives with their paired
+   * intervals. Report lines only. */
+  alternatives?: AlternativeModelEvidence
 }
 
 export type ModelPromotionReason = {
@@ -2599,7 +3628,17 @@ export type FullBacktestResult = {
   meanLongShortReturnNet: number
   meanLongShortSharpe: number
   meanBaselineRandomIc: number
+  /** 12-0 momentum (the momentum_252d column), Pearson, mean over windows. */
   meanBaselineMomentumIc: number
+  /** 12-1 momentum, Pearson, mean over the windows where it was available;
+   * NaN when it never was. */
+  meanBaselineMomentum12to1Ic: number
+  /** Ridge and blend alternatives, Pearson, same convention. */
+  meanRidgeIc: number
+  meanBlendIc: number
+  /** The yardsticks the gate read on this run. */
+  gateMomentumBaseline: MomentumBaselineDefinition
+  gateCorrelation: CorrelationKind
   /** Paired model-minus-baseline IC differences with moving-block bootstrap
    * CIs. Promotion requires both lower bounds to clear zero. */
   baselineEvidence: BaselineEvidence
@@ -2614,6 +3653,8 @@ export type FullBacktestResult = {
   /** Multi-horizon ensemble: one bundle per horizon, each containing
    *  median + p10 + p90 models for prediction intervals. */
   horizonBundles: HorizonModelBundle[]
+  /** The embargo the walk-forward windows used, in TRADING days (it was
+   * calendar days before the windows moved onto the trading calendar). */
   embargoDaysUsed: number
   txCostBpsUsed: number
   /** Mean per-step realized cost (bps) actually subtracted from the L/S
@@ -2636,6 +3677,15 @@ export type FullBacktestResult = {
    * single-ticker live predictions actually get. NaN if too few samples. */
   servingConsistentIC20d?: number
   hyperparameters: { numTrees: number; depth: number; learningRate: number }
+  /** How the hyperparameters were chosen: 'frozen' is FROZEN_HYPERPARAMETERS
+   * (the pre-registered default), 'nested-search' the inner walk-forward
+   * search, 'caller-supplied' explicit modelOptions. */
+  hyperparameterSelection: 'frozen' | 'nested-search' | 'caller-supplied'
+  /** How the test windows were cut on the trading calendar and how big
+   * they came out. The window count is the number of independent tests
+   * behind every confidence interval above, so it is reported, not
+   * assumed. */
+  windowSummary: CalendarWindowSummary
 }
 
 /**
@@ -2804,60 +3854,229 @@ export function measuredOverlapBlockLength(
  * overlapping forward labels. A single window cannot estimate uncertainty,
  * so its CI is deliberately unavailable rather than reported as degenerate.
  */
+/** The per-window numbers computeBaselineEvidence reads. WalkForwardResult
+ * satisfies it; older step records that lack the newer optional fields still
+ * work, with every comparison that needs them reported as unavailable. */
+export type BaselineEvidenceStep = {
+  testStartDate: string
+  testLabelEndDate: string
+  informationCoefficient: number
+  spearmanIc?: number
+  baselineRandomIc: number
+  baselineMomentumIc: number
+  baselineMomentumSpearmanIc?: number
+  baselineMomentum12to1Ic?: number
+  baselineMomentum12to1SpearmanIc?: number
+  ridgeIc?: number
+  ridgeSpearmanIc?: number
+  ridgeLambda?: number | null
+  ridgeFailure?: string
+  blendIc?: number
+  blendSpearmanIc?: number
+  blendWeight?: number | null
+}
+
+type EvidenceModel = 'trees' | 'ridge' | 'momentum_12_1' | 'momentum_252d' | 'blend' | 'random'
+
+/** One window's IC for one model under one correlation; NaN when the step
+ * does not carry it. */
+function evidenceModelIc(
+  step: BaselineEvidenceStep,
+  model: EvidenceModel,
+  correlation: CorrelationKind,
+): number {
+  const pick = (pearson: number | undefined, spearman: number | undefined): number =>
+    (correlation === 'pearson' ? pearson : spearman) ?? Number.NaN
+  switch (model) {
+    case 'trees':
+      return pick(step.informationCoefficient, step.spearmanIc)
+    case 'ridge':
+      return pick(step.ridgeIc, step.ridgeSpearmanIc)
+    case 'momentum_12_1':
+      return pick(step.baselineMomentum12to1Ic, step.baselineMomentum12to1SpearmanIc)
+    case 'momentum_252d':
+      return pick(step.baselineMomentumIc, step.baselineMomentumSpearmanIc)
+    case 'blend':
+      return pick(step.blendIc, step.blendSpearmanIc)
+    case 'random':
+      // The expected IC of an independent random ranking is exactly zero
+      // under either correlation, so the analytical value is used rather
+      // than one lucky draw (see walkForwardStep).
+      return step.baselineRandomIc
+  }
+}
+
+type PairedDifferenceEvidence = Pick<
+  BaselineComparisonEvidence,
+  'metric' | 'pairedStepCount' | 'meanDifference' | 'bootstrapIterations' | 'blockLength' | 'ci95' | 'ciClearOfZero'
+>
+
+/**
+ * Pair the left model's IC with the right model's IC from the exact same
+ * test window, then bootstrap the DIFFERENCE in contiguous blocks. Pairing
+ * removes common regime/window noise; blocks retain the serial dependence
+ * caused by overlapping forward labels. Windows where either side is
+ * unavailable drop out of the pairing. A single window cannot estimate
+ * uncertainty, so its CI is deliberately unavailable rather than reported
+ * as degenerate.
+ */
+function pairedDifferenceEvidence(
+  steps: readonly BaselineEvidenceStep[],
+  left: EvidenceModel,
+  right: EvidenceModel,
+  correlation: CorrelationKind,
+  iterations: number,
+): PairedDifferenceEvidence {
+  const paired = steps
+    .map((step) => ({
+      step,
+      left: evidenceModelIc(step, left, correlation),
+      right: evidenceModelIc(step, right, correlation),
+    }))
+    .filter((pair) => Number.isFinite(pair.left) && Number.isFinite(pair.right))
+  const differences = paired.map((pair) => pair.left - pair.right)
+  const meanDifference =
+    differences.length > 0
+      ? differences.reduce((sum, value) => sum + value, 0) / differences.length
+      : null
+  const blockLength = measuredOverlapBlockLength(paired.map((pair) => pair.step))
+  const ci95 =
+    differences.length >= 2 && blockLength < differences.length
+      ? blockBootstrapStat(
+          differences,
+          (values) => values.reduce((sum, value) => sum + value, 0) / values.length,
+          blockLength,
+          iterations,
+        )
+      : null
+  return {
+    metric: 'information-coefficient',
+    pairedStepCount: differences.length,
+    meanDifference,
+    bootstrapIterations: iterations,
+    blockLength: differences.length >= 2 ? blockLength : null,
+    ci95,
+    ciClearOfZero: ci95 != null && ci95.lower > 0,
+  }
+}
+
+/**
+ * Pair each model IC with the baseline IC from the exact same test window
+ * and bootstrap the differences in blocks (see pairedDifferenceEvidence).
+ *
+ * The two gate comparisons, `random` and `momentum`, are measured with the
+ * correlation and the momentum definition in `options` (defaults:
+ * DEFAULT_GATE_CORRELATION, DEFAULT_GATE_MOMENTUM_BASELINE). Everything
+ * else in the record is a report line: trees minus momentum under the other
+ * definition, and the ridge, momentum-only and blend alternatives with
+ * their own paired intervals under both correlations.
+ */
 export function computeBaselineEvidence(
-  steps: Array<
-    Pick<
-      WalkForwardResult,
-      | 'informationCoefficient'
-      | 'baselineRandomIc'
-      | 'baselineMomentumIc'
-      | 'testStartDate'
-      | 'testLabelEndDate'
-    >
-  >,
+  steps: BaselineEvidenceStep[],
   bootstrapIterations = 1000,
+  options: { momentumBaseline?: MomentumBaselineDefinition; correlation?: CorrelationKind } = {},
 ): BaselineEvidence {
   const iterations = Math.max(1, Math.floor(bootstrapIterations))
-  const comparison = (
-    baseline: BaselineComparisonEvidence['baseline'],
-    key: 'baselineRandomIc' | 'baselineMomentumIc',
-  ): BaselineComparisonEvidence => {
-    const paired = steps
-      .map((step) => ({ model: step.informationCoefficient, baseline: step[key] }))
-      .map((pair, index) => ({ ...pair, step: steps[index] }))
-      .filter((pair) => Number.isFinite(pair.model) && Number.isFinite(pair.baseline))
-    const differences = paired.map((pair) => pair.model - pair.baseline)
-    const meanDifference =
-      differences.length > 0
-        ? differences.reduce((sum, value) => sum + value, 0) / differences.length
-        : null
-    const blockLength = measuredOverlapBlockLength(paired.map((pair) => pair.step))
-    const ci95 =
-      differences.length >= 2 && blockLength < differences.length
-        ? blockBootstrapStat(
-            differences,
-            (values) => values.reduce((sum, value) => sum + value, 0) / values.length,
-            blockLength,
-            iterations,
-          )
-        : null
-    return {
-      baseline,
-      metric: 'information-coefficient',
-      pairedStepCount: differences.length,
-      meanDifference,
-      bootstrapIterations: iterations,
-      blockLength: differences.length >= 2 ? blockLength : null,
-      ci95,
-      ciClearOfZero: ci95 != null && ci95.lower > 0,
-    }
+  const gateCorrelation = options.correlation ?? DEFAULT_GATE_CORRELATION
+  const gateMomentum = options.momentumBaseline ?? DEFAULT_GATE_MOMENTUM_BASELINE
+  const otherMomentum: MomentumBaselineDefinition = gateMomentum === '12-1' ? '12-0' : '12-1'
+  const gateName = momentumBaselineName(gateMomentum)
+
+  const random: BaselineComparisonEvidence = {
+    baseline: 'random',
+    correlation: gateCorrelation,
+    ...pairedDifferenceEvidence(steps, 'trees', 'random', gateCorrelation, iterations),
   }
+  const momentum: BaselineComparisonEvidence = {
+    baseline: gateName,
+    correlation: gateCorrelation,
+    ...pairedDifferenceEvidence(steps, 'trees', gateName, gateCorrelation, iterations),
+  }
+  const momentumOther: BaselineComparisonEvidence = {
+    baseline: momentumBaselineName(otherMomentum),
+    correlation: gateCorrelation,
+    ...pairedDifferenceEvidence(
+      steps,
+      'trees',
+      momentumBaselineName(otherMomentum),
+      gateCorrelation,
+      iterations,
+    ),
+  }
+
+  const comparisons: ModelComparisonEvidence[] = []
+  for (const correlation of ['pearson', 'spearman'] as const) {
+    comparisons.push({
+      comparison: 'trees-minus-ridge',
+      correlation,
+      momentumBaseline: null,
+      ...pairedDifferenceEvidence(steps, 'trees', 'ridge', correlation, iterations),
+    })
+    comparisons.push({
+      comparison: 'trees-minus-momentum',
+      correlation,
+      momentumBaseline: gateMomentum,
+      ...pairedDifferenceEvidence(steps, 'trees', gateName, correlation, iterations),
+    })
+    comparisons.push({
+      comparison: 'blend-minus-momentum',
+      correlation,
+      momentumBaseline: gateMomentum,
+      ...pairedDifferenceEvidence(steps, 'blend', gateName, correlation, iterations),
+    })
+  }
+
+  const meanOfFinite = (values: number[]): number | null => {
+    const finite = values.filter((value) => Number.isFinite(value))
+    return finite.length === 0 ? null : finite.reduce((sum, value) => sum + value, 0) / finite.length
+  }
+  const models: AlternativeModelEvidence['models'] = (
+    ['trees', 'ridge', 'momentum_12_1', 'momentum_252d', 'blend'] as const
+  ).map((model) => {
+    const pearson = steps.map((step) => evidenceModelIc(step, model, 'pearson'))
+    const spearman = steps.map((step) => evidenceModelIc(step, model, 'spearman'))
+    return {
+      model,
+      windows: pearson.filter((value, index) => Number.isFinite(value) || Number.isFinite(spearman[index])).length,
+      meanPearsonIc: meanOfFinite(pearson),
+      meanSpearmanIc: meanOfFinite(spearman),
+    }
+  })
+  const lambdas = steps
+    .map((step) => step.ridgeLambda)
+    .filter((value): value is number => typeof value === 'number' && Number.isFinite(value))
+    .sort((a, b) => a - b)
+  const weights = steps
+    .map((step) => step.blendWeight)
+    .filter((value): value is number => typeof value === 'number' && Number.isFinite(value))
 
   return {
     method: 'paired moving-block bootstrap (Kunsch 1989; Politis-Romano 1994)',
     confidenceLevel: 0.95,
-    random: comparison('random', 'baselineRandomIc'),
-    momentum: comparison('momentum_252d', 'baselineMomentumIc'),
+    random,
+    momentum,
+    gate: { correlation: gateCorrelation, momentumBaseline: gateMomentum },
+    momentumByDefinition: {
+      [gateMomentum]: momentum,
+      [otherMomentum]: momentumOther,
+    } as Record<MomentumBaselineDefinition, BaselineComparisonEvidence>,
+    alternatives: {
+      models,
+      comparisons,
+      ridge: {
+        lambdaRule:
+          'exact leave-one-out over RIDGE_LAMBDA_GRID_MULTIPLIERS x feature count, inside each window\'s training rows (quantMath fitRidge)',
+        medianLambda: lambdas.length === 0 ? null : lambdas[lambdas.length >> 1],
+        failedWindows: steps.filter((step) => step.ridgeFailure != null).length,
+      },
+      blend: {
+        momentumBaseline: gateMomentum,
+        weightGrid: [...BLEND_MOMENTUM_WEIGHT_GRID],
+        weightBasis: 'out-of-bag',
+        meanMomentumWeight: meanOfFinite(weights),
+        windowsWithWeight: weights.length,
+      },
+    },
   }
 }
 
@@ -3299,10 +4518,9 @@ export function calibrationAndSizingAudit(
  */
 function nestedCvHyperparameterSearch(
   sortedSamples: IndexedSample[],
-  innerInitialTrainSize: number,
-  innerTestSize: number,
-  embargoDays: number,
+  rule: WindowRule,
   horizonDays: number,
+  tradingDates: readonly string[] | undefined,
 ): { numTrees: number; depth: number; learningRate: number } {
   const grid: Array<{ numTrees: number; depth: number; learningRate: number }> = [
     { numTrees: 30, depth: 3, learningRate: 0.05 },
@@ -3312,10 +4530,20 @@ function nestedCvHyperparameterSearch(
     { numTrees: 80, depth: 3, learningRate: 0.05 },
     { numTrees: 80, depth: 4, learningRate: 0.05 },
   ]
-  // Use only the first ~70% of the universe for inner CV (so we don't
-  // peek at the outer test windows during hyperparameter selection)
+  // Use only the first ~70% of the rows for inner CV (so we don't peek at
+  // the outer test windows during hyperparameter selection). The inner
+  // windows are cut on the same calendar with the same rule; only the
+  // burn-in is scaled by that same 0.7, as the old row-count version scaled
+  // its inner training start, so a shorter history still leaves inner
+  // windows to score.
   const innerScope = sortedSamples.slice(0, Math.floor(sortedSamples.length * 0.7))
-  if (innerScope.length < innerInitialTrainSize + innerTestSize) {
+  // Just take the first 3 inner windows to keep this fast.
+  const innerWindows = buildCalendarWindows(innerScope, {
+    ...rule,
+    burnInYears: rule.burnInYears * 0.7,
+    tradingDates,
+  }).slice(0, 3)
+  if (innerWindows.length === 0) {
     return grid[2]  // default fallback
   }
   let bestParams = grid[2]
@@ -3323,20 +4551,17 @@ function nestedCvHyperparameterSearch(
   for (const params of grid) {
     let total = 0
     let count = 0
-    let splitIndex = innerInitialTrainSize
-    // Just take the first 3 inner steps to keep this fast
-    for (let stepNum = 0; stepNum < 3 && splitIndex + innerTestSize <= innerScope.length; stepNum++) {
-      const result = walkForwardStep(innerScope, splitIndex, innerTestSize, {
-        embargoDays,
+    for (const window of innerWindows) {
+      const result = walkForwardStep(innerScope, window, {
         horizonDays,
         modelOptions: params,
         computeIntervals: false,  // hyperparameter scoring needs IC only
+        computeAlternatives: false,  // no ridge or blend inside the search
       })
       if (result) {
         total += result.informationCoefficient
         count++
       }
-      splitIndex += innerTestSize
     }
     if (count > 0) {
       const meanIc = total / count
@@ -3349,61 +4574,107 @@ function nestedCvHyperparameterSearch(
   return bestParams
 }
 
+/**
+ * The tree settings every pre-registered run uses: the values in the saved
+ * artifact (tools/ml_trained_model.json, `hyperparameters`) and in the
+ * pre-registered stopping rule (docs/EVIDENCE_QUALITY.md, section 1). They
+ * are frozen because the nested search that used to pick them scores six
+ * settings on only three inner windows and flipped to 80 trees / depth 4 /
+ * rate 0.05 on the 500-name run (tools/backtest-1000-derisk-500.log:61); a
+ * choice that moves that much on that little data is not stable enough to
+ * pre-register.
+ */
+export const FROZEN_HYPERPARAMETERS: Readonly<{ numTrees: number; depth: number; learningRate: number }> =
+  Object.freeze({ numTrees: 50, depth: 3, learningRate: 0.1 })
+
 export function runWalkForwardBacktest(
   samples: HistoricalSample[],
   options: {
-    initialTrainSize?: number
-    testSize?: number
-    stepSize?: number
-    embargoDays?: number
+    /** Window rule; whatever is left out comes from DEFAULT_WINDOW_RULE.
+     * The CLI's --window-days and --burn-in-years flags land here. */
+    stepTradingDays?: number
+    burnInYears?: number
+    embargoTradingDays?: number
+    /** Every trading day the dataset builder saw
+     * (DatasetBuildResult.tradingDates). Pass it: without it the windows
+     * are cut on sample dates, which are one trading day in ten. */
+    tradingDates?: readonly string[]
     horizonDays?: number
     txCostBps?: number
     modelOptions?: { numTrees?: number; depth?: number; learningRate?: number }
-    /** When true, runs nested CV to pick hyperparameters. Default true. */
+    /** When true (the default), the tree settings are FROZEN_HYPERPARAMETERS
+     * and the nested search never runs, which is what the pre-registered
+     * run requires (docs/EVIDENCE_QUALITY.md, section 1). Pass false to let
+     * the nested search choose them again; it stays available behind this
+     * flag. Explicit modelOptions win over both. */
+    freezeHyperparameters?: boolean
+    /** Only read when freezeHyperparameters is false: false skips the
+     * nested search and uses FROZEN_HYPERPARAMETERS. */
     nestedHyperparameterSearch?: boolean
     /** See walkForwardStep — pass featureNames.indexOf('momentum_252d'). */
     baselineMomentumFeatureIndex?: number
+    /** Momentum definition the gate reads, and the one the blend is built
+     * on. Default DEFAULT_GATE_MOMENTUM_BASELINE ('12-1'). Both definitions
+     * are always reported. */
+    momentumBaseline?: MomentumBaselineDefinition
+    /** Correlation the gate reads. Default DEFAULT_GATE_CORRELATION
+     * ('pearson'). Both are always reported. */
+    correlation?: CorrelationKind
     /** See walkForwardStep.captureTestDetails. */
     captureTestDetails?: boolean
   } = {},
 ): FullBacktestResult | null {
   const sorted = indexSamples(samples)
-  const initialTrainSize = options.initialTrainSize ?? Math.floor(sorted.length * 0.6)
-  const testSize = options.testSize ?? 60
-  const stepSize = options.stepSize ?? testSize
-  const embargoDays = options.embargoDays ?? 5
+  const rule = resolveWindowRule({
+    stepTradingDays: options.stepTradingDays,
+    burnInYears: options.burnInYears,
+    embargoTradingDays: options.embargoTradingDays,
+  })
+  // The two single-split diagnostics further down (heldOutHorizonMetrics,
+  // servingConsistentIC) still read this number as calendar days; they are
+  // separate splits, not walk-forward windows, and were left as they were.
+  const embargoDays = rule.embargoTradingDays
   const horizonDays = options.horizonDays ?? 20
   const txCostBps = options.txCostBps ?? 10
 
-  // Nested CV: pick hyperparameters using only training-side data
-  let chosenParams = options.modelOptions
-  if (options.nestedHyperparameterSearch !== false && !chosenParams) {
-    chosenParams = nestedCvHyperparameterSearch(
-      sorted,
-      Math.floor(initialTrainSize * 0.7),
-      Math.min(testSize, 40),
-      embargoDays,
-      horizonDays,
-    )
+  // Test windows are a property of the trading calendar, not of the row
+  // count: the same rule gives the same windows however wide the universe.
+  const windows = buildCalendarWindows(sorted, { ...rule, tradingDates: options.tradingDates })
+  if (windows.length === 0) return null
+
+  // Hyperparameters: frozen by default at the pre-registered values. The
+  // nested search (training-side data only) runs only when the caller
+  // unfreezes them, and explicit modelOptions always win.
+  const momentumBaseline = options.momentumBaseline ?? DEFAULT_GATE_MOMENTUM_BASELINE
+  const correlation = options.correlation ?? DEFAULT_GATE_CORRELATION
+  let chosenParams: { numTrees?: number; depth?: number; learningRate?: number }
+  let hyperparameterSelection: FullBacktestResult['hyperparameterSelection']
+  if (options.modelOptions) {
+    chosenParams = options.modelOptions
+    hyperparameterSelection = 'caller-supplied'
+  } else if (options.freezeHyperparameters !== false || options.nestedHyperparameterSearch === false) {
+    chosenParams = { ...FROZEN_HYPERPARAMETERS }
+    hyperparameterSelection = 'frozen'
   } else {
-    chosenParams = chosenParams ?? { numTrees: 50, depth: 3, learningRate: 0.1 }
+    chosenParams = nestedCvHyperparameterSearch(sorted, rule, horizonDays, options.tradingDates)
+    hyperparameterSelection = 'nested-search'
   }
 
   const steps: WalkForwardResult[] = []
-  let splitIndex = initialTrainSize
-  while (splitIndex + testSize <= sorted.length) {
-    const result = walkForwardStep(sorted, splitIndex, testSize, {
-      embargoDays,
+  for (const window of windows) {
+    const result = walkForwardStep(sorted, window, {
       horizonDays,
       txCostBps,
       modelOptions: chosenParams,
       baselineMomentumFeatureIndex: options.baselineMomentumFeatureIndex,
+      momentumBaseline,
+      correlation,
       captureTestDetails: options.captureTestDetails,
     })
     if (result) steps.push(result)
-    splitIndex += stepSize
   }
   if (steps.length === 0) return null
+  const windowSummary = summarizeCalendarWindows(sorted, windows, rule, steps.length)
 
   // Final ensemble: per-horizon median + p10 + p90 models.
   // Median trains on ALL samples (best point estimate). Quantile models
@@ -3511,6 +4782,16 @@ export function runWalkForwardBacktest(
 
   const mean = (key: keyof WalkForwardResult): number =>
     steps.reduce((sum, step) => sum + (step[key] as number), 0) / steps.length
+  // For the optional per-window numbers: the mean over the windows that
+  // carry a finite value, NaN when none does.
+  const meanFinite = (key: keyof WalkForwardResult): number => {
+    const values = steps
+      .map((step) => step[key])
+      .filter((value): value is number => typeof value === 'number' && Number.isFinite(value))
+    return values.length === 0
+      ? Number.NaN
+      : values.reduce((sum, value) => sum + value, 0) / values.length
+  }
 
   // Cumulative return path across walk-forward steps
   let runningCumReturn = 0
@@ -3574,7 +4855,7 @@ export function runWalkForwardBacktest(
       ? coverageSteps.reduce((sum, step) => sum + (step.intervalMeanWidthPct ?? 0), 0) /
         coverageSteps.length
       : undefined
-  const baselineEvidence = computeBaselineEvidence(steps)
+  const baselineEvidence = computeBaselineEvidence(steps, 1000, { momentumBaseline, correlation })
 
   return {
     steps,
@@ -3586,6 +4867,11 @@ export function runWalkForwardBacktest(
     meanLongShortSharpe: portfolioSharpe,
     meanBaselineRandomIc: mean('baselineRandomIc'),
     meanBaselineMomentumIc: mean('baselineMomentumIc'),
+    meanBaselineMomentum12to1Ic: meanFinite('baselineMomentum12to1Ic'),
+    meanRidgeIc: meanFinite('ridgeIc'),
+    meanBlendIc: meanFinite('blendIc'),
+    gateMomentumBaseline: momentumBaseline,
+    gateCorrelation: correlation,
     baselineEvidence,
     cumulativeReturn: runningCumReturn,
     maxDrawdown: maxDD,
@@ -3596,6 +4882,7 @@ export function runWalkForwardBacktest(
     horizonBundles,
     embargoDaysUsed: embargoDays,
     txCostBpsUsed: txCostBps,
+    windowSummary,
     meanRealizedCostBps: mean('realizedCostBps'),
     icCI,
     hitRateCI,
@@ -3605,10 +4892,11 @@ export function runWalkForwardBacktest(
     intervalMeanWidthPct,
     servingConsistentIC20d: servingIC,
     hyperparameters: {
-      numTrees: chosenParams.numTrees ?? 50,
-      depth: chosenParams.depth ?? 3,
-      learningRate: chosenParams.learningRate ?? 0.1,
+      numTrees: chosenParams.numTrees ?? FROZEN_HYPERPARAMETERS.numTrees,
+      depth: chosenParams.depth ?? FROZEN_HYPERPARAMETERS.depth,
+      learningRate: chosenParams.learningRate ?? FROZEN_HYPERPARAMETERS.learningRate,
     },
+    hyperparameterSelection,
   }
 }
 
@@ -3639,10 +4927,13 @@ export function runWalkForwardBacktest(
  * FDR set removes the free search, so the relevant deflation is just the
  * 6-config hyperparameter grid (DSR≈95%).
  *
- * The survivors are the classic, most-replicated cross-sectional factors:
- * low-volatility (Ang-Hodrick-Xing-Zhang 2006), size (Banz 1981), illiquidity
- * (Amihud 2002), momentum (Jegadeesh-Titman 1993), plus survivorship-
- * visibility (listing age). Annotations are the measured mean per-date IC.
+ * The survivors are mostly the classic, most-replicated cross-sectional
+ * factors: size (Banz 1981), illiquidity (Amihud 2002), momentum
+ * (Jegadeesh-Titman 1993), plus survivorship-visibility (listing age). The
+ * volatility columns survive too, but with the OPPOSITE sign to the
+ * low-volatility anomaly (Ang-Hodrick-Xing-Zhang 2006); see the note on
+ * volatility_252d below. Annotations are the measured mean per-date IC of
+ * the feature against the 20-day RELATIVE forward return.
  */
 export const PRUNED_FEATURE_NAMES: string[] = [
   // UNCHANGED by the 2026-09-10 company-descriptor work, deliberately. Three
@@ -3659,7 +4950,14 @@ export const PRUNED_FEATURE_NAMES: string[] = [
   // screen and drop (fund_revenue_growth_yoy, last_close_over_sma_20); two
   // of the three new tail-risk candidates earn entry. Annotations are the
   // 2026-07-07 run's measured mean per-date IC.
-  'volatility_252d',             // +0.070  low-vol (Ang et al. 2006)
+  // The sign on volatility_252d needs saying plainly. The measured per-date
+  // IC is POSITIVE: in this sample, higher trailing volatility went with a
+  // HIGHER relative 20-day return. That is the opposite of the low-volatility
+  // anomaly (Ang, Hodrick, Xing and Zhang 2006, Journal of Finance 61(1),
+  // where high idiosyncratic volatility predicts LOW returns), so the column
+  // is kept on the strength of the FDR screen alone, not on that paper's
+  // sign. An earlier annotation here put the paper's name on the wrong sign.
+  'volatility_252d',             // +0.070  observed: high vol -> higher next-20d relative return
   'volatility_60d',              // +0.068
   'range_compression_20d',       // +0.067
   'downside_vol_60d',            // +0.059  semi-deviation (Ang-Chen-Xing 2006) — NEW
