@@ -33,6 +33,7 @@ async function main() {
     { runHistoricalBacktestQualityTests },
     { runExecutiveBriefEvidenceTests },
     { runMarketDataAdjustmentTests },
+    { runPreRegisteredRunTests },
   ] = await Promise.all([
     import('../src/data/quantMath.tests'),
     import('../src/data/mlModelService.tests'),
@@ -43,6 +44,7 @@ async function main() {
     import('../src/data/historicalBacktestQuality.tests'),
     import('../src/components/ExecutiveBrief.evidence.tests'),
     import('../src/data/marketData.tests'),
+    import('./preregistered-run.tests'),
   ])
 
   const suites: Array<[string, () => TestResult[] | Promise<TestResult[]>]> = [
@@ -56,6 +58,7 @@ async function main() {
     ['backtest data and promotion quality', runHistoricalBacktestQualityTests],
     ['Executive Brief evidence gate', runExecutiveBriefEvidenceTests],
     ['adjusted market data', runMarketDataAdjustmentTests],
+    ['pre-registered runner (checkpoint, resume, ETF list, required windows)', runPreRegisteredRunTests],
   ]
 
   let total = 0

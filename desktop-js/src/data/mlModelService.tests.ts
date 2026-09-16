@@ -21,6 +21,7 @@ import {
 } from './mlModelService'
 import {
   assessModelPromotion,
+  computeBaselineEvidence,
   HISTORICAL_FEATURE_PIPELINE_VERSION,
   type BacktestDatasetQuality,
   type BaselineEvidence,
@@ -385,6 +386,66 @@ export function runServingNormTests(): TestResult[] {
         authority.canLeadDecisions === false &&
         authority.blockerCodes.includes('INCONSISTENT_DATASET_AUDIT'),
       detail: `${authority.status}: ${authority.detail}`,
+    })
+  }
+
+  // N — the evidence record may name the 12-1 momentum baseline and carry
+  // the optional report fields added 2026-09-16 (gate, momentumByDefinition,
+  // alternatives, correlation). They are report lines, so an otherwise
+  // promoted artifact keeps its authority. A baseline name outside the two
+  // known momentum definitions still fails closed.
+  {
+    const overlap = (index: number) => {
+      const start = new Date(Date.UTC(2020, 0, 1 + index * 7))
+      return {
+        testStartDate: start.toISOString().slice(0, 10),
+        testLabelEndDate: new Date(start.getTime() + 20 * 86_400_000).toISOString().slice(0, 10),
+      }
+    }
+    const evidence = computeBaselineEvidence(
+      Array.from({ length: 12 }, (_, index) => ({
+        informationCoefficient: 0.12 + index * 0.001,
+        spearmanIc: 0.11 + index * 0.001,
+        baselineRandomIc: 0,
+        baselineMomentumIc: 0.04 + index * 0.0003,
+        baselineMomentumSpearmanIc: 0.035 + index * 0.0003,
+        baselineMomentum12to1Ic: 0.05 + index * 0.0003,
+        baselineMomentum12to1SpearmanIc: 0.045 + index * 0.0003,
+        ridgeIc: 0.06 + index * 0.0004,
+        ridgeSpearmanIc: 0.055 + index * 0.0004,
+        ridgeLambda: 30,
+        blendIc: 0.1 + index * 0.0005,
+        blendSpearmanIc: 0.09 + index * 0.0005,
+        blendWeight: 0.25,
+        ...overlap(index),
+      })),
+      1000,
+    )
+    const model = auditedModel('promoted')
+    // The headline IC must reconcile to the zero-IC random comparison.
+    model.meanIC = evidence.random.meanDifference ?? Number.NaN
+    model.promotion = {
+      ...assessModelPromotion(model.datasetQuality!, evidence),
+      persistedMode: 'promoted',
+      advisoryOverrideUsed: false,
+    }
+    const authority = modelDecisionAuthority(model)
+    const forged = auditedModel('promoted')
+    ;(forged.promotion!.baselineEvidence.momentum as { baseline: string }).baseline = 'momentum_6_1'
+    const forgedAuthority = modelDecisionAuthority(forged)
+    const passed =
+      evidence.momentum.baseline === 'momentum_12_1' &&
+      evidence.gate != null &&
+      evidence.momentumByDefinition != null &&
+      evidence.alternatives != null &&
+      authority.canLeadDecisions === true &&
+      authority.status === 'promoted' &&
+      forgedAuthority.canLeadDecisions === false &&
+      forgedAuthority.blockerCodes.includes('INVALID_BASELINE_AUDIT')
+    results.push({
+      name: 'N: 12-1 momentum baseline and the optional report fields keep authority; an unknown baseline fails closed',
+      passed,
+      detail: `${authority.status}: ${authority.detail} / forged ${forgedAuthority.status}: ${forgedAuthority.blockerCodes.join(',')}`,
     })
   }
 

@@ -1,15 +1,67 @@
 /**
- * Node CLI for the walk-forward backtest — runs the exact same pipeline
- * as the in-app BacktestPanel (dataset build → purged/embargoed
- * walk-forward → multi-horizon quantile ensemble) but headless, so
- * results can be produced and inspected without clicking through the UI.
+ * The pre-registered walk-forward runner (docs/EVIDENCE_QUALITY.md).
+ *
+ * Runs the same pipeline as the in-app BacktestPanel (dataset build, purged
+ * and embargoed walk-forward, multi-horizon quantile ensemble) headless, so
+ * the evidence can be produced, checkpointed and inspected without the UI.
  *
  * Build + run (from desktop-js/):
  *   npx esbuild tools/backtest-cli.ts --bundle --platform=node --format=esm \
- *     --outfile=tools/backtest-cli.mjs \
- *     "--define:import.meta.env.VITE_ORACLE_BACKEND_URL='\"http://127.0.0.1:8787\"'" \
- *     "--define:import.meta.env.VITE_FRED_API_KEY='\"\"'"
- *   node tools/backtest-cli.mjs
+ *     --define:import.meta.env='{}' --outfile=tools/backtest-cli.mjs
+ *   node --max-old-space-size=13312 tools/backtest-cli.mjs --checkpoint <dir>
+ *
+ * Memory: the in-process bar cache (marketData.ts) keeps every name's
+ * 40-year history for the life of the process, the dataset holds every row
+ * twice (the 51-column build plus the pruned copy), and every scored window
+ * keeps its per-row detail. Nothing is released, so the need grows with the
+ * number of names. Two smoke runs on 2026-09-16 (40 years, 359 windows,
+ * price-only columns) peaked at 355 MB for 15 names and 446 MB for 25, which
+ * is about 219 MB fixed plus 9.1 MB per name. For the full 1,073-name
+ * universe that projects to about 9,983 MB (9.7 GB), and with a quarter of
+ * headroom rounded up to a whole gigabyte the flag to pass is
+ *   --max-old-space-size=13312
+ * (a 12-name smoke on the same day projected 328 MB and peaked at 327 MB).
+ * Node's default ceiling is 2-4 GB, so the full run dies with "heap out of
+ * memory" without it. The run prints the ceiling it actually got, the
+ * projection for the universe it was given, and the exact flag, and warns
+ * loudly at start when the projection is above the ceiling
+ * (projectHeapNeed in tools/preregistered-run.ts holds the arithmetic).
+ *
+ * Nothing may go missing quietly. Before any data is fetched the runner asks
+ * the backend's /health once and stops at once if it is down. A name whose
+ * price history cannot be fetched after four attempts, a name whose SEC
+ * fundamentals request fails (as opposed to the backend saying the name files
+ * nothing), and missing SPY history for the regime table each stop the run
+ * with the names printed, unless --allow-missing is given, in which case the
+ * run proceeds and the artifact's provenance lists what was dropped.
+ *
+ * Flags, with the pre-registered defaults (each is printed at start):
+ *   --allow-missing                   OFF by default; see above
+ *   --range max                       bars per name (5y | 10y | 15y | max)
+ *   --window-days 20                  trading days per test window
+ *   --burn-in-years 10                training-only years before the first window
+ *   --momentum-baseline 12-1          12-1 (skips the latest month) or 12-0
+ *   --correlation pearson             pearson or spearman; what the gate reads
+ *   --exclude-etfs                    ON by default; --include-etfs keeps the funds
+ *   --features <comma list>           default: the price-only names in the pruned
+ *                                     keeper set; --pruned = all 13 keepers; all = every column
+ *   --freeze-hparams                  ON by default (50 trees, depth 3, rate 0.1);
+ *                                     --search-hyperparameters re-enables the nested search
+ *   --checkpoint <dir>                write every finished window to <dir>/windows.jsonl and
+ *                                     resume from it; a crash loses at most one window
+ *   --limit N                         train on the first N names (after the ETF exclusion)
+ *   --tickers-file PATH               a JSON array of names instead of the default list
+ *   --persist [--allow-advisory-persist]   save the artifact (fail-closed, see below)
+ *   --fdr-q Q                         run the feature screen at a pre-registered q
+ * There is no --selection-cutoff flag: the re-screen was cut from the design.
+ *
+ * Both momentum definitions and both correlations are always printed; the
+ * two gate flags only choose which pair the promotion gate reads.
+ *
+ * Checkpointing runs the window loop from this file through the core's own
+ * walkForwardStep (tools/preregistered-run.ts). The nested hyperparameter
+ * search lives inside the core's single call and cannot be checkpointed, so
+ * --search-hyperparameters and --checkpoint refuse to run together.
  *
  * Persistence is fail-closed. `--persist` writes only a promotable model.
  * Research artifacts that fail one or more gates require BOTH `--persist`
@@ -26,68 +78,322 @@
 async function main() {
   const {
     DEFAULT_BACKTEST_TICKERS,
+    FROZEN_HYPERPARAMETERS,
     HISTORICAL_FEATURE_NAMES,
     PRUNED_FEATURE_NAMES,
     analyzeSurvivorship,
     assessModelPromotion,
+    buildCalendarWindows,
     buildHistoricalDataset,
     calibrationAndSizingAudit,
+    computeBaselineEvidence,
     computeFeatureStats,
     featureSelectionFDR,
+    fetchFundamentalsTimeline,
+    fundamentalsFetchFailures,
+    fundamentalsFetchOutcome,
+    indexSamples,
     labelStepsByRegime,
     pruneSampleFeatures,
+    resolveWindowRule,
     runWalkForwardBacktest,
     singleFeatureSharpes,
+    summarizeCalendarWindows,
     summarizeStepsByRegime,
   } = await import('../src/data/historicalBacktest')
+  type FullBacktestResult = import('../src/data/historicalBacktest').FullBacktestResult
+  type BaselineComparisonEvidence = import('../src/data/historicalBacktest').BaselineComparisonEvidence
   const { cachedFetchDailyBars } = await import('../src/data/marketData')
   const { sampleSkewness, sampleExcessKurtosis } = await import('../src/data/quantMath')
   const { createServingEnsembleAudit } = await import('../src/data/mlModelService')
   const { deflatedSharpeRatio } = await import('../src/data/selectionStats')
+  const pre = await import('./preregistered-run')
+  const { dirname, resolve } = await import('node:path')
+  const { fileURLToPath } = await import('node:url')
+  const { getHeapStatistics } = await import('node:v8')
+  const { totalmem } = await import('node:os')
 
-  const usePruned = process.argv.includes('--pruned')
-  // --persist: PUT the trained bundle to the backend's /ml/model store so
-  // every app instance adopts it on next boot (newest trainedAt wins).
-  const persist = process.argv.includes('--persist')
-  const allowAdvisoryPersist = process.argv.includes('--allow-advisory-persist')
-  const fdrQIndex = process.argv.indexOf('--fdr-q')
-  const fdrQ = fdrQIndex >= 0 ? Number(process.argv[fdrQIndex + 1]) : null
-  if (fdrQ != null && (!Number.isFinite(fdrQ) || fdrQ <= 0 || fdrQ >= 1)) {
-    throw new Error('--fdr-q must be an explicitly pre-registered value between 0 and 1.')
+  /* ------------------------------------------------------------------ */
+  /* Flags                                                               */
+  /* ------------------------------------------------------------------ */
+  const args = process.argv.slice(2)
+  const flagValue = (name: string): string | undefined => {
+    const index = args.indexOf(name)
+    return index >= 0 ? args[index + 1] : undefined
   }
-  if (allowAdvisoryPersist && !persist) {
-    console.error('--allow-advisory-persist is valid only together with --persist.')
+  const hasFlag = (name: string): boolean => args.includes(name)
+  const refuse = (message: string): never => {
+    console.error(message)
     process.exit(2)
   }
-  const rangeArgIndex = process.argv.indexOf('--range')
-  const range = (rangeArgIndex >= 0 ? process.argv[rangeArgIndex + 1] : '15y') as
-    | '5y'
-    | '10y'
-    | '15y'
-    | 'max'
-  // --tickers-file PATH: train on a custom JSON array of tickers instead of
-  // DEFAULT_BACKTEST_TICKERS (used for size-segment experiments — e.g. an
-  // S&P 400 mid-cap-only or S&P 600 small-cap-only universe).
-  const tickersFileIdx = process.argv.indexOf('--tickers-file')
-  let baseTickers: readonly string[] = DEFAULT_BACKTEST_TICKERS
-  if (tickersFileIdx >= 0) {
-    const { readFileSync } = await import('node:fs')
-    const parsed: unknown = JSON.parse(readFileSync(process.argv[tickersFileIdx + 1], 'utf-8'))
-    if (!Array.isArray(parsed) || !parsed.every((ticker) => typeof ticker === 'string')) {
-      throw new Error('--tickers-file must contain a JSON array of ticker strings.')
-    }
-    baseTickers = parsed
-  }
-  // --limit N: train on the first N tickers (the curated bellwethers come
-  // first). Used to stage a big retrain — e.g. 500 to de-risk, then 1000.
-  const limitArgIndex = process.argv.indexOf('--limit')
-  const limit = limitArgIndex >= 0 ? Number(process.argv[limitArgIndex + 1]) : 0
-  const tickers = limit > 0 ? baseTickers.slice(0, limit) : baseTickers
 
+  if (hasFlag('--selection-cutoff')) {
+    refuse('--selection-cutoff is not a flag of this runner: the re-screen was cut from the pre-registered design.')
+  }
+
+  const persist = hasFlag('--persist')
+  const allowAdvisoryPersist = hasFlag('--allow-advisory-persist')
+  if (allowAdvisoryPersist && !persist) refuse('--allow-advisory-persist is valid only together with --persist.')
+
+  // Nothing goes missing quietly. Without this flag a lost price history, a
+  // failed fundamentals request or missing SPY history stops the run with
+  // the names printed; with it the run proceeds and records what it lost.
+  const allowMissing = hasFlag('--allow-missing')
+  // A data failure is a different exit code from a bad flag (2), so a
+  // wrapper script can tell "fix the command line" from "fix the backend".
+  const abortRun = (headline: string, lines: string[] = []): never => {
+    console.error('')
+    console.error(`ABORTED: ${headline}`)
+    for (const line of lines) console.error(`  ${line}`)
+    if (!allowMissing) console.error('  Pass --allow-missing to proceed anyway; the artifact will record what was dropped.')
+    process.exit(1)
+  }
+  const backendBase = import.meta.env.VITE_ORACLE_BACKEND_URL ?? 'http://127.0.0.1:8787'
+
+  const fdrQRaw = flagValue('--fdr-q')
+  const fdrQ = fdrQRaw != null ? Number(fdrQRaw) : null
+  if (fdrQ != null && (!Number.isFinite(fdrQ) || fdrQ <= 0 || fdrQ >= 1)) {
+    refuse('--fdr-q must be an explicitly pre-registered value between 0 and 1.')
+  }
+
+  const rangeArg = flagValue('--range') ?? 'max'
+  if (!['5y', '10y', '15y', 'max'].includes(rangeArg)) refuse('--range must be 5y, 10y, 15y or max.')
+  const range = rangeArg as '5y' | '10y' | '15y' | 'max'
+
+  // Test windows are cut on the trading calendar (buildCalendarWindows):
+  // --window-days trading days per window after a --burn-in-years
+  // training-only burn-in, embargo counted in trading days. Nothing here
+  // depends on the row count, so widening the universe adds names to each
+  // window and never changes the window count. The in-app worker uses the
+  // same rule and the same defaults (DEFAULT_WINDOW_RULE).
+  const windowDaysArg = flagValue('--window-days')
+  const burnInYearsArg = flagValue('--burn-in-years')
+  const windowRule = resolveWindowRule({
+    stepTradingDays: windowDaysArg != null ? Number(windowDaysArg) : undefined,
+    burnInYears: burnInYearsArg != null ? Number(burnInYearsArg) : undefined,
+  })
+
+  // Gate yardsticks (docs/EVIDENCE_QUALITY.md, section 4). Both momentum
+  // definitions and both correlations are always reported; the flags only
+  // pick which pair the gate reads, and a value outside the two choices is
+  // refused rather than silently defaulted.
+  const momentumBaselineArg = flagValue('--momentum-baseline') ?? '12-1'
+  if (momentumBaselineArg !== '12-1' && momentumBaselineArg !== '12-0') refuse('--momentum-baseline must be 12-1 or 12-0.')
+  const momentumBaseline = momentumBaselineArg as '12-1' | '12-0'
+  const correlationArg = flagValue('--correlation') ?? 'pearson'
+  if (correlationArg !== 'pearson' && correlationArg !== 'spearman') refuse('--correlation must be pearson or spearman.')
+  const correlation = correlationArg as 'pearson' | 'spearman'
+
+  // Funds are out of the scored cross-section unless the owner keeps them.
+  const excludeEtfs = !hasFlag('--include-etfs')
+
+  // Tree settings are frozen at the pre-registered values unless the nested
+  // search is asked for by name.
+  const freezeHparams = !(hasFlag('--search-hyperparameters') || hasFlag('--no-freeze-hparams'))
+
+  // Feature set: price-only keepers by default, every keeper with --pruned,
+  // a named list with --features a,b,c, or every column with --features all.
+  const featuresArg = flagValue('--features')
+  let featureNames: string[]
+  let featureChoice: string
+  if (featuresArg != null && featuresArg.trim().toLowerCase() === 'all') {
+    featureNames = [...HISTORICAL_FEATURE_NAMES]
+    featureChoice = '--features all (every column)'
+  } else if (featuresArg != null) {
+    featureNames = featuresArg.split(',').map((name) => name.trim()).filter((name) => name.length > 0)
+    const unknown = featureNames.filter((name) => !HISTORICAL_FEATURE_NAMES.includes(name))
+    if (unknown.length > 0) refuse(`--features names not in HISTORICAL_FEATURE_NAMES: ${unknown.join(', ')}`)
+    if (new Set(featureNames).size !== featureNames.length) refuse('--features lists a name twice.')
+    featureChoice = '--features (caller-supplied list)'
+  } else if (hasFlag('--pruned')) {
+    featureNames = [...PRUNED_FEATURE_NAMES]
+    featureChoice = '--pruned (every FDR keeper, fundamentals included)'
+  } else {
+    featureNames = PRUNED_FEATURE_NAMES.filter((name) => !name.startsWith('fund_'))
+    featureChoice = 'default (price-only FDR keepers)'
+  }
+  const usesEveryColumn = featureNames.length === HISTORICAL_FEATURE_NAMES.length && featureNames.every((name, i) => name === HISTORICAL_FEATURE_NAMES[i])
+
+  const checkpointArg = flagValue('--checkpoint')
+  const checkpointDir = checkpointArg != null ? resolve(checkpointArg) : null
+  if (checkpointDir != null && !freezeHparams) {
+    refuse('--checkpoint cannot be combined with --search-hyperparameters: the nested search runs inside one core call and cannot be resumed window by window.')
+  }
+
+  // --tickers-file PATH: train on a custom JSON array of tickers instead of
+  // DEFAULT_BACKTEST_TICKERS (used for size-segment experiments).
+  const tickersFile = flagValue('--tickers-file')
+  let baseTickers: readonly string[] = DEFAULT_BACKTEST_TICKERS
+  if (tickersFile != null) {
+    const { readFileSync } = await import('node:fs')
+    const parsed: unknown = JSON.parse(readFileSync(tickersFile, 'utf-8'))
+    if (!Array.isArray(parsed) || !parsed.every((ticker) => typeof ticker === 'string')) {
+      refuse('--tickers-file must contain a JSON array of ticker strings.')
+    }
+    baseTickers = parsed as string[]
+  }
+  // --limit N: the first N names, counted after the ETF exclusion, so
+  // "--limit 25" always means 25 scored companies.
+  const limitArg = flagValue('--limit')
+  const limit = limitArg != null ? Number(limitArg) : 0
+
+  /* ------------------------------------------------------------------ */
+  /* Universe: take the funds out                                        */
+  /* ------------------------------------------------------------------ */
+  // The isEtf flag lives in the Dart universe files two directories up
+  // (lib/src/data). When they are present the CLI reads the flag from them;
+  // otherwise it falls back to the two fund blocks in the default list.
+  const dartDataDir = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', 'lib', 'src', 'data')
+  const etfUniverse = pre.resolveEtfUniverse(dartDataDir)
+  const afterEtfs = excludeEtfs ? baseTickers.filter((ticker) => !etfUniverse.symbols.has(ticker)) : [...baseTickers]
+  const etfsExcluded = baseTickers.length - afterEtfs.length
+  const tickers = limit > 0 ? afterEtfs.slice(0, limit) : [...afterEtfs]
+  const hyperparameters = { ...FROZEN_HYPERPARAMETERS }
+
+  /* ------------------------------------------------------------------ */
+  /* Print every setting before anything runs                            */
+  /* ------------------------------------------------------------------ */
+  const heapLimitMb = Math.round(getHeapStatistics().heap_size_limit / 1024 / 1024)
+  console.log('=== PRE-REGISTERED RUN SETTINGS ===')
+  console.log(`  --range              ${range}${rangeArg === (flagValue('--range') ?? '') ? '' : '  (default)'}`)
+  console.log(`  --window-days        ${windowRule.stepTradingDays} trading days${windowDaysArg == null ? '  (default)' : ''}`)
+  console.log(`  --burn-in-years      ${windowRule.burnInYears}${burnInYearsArg == null ? '  (default)' : ''}`)
+  console.log(`  embargo              ${windowRule.embargoTradingDays} trading days (DEFAULT_WINDOW_RULE)`)
+  console.log(`  --momentum-baseline  ${momentumBaseline}${flagValue('--momentum-baseline') == null ? '  (default)' : ''}`)
+  console.log(`  --correlation        ${correlation}${flagValue('--correlation') == null ? '  (default)' : ''}`)
+  console.log(`  --exclude-etfs       ${excludeEtfs ? 'ON' : 'OFF (--include-etfs)'}${hasFlag('--include-etfs') || hasFlag('--exclude-etfs') ? '' : '  (default)'}`)
   console.log(
-    `Building dataset for ${tickers.length} tickers (${range} bars via proxy)…`,
+    `       ETF list source: ${etfUniverse.source === 'dart-universe-isEtf-flag' ? `isEtf flag in ${dartDataDir} (${etfUniverse.dartFlaggedCount} names flagged; ${etfUniverse.blockCount} in the default fund blocks` : `fallback: the two fund blocks inside DEFAULT_BACKTEST_TICKERS (${etfUniverse.blockCount} names; Dart universe files not found at ${dartDataDir}`}` +
+      (etfUniverse.disagreements.length ? `; DISAGREE on ${etfUniverse.disagreements.join(', ')})` : '; the two sources agree)'),
   )
+  console.log(`  --freeze-hparams     ${freezeHparams ? `ON: ${hyperparameters.numTrees} trees / depth ${hyperparameters.depth} / rate ${hyperparameters.learningRate} (FROZEN_HYPERPARAMETERS)` : 'OFF (--search-hyperparameters): nested search picks them'}${hasFlag('--search-hyperparameters') || hasFlag('--no-freeze-hparams') || hasFlag('--freeze-hparams') ? '' : '  (default)'}`)
+  console.log(`  --features           ${featureChoice}: ${featureNames.length} of ${HISTORICAL_FEATURE_NAMES.length}`)
+  console.log(`       ${featureNames.join(', ')}`)
+  console.log(`  --checkpoint         ${checkpointDir ?? 'none (nothing written; a crash loses the run)'}`)
+  console.log(`  --limit              ${limit > 0 ? limit : 'none'}`)
+  console.log(`  --tickers-file       ${tickersFile ?? 'none (DEFAULT_BACKTEST_TICKERS)'}`)
+  console.log(`  --persist            ${persist ? (allowAdvisoryPersist ? 'yes, advisory override allowed' : 'yes, promotable only') : 'no'}`)
+  console.log(`  --fdr-q              ${fdrQ ?? 'none (feature screen skipped)'}`)
+  console.log(`  --allow-missing      ${allowMissing ? 'ON: lost names, failed fundamentals requests and missing SPY history are recorded, not fatal' : 'OFF (default): any of those stops the run before the walk-forward'}`)
+  console.log(`  universe             ${baseTickers.length} names -> ${etfsExcluded} ETFs ${excludeEtfs ? 'excluded' : 'kept'} -> ${afterEtfs.length}${limit > 0 ? ` -> first ${tickers.length} (--limit)` : ''}`)
+  // Memory: the smoke-measured line (fixed cost plus a cost per name),
+  // extended to this universe, against the ceiling node actually gave us.
+  const heap = pre.projectHeapNeed(tickers.length, heapLimitMb)
+  const totalMemoryMb = Math.round(totalmem() / 1024 / 1024)
+  console.log(`  node heap ceiling    ${heapLimitMb} MB (this process; machine has ${totalMemoryMb} MB)`)
+  console.log(
+    `  projected need       ${heap.projectedMb} MB for ${tickers.length} names = ${heap.baseMb.toFixed(0)} MB fixed + ${tickers.length} x ${heap.perNameMb.toFixed(1)} MB per name ` +
+      `(line through the 2026-09-16 smokes: ${pre.SMOKE_MEMORY_POINTS.map((point) => `${point.names} names -> ${point.peakRssMb} MB peak`).join(', ')})`,
+  )
+  console.log(`  node flag to use     node ${heap.flag} tools/backtest-cli.mjs ...  (projection plus a quarter, rounded up to a whole GB)`)
+  if (heap.exceedsCeiling) {
+    console.log('')
+    console.log('  !!! WARNING: the projected need is ABOVE this process\'s heap ceiling. The run will most likely die with')
+    console.log(`  !!! "heap out of memory" part-way through. Restart it as:  node ${heap.flag} tools/backtest-cli.mjs ${args.join(' ')}`)
+    if (heap.recommendedMb > totalMemoryMb) {
+      console.log(`  !!! That is more than this machine's ${totalMemoryMb} MB of memory; use --limit or a machine with more memory.`)
+    }
+    console.log('')
+  }
+  console.log('')
+
+  /* ------------------------------------------------------------------ */
+  /* One health probe before anything is fetched                         */
+  /* ------------------------------------------------------------------ */
+  // Every fetch below waits out its own timeout when the backend is down,
+  // and with four attempts per name that is more than an hour of silence
+  // for the full universe. One request to /health answers at once.
+  const health = await pre.probeBackendHealth(backendBase, { timeoutMs: 5000 })
+  if (!health.ok) {
+    console.error('')
+    console.error(`ABORTED: the backend on ${backendBase} is not answering (${health.detail}).`)
+    console.error("  Start it from the repository root with: dart run tool/backend_cache_server.dart --port 8787 --web-root build/web")
+    console.error('  Nothing was fetched and nothing was written.')
+    process.exit(1)
+  }
+  console.log(`Backend: ${health.detail}`)
+
+  /* ------------------------------------------------------------------ */
+  /* Dataset                                                             */
+  /* ------------------------------------------------------------------ */
+  // Fetch every name's full history first, with bounded retries, so a
+  // proxy that is still warming up cannot silently drop names from the
+  // universe. The builder fetches once and moves on when a fetch fails, and
+  // a universe that differs between two runs makes a checkpoint unusable.
   const started = Date.now()
+  const heapUsedAtStartMb = process.memoryUsage().heapUsed / 1024 / 1024
+  console.log(`Warming price history for ${tickers.length} tickers (max bars via proxy, up to 4 attempts each)...`)
+  const warm = await pre.warmDailyBars(tickers, (ticker) => cachedFetchDailyBars(ticker, 'max'), {
+    attempts: 4,
+    pauseMs: 1500,
+    onProgress: (done, total, ticker) => {
+      if (done % 25 === 0) console.log(`  ${done}/${total} ${ticker}`)
+    },
+  })
+  console.log(
+    `  warmed ${warm.usable.length}/${tickers.length} · ${warm.retries} retr${warm.retries === 1 ? 'y' : 'ies'} · ` +
+      `${warm.failed.length ? `still no bars after 4 attempts: ${warm.failed.join(', ')}` : 'no fetch failures'} · ${((Date.now() - started) / 1000).toFixed(0)}s`,
+  )
+  // Names that could not be fetched narrow the universe. That is fatal by
+  // default: a pre-registered run on fewer names than it registered is a
+  // different run, and it must say so instead of quietly going on.
+  const droppedNames = new Set<string>(warm.failed)
+  if (warm.failed.length > 0 && !allowMissing) {
+    abortRun(`${warm.failed.length} of ${tickers.length} names could not be fetched after 4 attempts each; the run would narrow silently.`, [
+      `names: ${warm.failed.join(', ')}`,
+      'Check the backend log for these symbols, then start the run again.',
+    ])
+  }
+
+  // SPY is the regime yardstick for the era report. Fetch it now, so a run
+  // that cannot label its windows stops before it spends hours scoring them.
+  const spyWarm = await pre.warmDailyBars(['SPY'], (ticker) => cachedFetchDailyBars(ticker, 'max'), { attempts: 4, pauseMs: 1500 })
+  if (spyWarm.failed.length > 0) {
+    if (!allowMissing) {
+      abortRun('SPY history could not be fetched after 4 attempts; the regime table of the era report needs it.', [
+        'Every window would be labeled "unknown" and the regime breakdown would be empty.',
+      ])
+    }
+    console.warn('  WARNING: SPY history unavailable now; the regime step will try again at the end (--allow-missing).')
+  }
+
+  // SEC fundamentals, with the same care: a request that failed is retried,
+  // and one that still fails is a lost fetch, not "files nothing". The
+  // pre-registered run trains on price-only columns, so this protects the
+  // cost tier and the cohort diagnostics here, and every fund_ column on
+  // runs that use them.
+  const fundamentalsStarted = Date.now()
+  console.log(`Warming SEC fundamentals for ${tickers.length} tickers (up to 4 attempts for a failed request; "files nothing" is accepted at once)...`)
+  const fundamentalsWarm = await pre.warmFundamentals(
+    tickers,
+    async (ticker) => {
+      await fetchFundamentalsTimeline(ticker)
+      const outcome = fundamentalsFetchOutcome(ticker)
+      return outcome == null ? 'failed' : outcome.kind
+    },
+    {
+      attempts: 4,
+      pauseMs: 1500,
+      onProgress: (done, total, ticker) => {
+        if (done % 25 === 0) console.log(`  ${done}/${total} ${ticker}`)
+      },
+    },
+  )
+  console.log(
+    `  fundamentals: ${fundamentalsWarm.withTimeline.length} with filings · ${fundamentalsWarm.notFilers.length} file nothing (backend's answer) · ` +
+      `${fundamentalsWarm.failed.length} requests still failing after 4 attempts · ${fundamentalsWarm.retries} retr${fundamentalsWarm.retries === 1 ? 'y' : 'ies'} · ${((Date.now() - fundamentalsStarted) / 1000).toFixed(0)}s`,
+  )
+  if (fundamentalsWarm.failed.length > 0) {
+    const detail = fundamentalsWarm.failed.slice(0, 20).map((ticker) => `${ticker} (${fundamentalsFetchOutcome(ticker)?.kind === 'failed' ? (fundamentalsFetchOutcome(ticker) as { detail: string }).detail : 'failed'})`)
+    if (!allowMissing) {
+      abortRun(`${fundamentalsWarm.failed.length} SEC fundamentals requests failed after 4 attempts each (timed out or errored; not "files nothing").`, [
+        `names: ${detail.join(', ')}${fundamentalsWarm.failed.length > 20 ? ` ... and ${fundamentalsWarm.failed.length - 20} more` : ''}`,
+        'A cold backend needs up to 20 s per SEC download; the client now waits 30 s. Check the backend log, then start the run again.',
+      ])
+    }
+    console.warn(`  WARNING: proceeding with no fundamentals for ${fundamentalsWarm.failed.length} names (--allow-missing): ${detail.join(', ')}`)
+  }
+  console.log(`Building dataset for ${tickers.length} tickers (${range} bars via proxy)...`)
   const built = await buildHistoricalDataset(tickers, {
     cadenceDays: 10,
     range,
@@ -95,12 +401,14 @@ async function main() {
       if (current % 10 === 0) console.log(`  ${current}/${total} ${ticker}`)
     },
   })
+  const datasetSeconds = (Date.now() - started) / 1000
   const d = built.diagnostics
   console.log(
     `Dataset: ${built.samples.length} samples · ${d.tickersWithUsableBars}/${d.tickersAttempted} tickers usable` +
       ` · ${d.tickersWithFundamentals ?? 0} with point-in-time EDGAR fundamentals` +
       (d.tickersWithZeroBars ? ` · ${d.tickersWithZeroBars} fetch failures` : '') +
-      (d.tickersBelowMinBars ? ` · ${d.tickersBelowMinBars} below history threshold` : ''),
+      (d.tickersBelowMinBars ? ` · ${d.tickersBelowMinBars} below history threshold` : '') +
+      ` · ${datasetSeconds.toFixed(0)}s (${(tickers.length / Math.max(1, datasetSeconds)).toFixed(2)} names/s)`,
   )
   const q = built.quality
   console.log('Dataset evidence quality:')
@@ -124,77 +432,369 @@ async function main() {
     `  locked post-selection holdout: ${q.evaluation.lockedPostSelectionHoldout ? 'yes' : 'NO'} ` +
       '(walk-forward folds are OOS, but they are not a never-touched final holdout)',
   )
-  if (d.tickersWithZeroBars > 0) {
-    const failed = d.perTickerSummary.filter((entry) => entry.bars === 0).map((entry) => entry.ticker)
-    console.log(`  failed: ${failed.join(', ')}`)
+  // The builder fetches each name once more (the in-process bar cache keeps
+  // a name for five minutes, and a long warm-up outlives that), so a fetch
+  // can still fail here. Same rule as the warm-up: fatal unless told otherwise.
+  const buildFailures = d.perTickerSummary.filter((entry) => entry.bars === 0).map((entry) => entry.ticker)
+  for (const ticker of buildFailures) droppedNames.add(ticker)
+  if (buildFailures.length > 0) {
+    console.log(`  fetch failed in the build: ${buildFailures.join(', ')}`)
+    if (!allowMissing) {
+      abortRun(`${buildFailures.length} names had no price history when the dataset was built, after the warm-up had fetched them; the run would narrow silently.`, [
+        `names: ${buildFailures.join(', ')}`,
+      ])
+    }
   }
+  // A fundamentals request that failed during the build is a lost fetch
+  // too. The warm-up already retried these, so anything left is fatal by
+  // default; names the backend says file nothing are not in this list.
+  const fundamentalsFailed = fundamentalsFetchFailures()
+  if (fundamentalsFailed.length > 0) {
+    console.log(`  fundamentals requests failed (not "files nothing"): ${fundamentalsFailed.join(', ')}`)
+    if (!allowMissing) {
+      abortRun(`${fundamentalsFailed.length} SEC fundamentals requests failed while the dataset was built; those rows carry no fundamentals.`, [
+        `names: ${fundamentalsFailed.join(', ')}`,
+      ])
+    }
+  }
+  if (droppedNames.size > 0) {
+    console.warn(`  WARNING: proceeding without ${droppedNames.size} names (--allow-missing): ${[...droppedNames].sort().join(', ')}`)
+  }
+  // What this build actually cost, so the projection's constant can be
+  // refreshed from a real run instead of trusted forever.
+  const heapUsedAfterBuildMb = process.memoryUsage().heapUsed / 1024 / 1024
+  console.log(
+    `  memory after the build: heap ${heapUsedAfterBuildMb.toFixed(0)} MB used of ${heapLimitMb} MB ceiling · ` +
+      `${((heapUsedAfterBuildMb - heapUsedAtStartMb) / Math.max(1, d.tickersWithUsableBars)).toFixed(1)} MB per usable name so far (bars + rows; per-window detail comes later) · ` +
+      `projection for this run was ${heap.projectedMb} MB peak`,
+  )
   if (built.samples.length < 200) {
     console.error('Not enough samples for a reliable walk-forward. Is the backend running on 8787?')
     process.exit(1)
   }
 
-  // Optional pruning to the importance-survivor feature set
+  /* ------------------------------------------------------------------ */
+  /* Feature columns                                                     */
+  /* ------------------------------------------------------------------ */
   let samples = built.samples
-  let featureNames: string[] = [...HISTORICAL_FEATURE_NAMES]
-  if (usePruned) {
-    const pruned = pruneSampleFeatures(built.samples, PRUNED_FEATURE_NAMES)
-    samples = pruned.samples
-    featureNames = pruned.featureNames
-    console.log(
-      `Pruned to ${featureNames.length}/${HISTORICAL_FEATURE_NAMES.length} importance-positive features.`,
-    )
+  if (!usesEveryColumn) {
+    samples = pruneSampleFeatures(built.samples, featureNames).samples
+    console.log(`Pruned to ${featureNames.length}/${HISTORICAL_FEATURE_NAMES.length} features.`)
+  }
+  const baselineMomentumFeatureIndex = featureNames.indexOf('momentum_252d')
+
+  /* ------------------------------------------------------------------ */
+  /* Walk-forward                                                        */
+  /* ------------------------------------------------------------------ */
+  const f = (value: number, digits = 3) => (Number.isFinite(value) ? value.toFixed(digits) : 'n/a')
+  const range3 = (m: { min: number; median: number; max: number }) => `${m.min}/${m.median}/${m.max}`
+  const pairedLine = (comparison: { ci95: { lower: number; mean: number; upper: number } | null; ciClearOfZero: boolean; pairedStepCount: number; blockLength: number | null }) =>
+    comparison.ci95
+      ? `${f(comparison.ci95.mean)}  CI [${f(comparison.ci95.lower)}, ${f(comparison.ci95.upper)}]  ` +
+        `${comparison.ciClearOfZero ? 'PASS: lower > 0' : 'ADVISORY: CI crosses 0'}  ` +
+        `(n=${comparison.pairedStepCount}, block=${comparison.blockLength ?? 'n/a'})`
+      : `n/a (only ${comparison.pairedStepCount} usable paired window${comparison.pairedStepCount === 1 ? '' : 's'})`
+  // The required-windows arithmetic (docs/EVIDENCE_QUALITY.md section 5):
+  // n x (h / m)^2 windows for the lower bound to reach zero at the current
+  // mean, where h is the half-width of the interval.
+  const requiredLine = (comparison: Pick<BaselineComparisonEvidence, 'ci95' | 'pairedStepCount'>): string => {
+    const r = pre.requiredWindows(comparison)
+    if (r.mean == null || r.halfWidth == null) return 'windows needed: n/a (no interval)'
+    if (r.alreadyClear) return `windows needed: already clear at n=${r.windowsHave}`
+    if (r.windowsNeeded == null) return `windows needed: n/a (mean ${f(r.mean, 4)} is not above zero)`
+    return `windows needed: ${r.windowsHave} x (${f(r.halfWidth, 4)}/${f(r.mean, 4)})^2 = ~${r.windowsNeeded} (have ${r.windowsHave})`
+  }
+  const printGatePair = (label: string, evidence: { random: BaselineComparisonEvidence; momentum: BaselineComparisonEvidence }, indent = '  ') => {
+    console.log(`${indent}${label}`)
+    for (const comparison of [evidence.random, evidence.momentum]) {
+      console.log(`${indent}  vs ${comparison.baseline.padEnd(13)} ${pairedLine(comparison)}`)
+      console.log(`${indent}     ${requiredLine(comparison)}`)
+    }
   }
 
-  console.log('Running purged+embargoed walk-forward (nested-CV hyperparameters)…')
-  // Test windows: at least one cross-sectional date each, sized so the
-  // out-of-sample period yields ~70 windows (CI width scales with the
-  // number of independent windows, not with samples).
-  const targetWindows = 70
-  const testSize = Math.max(
-    d.tickersWithUsableBars,
-    Math.floor((samples.length * 0.4) / targetWindows),
-  )
-  const result = runWalkForwardBacktest(samples, {
-    initialTrainSize: Math.floor(samples.length * 0.6),
-    testSize,
-    stepSize: testSize,
-    baselineMomentumFeatureIndex: featureNames.indexOf('momentum_252d'),
-    captureTestDetails: true,
-  })
-  if (!result) {
-    console.error('Walk-forward produced no usable steps.')
-    process.exit(1)
+  let result: FullBacktestResult | null
+  let checkpointReport: { dir: string; replayedWindows: number; computedWindows: number } | null = null
+  let peakRssMb = process.memoryUsage().rss / 1024 / 1024
+  const sampleRss = () => {
+    peakRssMb = Math.max(peakRssMb, process.memoryUsage().rss / 1024 / 1024)
   }
+  const walkForwardStarted = Date.now()
+  let servedSeconds = 0
+
+  if (freezeHparams) {
+    // The pre-registered path: this file drives the window loop through the
+    // core's walkForwardStep so every finished window can be written to the
+    // checkpoint at once, then asks the core to train the served models.
+    const sorted = indexSamples(samples)
+    const windows = buildCalendarWindows(sorted, { ...windowRule, tradingDates: built.tradingDates })
+    const attempted = summarizeCalendarWindows(sorted, windows, windowRule, 0)
+    if (windows.length === 0) {
+      console.error(
+        `Walk-forward produced no test windows from samples dated ${attempted.firstSampleDate} to ${attempted.lastSampleDate} ` +
+          `after the ${windowRule.burnInYears}-year burn-in. Use a longer --range or a shorter --burn-in-years.`,
+      )
+      process.exit(1)
+    }
+    console.log('')
+    console.log(
+      `Calendar windows: built=${windows.length} · ${windowRule.stepTradingDays} trading days each · names per window min/median/max=${range3(attempted.namesPerWindow)}` +
+        ` · rows per window min/median/max=${range3(attempted.rowsPerWindow)} · test dates ${attempted.firstTestDate} -> ${attempted.lastTestDate}`,
+    )
+
+    let checkpoint: import('./preregistered-run').Checkpoint | null = null
+    if (checkpointDir != null) {
+      // The row hash runs through the date the checkpoint was created with,
+      // so rows a later fetch appends at the tail do not break a resume;
+      // a fresh directory fixes that date now.
+      const stored = pre.readStoredFingerprint(checkpointDir)
+      const hashStarted = Date.now()
+      const sampleHash = pre.hashSampleContent(built.samples, stored?.samples?.throughDate ?? pre.sampleHashThroughDate(built.samples))
+      const fingerprint: import('./preregistered-run').CheckpointFingerprint = {
+        schemaVersion: 2,
+        tickers: [...tickers].sort(),
+        featureNames: [...featureNames],
+        rule: { ...windowRule },
+        momentumBaseline,
+        correlation,
+        hyperparameters,
+        freezeHparams,
+        horizonDays: 20,
+        range,
+        excludeEtfs,
+        cadenceDays: 10,
+        firstSampleDate: attempted.firstSampleDate,
+        usableTickers: d.perTickerSummary
+          .filter((entry) => entry.samplesGenerated > 0)
+          .map((entry) => entry.ticker)
+          .sort(),
+        settingsHash: pre.hashRunSettings({ tickers, featureNames, momentumBaseline, correlation, rule: windowRule, excludeEtfs, freezeHparams }),
+        fundamentals: {
+          tickersWithFundamentals: d.tickersWithFundamentals ?? 0,
+          sampleCoveragePct: Number((q.fundamentals.sampleSnapshotCoverage * 100).toFixed(1)),
+        },
+        samples: sampleHash,
+      }
+      console.log(`Row hash: ${sampleHash.count} rows through ${sampleHash.throughDate} -> ${sampleHash.sha256.slice(0, 16)}... (${((Date.now() - hashStarted) / 1000).toFixed(1)}s)`)
+      try {
+        checkpoint = pre.openCheckpoint(checkpointDir, fingerprint)
+      } catch (error) {
+        refuse((error as Error).message)
+      }
+      // The lock is ours until this process ends, however it ends.
+      const giveBackLock = () => pre.releaseCheckpoint(checkpoint!)
+      process.on('exit', giveBackLock)
+      for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
+        process.on(signal, () => {
+          giveBackLock()
+          process.exit(130)
+        })
+      }
+      if (checkpoint!.lockReclaimed) {
+        console.log(
+          `Checkpoint lock: taken over from pid ${checkpoint!.lockReclaimed.pid} (started ${checkpoint!.lockReclaimed.startedAt}), which is no longer running.`,
+        )
+      }
+      const done = checkpoint!.completed.size
+      console.log(
+        `Checkpoint ${checkpointDir}: ${done === 0 ? 'fresh (no finished windows yet)' : `resuming, ${done} of ${windows.length} windows already finished`}` +
+          (checkpoint!.droppedPartialLine ? ' · the last line was cut off mid-write and is being scored again' : '') +
+          ` · lock held by pid ${process.pid}`,
+      )
+    }
+
+    console.log(
+      `Running purged+embargoed walk-forward (frozen hyperparameters; gate reads ${correlation} IC against ${momentumBaseline} momentum)...`,
+    )
+    const loopStarted = Date.now()
+    let freshDone = 0
+    const loop = pre.runCheckpointedWindows({
+      sorted,
+      windows,
+      checkpoint,
+      stepOptions: {
+        horizonDays: 20,
+        txCostBps: 10,
+        modelOptions: hyperparameters,
+        baselineMomentumFeatureIndex,
+        momentumBaseline,
+        correlation,
+        captureTestDetails: true,
+      },
+      onWindow: ({ window, step, replayed, done, total, stepsSoFar }) => {
+        sampleRss()
+        if (!replayed) freshDone++
+        const freshRemaining = total - done
+        const perWindow = freshDone > 0 ? (Date.now() - loopStarted) / freshDone : 0
+        const eta = freshDone > 0 ? ` eta ${((perWindow * freshRemaining) / 60_000).toFixed(1)}m` : ''
+        const tag = replayed ? 'replay' : 'scored'
+        if (step) {
+          console.log(
+            `  [${String(done).padStart(4)}/${total}] ${tag} ${window.testStartDate} -> ${window.testEndDate} names=${window.testNameCount} ` +
+              `trees ${f(step.informationCoefficient)}/${f(step.spearmanIc)}  mom12-1 ${f(step.baselineMomentum12to1Ic ?? Number.NaN)}  mom12-0 ${f(step.baselineMomentumIc)}  ` +
+              `ridge ${f(step.ridgeIc ?? Number.NaN)}  blend ${f(step.blendIc ?? Number.NaN)}  cost ${f(step.realizedCostBps, 1)}bps  [${((Date.now() - started) / 60_000).toFixed(1)}m${eta}, rss ${peakRssMb.toFixed(0)}MB]`,
+          )
+        } else {
+          console.log(`  [${String(done).padStart(4)}/${total}] ${tag} ${window.testStartDate} -> ${window.testEndDate} skipped (too few rows)`)
+        }
+        if (!replayed && stepsSoFar.length >= 2 && (done % 10 === 0 || done === total)) {
+          const interim = computeBaselineEvidence(stepsSoFar, 1000, { momentumBaseline, correlation })
+          printGatePair(`interim paired intervals after ${stepsSoFar.length} scored windows (${correlation}, block=${interim.random.blockLength ?? 'n/a'}):`, interim, '    ')
+        }
+      },
+    })
+    checkpointReport = checkpointDir != null ? { dir: checkpointDir, replayedWindows: loop.replayedWindows, computedWindows: loop.computedWindows } : null
+    if (loop.steps.length === 0) {
+      console.error('Every window was skipped (too few rows); nothing to report.')
+      process.exit(1)
+    }
+    console.log(`Window loop done: ${loop.computedWindows} scored now, ${loop.replayedWindows} replayed from the checkpoint, ${loop.steps.length} usable.`)
+
+    console.log('Training the served models on every row (the core recipe, one spanning window)...')
+    const servedStarted = Date.now()
+    const served = pre.trainFinalModelsWithCore({
+      samples,
+      rule: windowRule,
+      tradingDates: built.tradingDates,
+      modelOptions: hyperparameters,
+      baselineMomentumFeatureIndex,
+      momentumBaseline,
+      correlation,
+    })
+    servedSeconds = (Date.now() - servedStarted) / 1000
+    sampleRss()
+    result = pre.assembleFullResult({
+      sorted,
+      windows,
+      rule: windowRule,
+      steps: loop.steps,
+      served,
+      momentumBaseline,
+      correlation,
+      horizonDays: 20,
+      hyperparameterSelection: 'frozen',
+    })
+  } else {
+    // The nested search runs inside the core's single call; no checkpoint.
+    console.log(
+      `Running purged+embargoed walk-forward (nested-search hyperparameters; no checkpoint; gate reads ${correlation} IC against ${momentumBaseline} momentum)...`,
+    )
+    result = runWalkForwardBacktest(samples, {
+      ...windowRule,
+      tradingDates: built.tradingDates,
+      baselineMomentumFeatureIndex,
+      momentumBaseline,
+      correlation,
+      freezeHyperparameters: false,
+      captureTestDetails: true,
+    })
+    sampleRss()
+    if (!result) {
+      const attempted = summarizeCalendarWindows(
+        samples,
+        buildCalendarWindows(samples, { ...windowRule, tradingDates: built.tradingDates }),
+        windowRule,
+        0,
+      )
+      console.error(
+        `Walk-forward produced no usable steps: ${attempted.windowsBuilt} test window(s) from samples dated ` +
+          `${attempted.firstSampleDate} to ${attempted.lastSampleDate} after the ${windowRule.burnInYears}-year burn-in. ` +
+          'Use a longer --range or a shorter --burn-in-years.',
+      )
+      process.exit(1)
+    }
+  }
+  const walkForwardSeconds = (Date.now() - walkForwardStarted) / 1000
   const promotion = assessModelPromotion(built.quality, result.baselineEvidence)
 
   // Regime labeling: point-in-time Markov regime on SPY at each step
   // start. 'max', not the dataset range: every step needs 60+ prior SPY
   // returns. Retry on empty — a single transient Yahoo failure here would
   // mark every window 'unknown' and erase the whole regime breakdown.
-  console.log('Labeling walk-forward steps by SPY Markov regime…')
+  console.log('Labeling walk-forward steps by SPY Markov regime...')
   let spyBars = await cachedFetchDailyBars('SPY', 'max')
   for (let attempt = 0; spyBars.length === 0 && attempt < 4; attempt++) {
     await new Promise((r) => setTimeout(r, 1500))
     spyBars = await cachedFetchDailyBars('SPY', 'max')
   }
-  if (spyBars.length === 0) {
-    console.warn('  WARNING: SPY history unavailable — every step labeled "unknown".')
+  const regimeHistoryMissing = spyBars.length === 0
+  if (regimeHistoryMissing) {
+    // The regime table is part of the era report; a report without it is
+    // not the report that was registered. The windows are already in the
+    // checkpoint, so a fresh run after the backend recovers is cheap.
+    if (!allowMissing) {
+      abortRun('SPY history is unavailable after 4 attempts, so the regime table of the era report cannot be built.', [
+        checkpointDir != null ? `Every scored window is saved in ${checkpointDir}; run the same command again once SPY can be fetched.` : 'Run again once SPY can be fetched (a --checkpoint directory would have kept the scored windows).',
+      ])
+    }
+    console.warn('  WARNING: SPY history unavailable — every step labeled "unknown" (--allow-missing).')
   } else {
-    console.log(`  SPY history: ${spyBars.length} bars (${spyBars[0].date} → ${spyBars[spyBars.length - 1].date})`)
+    console.log(`  SPY history: ${spyBars.length} bars (${spyBars[0].date} -> ${spyBars[spyBars.length - 1].date})`)
   }
   const regimeLabels = labelStepsByRegime(result.steps, spyBars)
   const regimeBreakdown = summarizeStepsByRegime(result.steps, regimeLabels)
 
   const elapsed = ((Date.now() - started) / 1000).toFixed(0)
-  const f = (value: number, digits = 3) => value.toFixed(digits)
 
+  /* ------------------------------------------------------------------ */
+  /* The pre-registered gate report                                      */
+  /* ------------------------------------------------------------------ */
+  const evidence = result.baselineEvidence
+  const w = result.windowSummary
+  const holdoutSteps = pre.holdoutWindows(result.steps)
+  const holdoutEvidence = holdoutSteps.length >= 2 ? computeBaselineEvidence(holdoutSteps, 1000, { momentumBaseline, correlation }) : null
   console.log('')
-  console.log(`=== WALK-FORWARD RESULTS (out-of-sample, ${usePruned ? 'PRUNED' : 'FULL'} feature set: ${featureNames.length}) ===`)
+  console.log(`=== PRE-REGISTERED GATE REPORT (${featureNames.length} features; gate reads ${evidence.gate?.correlation ?? correlation} IC against ${evidence.gate?.momentumBaseline ?? momentumBaseline} momentum) ===`)
+  console.log(`windows built=${w.windowsBuilt} scored=${w.windowsScored} · names per window min/median/max=${range3(w.namesPerWindow)} · first test date ${w.firstTestDate} · last test date ${w.lastTestDate}`)
+  console.log(`measured block length: random=${evidence.random.blockLength ?? 'n/a'} momentum=${evidence.momentum.blockLength ?? 'n/a'} (adjacent windows sharing 20-day label space)`)
+  console.log(`hyperparameters: trees=${result.hyperparameters.numTrees} depth=${result.hyperparameters.depth} rate=${result.hyperparameters.learningRate} (${result.hyperparameterSelection})`)
+  printGatePair(`Holdout split: windows starting before ${pre.HOLDOUT_CUTOFF_DATE} (${holdoutSteps.length} windows)` + (holdoutEvidence ? ':' : ' - n/a, fewer than two windows'), holdoutEvidence ?? { random: { ...evidence.random, ci95: null, ciClearOfZero: false, pairedStepCount: holdoutSteps.length, blockLength: null }, momentum: { ...evidence.momentum, ci95: null, ciClearOfZero: false, pairedStepCount: holdoutSteps.length, blockLength: null } })
+  printGatePair(`All windows (${result.steps.length} windows):`, evidence)
+  console.log(`timing: dataset ${datasetSeconds.toFixed(0)}s · walk-forward ${walkForwardSeconds.toFixed(0)}s (served models ${servedSeconds.toFixed(0)}s of that) · total ${elapsed}s · peak RSS ${peakRssMb.toFixed(0)} MB (sampled after each window)`)
+  if (checkpointReport) {
+    console.log(`checkpoint: ${checkpointReport.dir} · ${checkpointReport.replayedWindows} windows replayed · ${checkpointReport.computedWindows} scored this run`)
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Full results                                                        */
+  /* ------------------------------------------------------------------ */
+  console.log('')
+  console.log(`=== WALK-FORWARD RESULTS (out-of-sample, ${featureNames.length} features) ===`)
   console.log(`samples=${result.totalSamples} steps=${result.steps.length} elapsed=${elapsed}s`)
   console.log(
-    `hyperparameters: trees=${result.hyperparameters.numTrees} depth=${result.hyperparameters.depth} lr=${result.hyperparameters.learningRate}`,
+    `calendar windows: built=${w.windowsBuilt} scored=${w.windowsScored} · ${w.rule.stepTradingDays} trading days each` +
+      ` · burn-in ${w.rule.burnInYears}y from ${w.firstSampleDate} · embargo ${w.rule.embargoTradingDays} trading days`,
   )
-  console.log(`embargo=${result.embargoDaysUsed}d  size-tiered cost (entry both legs + short borrow) avg=${f(result.meanRealizedCostBps, 1)}bps/window`)
+  console.log(
+    `  names per window min/median/max=${range3(w.namesPerWindow)} · rows per window min/median/max=${range3(w.rowsPerWindow)}` +
+      ` · test dates ${w.firstTestDate} -> ${w.lastTestDate}`,
+  )
+  console.log(
+    `hyperparameters: trees=${result.hyperparameters.numTrees} depth=${result.hyperparameters.depth} lr=${result.hyperparameters.learningRate} (${result.hyperparameterSelection})`,
+  )
+  console.log(`embargo=${result.embargoDaysUsed} trading days  size-tiered cost (entry + exit on both sides + short borrow) avg=${f(result.meanRealizedCostBps, 1)}bps/window`)
+  // Sum the per-window cost-tier basis so a reader of the net-return line can
+  // see how much of the cost rests on the dollar-volume stand-in rather than a
+  // filed market cap. Before SEC XBRL coverage (about 2009) every charged name
+  // is proxied, so on a 40-year run this is most of the holdout era. It touches
+  // net return, Sharpe and the cost lines only, never the IC the gate reads.
+  const tierTotals = { filedCap: 0, dollarVolumeProxy: 0, unavailable: 0, chargedNames: 0 }
+  for (const step of result.steps) {
+    const basis = step.costTierBasis
+    if (!basis) continue
+    tierTotals.filedCap += basis.filedCap
+    tierTotals.dollarVolumeProxy += basis.dollarVolumeProxy
+    tierTotals.unavailable += basis.unavailable
+    tierTotals.chargedNames += basis.chargedNames
+  }
+  if (tierTotals.chargedNames > 0) {
+    const pct = (n: number) => f((n / tierTotals.chargedNames) * 100, 1)
+    console.log(
+      `  cost tier basis over ${tierTotals.chargedNames} charged name-windows: filed cap ${tierTotals.filedCap} (${pct(tierTotals.filedCap)}%)` +
+        ` · dollar-volume proxy ${tierTotals.dollarVolumeProxy} (${pct(tierTotals.dollarVolumeProxy)}%)` +
+        ` · neither (bottom tier) ${tierTotals.unavailable} (${pct(tierTotals.unavailable)}%)` +
+        `  [affects net return and Sharpe lines only, not IC]`,
+    )
+  }
   console.log('')
   console.log(`IC (Pearson, validated):  ${f(result.meanIC)}  CI [${f(result.icCI.lower)}, ${f(result.icCI.upper)}]   (per-date cross-sectional norm)`)
   if (result.servingConsistentIC20d != null && Number.isFinite(result.servingConsistentIC20d)) {
@@ -213,16 +813,44 @@ async function main() {
   if (momInSet) {
     console.log(`Edge over momentum: ${f(result.meanIC - result.meanBaselineMomentumIc)}`)
   }
-  console.log('Paired moving-block bootstrap edge (model IC minus baseline IC):')
-  for (const comparison of [result.baselineEvidence.random, result.baselineEvidence.momentum]) {
-    const ci = comparison.ci95
+  console.log(
+    `12-1 momentum:      ${f(result.meanBaselineMomentum12to1Ic)}  (skips the latest month; the 12-month line above is 12-0)`,
+  )
+  console.log(
+    `Paired moving-block bootstrap edge (model IC minus baseline IC; gate reads ${evidence.gate?.correlation ?? 'pearson'} ` +
+      `against ${evidence.gate?.momentumBaseline ?? '12-0'} momentum):`,
+  )
+  for (const comparison of [evidence.random, evidence.momentum]) {
+    console.log(`  vs ${comparison.baseline.padEnd(13)} ${pairedLine(comparison)}`)
+  }
+  if (evidence.momentumByDefinition) {
+    console.log('Momentum definition check (trees minus momentum, both definitions, gate correlation):')
+    for (const definition of ['12-1', '12-0'] as const) {
+      const comparison = evidence.momentumByDefinition[definition]
+      const tag = evidence.gate?.momentumBaseline === definition ? 'GATE  ' : 'report'
+      console.log(`  ${tag} ${definition} (${comparison.baseline.padEnd(13)}) ${pairedLine(comparison)}`)
+    }
+  }
+  if (evidence.alternatives) {
+    const alt = evidence.alternatives
+    console.log('')
+    console.log('--- Alternative models on the identical rows (report lines; none of these gate) ---')
+    console.log('  model          Pearson   Spearman  windows')
+    for (const entry of alt.models) {
+      const show = (value: number | null) => (value == null ? '    n/a' : f(value).padStart(7))
+      console.log(`  ${entry.model.padEnd(14)} ${show(entry.meanPearsonIc)}   ${show(entry.meanSpearmanIc)}   ${entry.windows}`)
+    }
     console.log(
-      `  vs ${comparison.baseline.padEnd(13)} ` +
-        (ci
-          ? `${f(ci.mean)}  CI [${f(ci.lower)}, ${f(ci.upper)}]  ` +
-            `${comparison.ciClearOfZero ? 'PASS: lower > 0' : 'ADVISORY: CI crosses 0'}`
-          : `n/a (only ${comparison.pairedStepCount} usable paired window${comparison.pairedStepCount === 1 ? '' : 's'})`),
+      `  ridge: ${alt.ridge.lambdaRule}; median lambda=${alt.ridge.medianLambda == null ? 'n/a' : f(alt.ridge.medianLambda, 2)}, failed windows=${alt.ridge.failedWindows}`,
     )
+    console.log(
+      `  blend: trees + ${alt.blend.momentumBaseline} momentum, weight on momentum picked per window from {${alt.blend.weightGrid.join(', ')}} ` +
+        `on ${alt.blend.weightBasis} training rows; mean weight=${alt.blend.meanMomentumWeight == null ? 'n/a' : f(alt.blend.meanMomentumWeight, 2)} over ${alt.blend.windowsWithWeight} windows`,
+    )
+    console.log('  paired differences (left model IC minus right model IC):')
+    for (const comparison of alt.comparisons) {
+      console.log(`    ${comparison.comparison.padEnd(22)} [${comparison.correlation.padEnd(8)}] ${pairedLine(comparison)}`)
+    }
   }
   console.log('')
   console.log('--- Long-short quintile (20d horizon) ---')
@@ -305,7 +933,7 @@ async function main() {
       `  N=${String(nTrials).padStart(3)} trials -> max-SR0=${f(sr0, 3)}  PSR(0)=${f(psr0 * 100, 1)}%  DSR=${f(dsr * 100, 1)}%`,
     )
   }
-  console.log('  (PSR(0)=P(true Sharpe>0); DSR=P(Sharpe beats the best-of-N-trials null). DSR>95% ⇒ robust to selection.)')
+  console.log('  (PSR(0)=P(true Sharpe>0); DSR=P(Sharpe beats the best-of-N-trials null). DSR>95% => robust to selection.)')
 
   // === Calibration + sizing audit ===
   const cs = calibrationAndSizingAudit(result.steps, 20)
@@ -315,9 +943,9 @@ async function main() {
     console.log(
       `Base rate P(outperform): ${f(cs.baseRate * 100, 1)}%  ·  Brier (held-out ${cs.evalN}): calibrated ${f(cs.brierCalibrated, 4)} vs base-rate ${f(cs.brierBaseRate, 4)} (lower = better)`,
     )
-    console.log('  reliability  (calibrated prob bin → realized win rate):')
+    console.log('  reliability  (calibrated prob bin -> realized win rate):')
     for (const b of cs.reliability) {
-      console.log(`    P≈${f(b.binMeanProb * 100, 1)}%  →  won ${f(b.winRate * 100, 1)}%   (n=${b.n})`)
+      console.log(`    P~${f(b.binMeanProb * 100, 1)}%  ->  won ${f(b.winRate * 100, 1)}%   (n=${b.n})`)
     }
     console.log(
       `Sizing A/B (ann. Sharpe): equal-weight quintile ${f(cs.equalWeightSharpe, 2)}  vs  conviction-weighted ${f(cs.convictionWeightedSharpe, 2)}` +
@@ -326,25 +954,21 @@ async function main() {
   }
 
   // ALWAYS the unpruned samples: the diagnostics index raw features in
-  // full 45-column space; pruned arrays would silently misread.
+  // full column space; pruned arrays would silently misread.
   const survivorship = analyzeSurvivorship(built.samples, result.steps)
   if (survivorship) {
     console.log('')
     console.log('--- Survivorship diagnostics ---')
     const core = survivorship.cohorts.core
     const priv = survivorship.cohorts.survivorPrivileged
-    console.log(
-      `cohorts at formation (HXZ 2020 size screen + FF 2004 age screen):`,
-    )
+    console.log(`cohorts at formation (HXZ 2020 size screen + FF 2004 age screen):`)
     console.log(
       `  established-then    windows=${core.windows}  IC ${f(core.meanIC)}  L/S ${f(core.meanLongShortPct, 2)}%  (n=${core.samples})`,
     )
     console.log(
       `  survivor-privileged windows=${priv.windows}  IC ${f(priv.meanIC)}  L/S ${f(priv.meanLongShortPct, 2)}%  (n=${priv.samples}, young-or-small-then)`,
     )
-    console.log(
-      `  edge concentrated in the privileged cohort = partly survivorship artifact`,
-    )
+    console.log(`  edge concentrated in the privileged cohort = partly survivorship artifact`)
     console.log(`era ICs (Linnainmaa-Roberts 2018 subperiods; deeper-past outperformance = bias fingerprint):`)
     for (const era of survivorship.eras) {
       console.log(
@@ -362,9 +986,7 @@ async function main() {
     if (dd == null && az == null) {
       console.log(`  canary NOT COMPUTED (too few observed distress values out of sample) — no verdict either way.`)
     } else if (survivorship.canary.survivorshipSignature) {
-      console.log(
-        `  WARNING: distress predicts HIGH returns here — the survivorship signature. Treat absolute returns as inflated.`,
-      )
+      console.log(`  WARNING: distress predicts HIGH returns here — the survivorship signature. Treat absolute returns as inflated.`)
     } else {
       console.log(`  sign consistent with CHS 2008 — no overt survivorship signature in the distress dimension.`)
     }
@@ -392,9 +1014,21 @@ async function main() {
       ? `${label.regime === 'high-vol' ? 'HIGH' : label.regime === 'unknown' ? '??? ' : 'low '} p=${f(label.highProb, 2)}`
       : ''
     console.log(
-      `  ${step.testStartDate} → ${step.testEndDate}  IC ${f(step.informationCoefficient)}  hit ${f(step.hitRate * 100, 0)}%  L/S net ${f(step.longShortReturnNet, 2)}%  [${regimeTag}]`,
+      `  ${step.testStartDate} -> ${step.testEndDate}  IC ${f(step.informationCoefficient)}  hit ${f(step.hitRate * 100, 0)}%  L/S net ${f(step.longShortReturnNet, 2)}%  [${regimeTag}]`,
     )
   }
+
+  // What the run went without, printed whether or not the artifact is
+  // saved, so a --allow-missing run can never read as a complete one.
+  if (droppedNames.size > 0 || fundamentalsFailed.length > 0 || regimeHistoryMissing) {
+    console.log('')
+    console.log('--- What went missing (--allow-missing; also recorded in the artifact provenance when persisted) ---')
+    if (droppedNames.size > 0) console.log(`  price history not fetched, names dropped from the universe: ${[...droppedNames].sort().join(', ')}`)
+    if (fundamentalsFailed.length > 0) console.log(`  SEC fundamentals requests failed (rows built without fundamentals): ${fundamentalsFailed.join(', ')}`)
+    if (regimeHistoryMissing) console.log('  SPY history unavailable: every window is labeled "unknown" in the regime table')
+  }
+  console.log('')
+  console.log(`memory: heap ceiling ${heapLimitMb} MB · projected ${heap.projectedMb} MB for ${tickers.length} names · peak RSS ${peakRssMb.toFixed(0)} MB · flag for this size: node ${heap.flag}`)
 
   console.log('')
   console.log(`--- Model promotion assessment: ${promotion.status.toUpperCase()} ---`)
@@ -403,6 +1037,9 @@ async function main() {
     console.log(`  [${tag}] ${reason.title}: ${reason.detail}`)
   }
 
+  /* ------------------------------------------------------------------ */
+  /* Persist                                                             */
+  /* ------------------------------------------------------------------ */
   if (persist) {
     if (!promotion.promotable && !allowAdvisoryPersist) {
       console.error(
@@ -419,31 +1056,73 @@ async function main() {
     )
     const stats = computeFeatureStats(samples)
     const bundle20 = result.horizonBundles.find((bundle) => bundle.horizon === 20)
+    // What this run was, kept beside the dataset provenance. Every field is
+    // optional on the artifact: the serving validator checks named keys only
+    // and ignores this block, so older artifacts and this one both load.
+    const preRegisteredRun: import('./preregistered-run').PreRegisteredRunProvenance = {
+      schemaVersion: 1,
+      flags: {
+        range,
+        windowDays: windowRule.stepTradingDays,
+        burnInYears: windowRule.burnInYears,
+        embargoTradingDays: windowRule.embargoTradingDays,
+        momentumBaseline,
+        correlation,
+        excludeEtfs,
+        freezeHparams,
+        features: featureChoice,
+        limit,
+        tickersFile: tickersFile ?? '',
+        allowMissing,
+      },
+      universe: { requested: baseTickers.length, etfsExcluded, etfSource: etfUniverse.source, trained: tickers.length },
+      windows: {
+        rule: { ...w.rule },
+        built: w.windowsBuilt,
+        scored: w.windowsScored,
+        namesPerWindow: { ...w.namesPerWindow },
+        firstTestDate: w.firstTestDate,
+        lastTestDate: w.lastTestDate,
+        measuredBlockLength: evidence.random.blockLength,
+      },
+      gate: { correlation, momentumBaseline },
+      requiredWindows: { random: pre.requiredWindows(evidence.random), momentum: pre.requiredWindows(evidence.momentum) },
+      holdout: {
+        cutoffDate: pre.HOLDOUT_CUTOFF_DATE,
+        windowsBefore: holdoutSteps.length,
+        windowsAll: result.steps.length,
+        random: holdoutEvidence?.random ?? null,
+        momentum: holdoutEvidence?.momentum ?? null,
+      },
+      checkpoint: checkpointReport,
+      missing: {
+        allowMissing,
+        droppedNames: [...droppedNames].sort(),
+        fundamentalsFetchFailures: fundamentalsFailed,
+        regimeHistoryMissing,
+      },
+      memory: { heapCeilingMb: heapLimitMb, projectedMb: heap.projectedMb, recommendedFlag: heap.flag, peakRssMb: Math.round(peakRssMb) },
+    }
+    const horizonModels = result.horizonBundles.map((bundle) => ({
+      horizon: bundle.horizon,
+      medianModel: bundle.medianModel,
+      meanIC: bundle.meanIC,
+      icCI: bundle.icCI,
+      conformalOffsetPct: bundle.conformalOffsetPct,
+    }))
     const payload = {
       model: result.trainedModel,
       bag20: result.bag20,
       p10Model: bundle20?.p10Model,
       p90Model: bundle20?.p90Model,
-      horizonModels: result.horizonBundles.map((bundle) => ({
-        horizon: bundle.horizon,
-        medianModel: bundle.medianModel,
-        meanIC: bundle.meanIC,
-        icCI: bundle.icCI,
-        conformalOffsetPct: bundle.conformalOffsetPct,
-      })),
+      horizonModels,
       conformalOffset20dPct: bundle20?.conformalOffsetPct,
       servingEnsembleAudit: createServingEnsembleAudit({
         model: result.trainedModel,
         bag20: result.bag20,
         p10Model: bundle20?.p10Model,
         p90Model: bundle20?.p90Model,
-        horizonModels: result.horizonBundles.map((bundle) => ({
-          horizon: bundle.horizon,
-          medianModel: bundle.medianModel,
-          meanIC: bundle.meanIC,
-          icCI: bundle.icCI,
-          conformalOffsetPct: bundle.conformalOffsetPct,
-        })),
+        horizonModels,
         conformalOffset20dPct: bundle20?.conformalOffsetPct,
         featureNames,
         featureMeans: stats.means,
@@ -462,6 +1141,7 @@ async function main() {
       datasetProvenance: {
         ...built.provenance,
         featureNames: [...featureNames],
+        preRegisteredRun,
       },
       datasetQuality: built.quality,
       promotion: {

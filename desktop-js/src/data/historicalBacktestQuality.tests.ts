@@ -2,20 +2,133 @@
 import {
   applyCrossSectionalNormalization,
   assessModelPromotion,
+  BLEND_MOMENTUM_WEIGHT_GRID,
+  buildCalendarWindows,
   buildHistoricalDataset,
   COMPANY_DESCRIPTOR_FEATURE_COUNT,
   computeBaselineEvidence,
   computeFeaturesAtDate,
+  computeMomentum12to1AtDate,
+  costTierMarketCapUsd,
+  DEFAULT_GATE_CORRELATION,
+  DEFAULT_GATE_MOMENTUM_BASELINE,
+  DEFAULT_WINDOW_RULE,
+  FROZEN_HYPERPARAMETERS,
   FundamentalsTimeline,
   HISTORICAL_FEATURE_NAMES,
   imputeMissingWithDateMedians,
+  indexSamples,
   measuredOverlapBlockLength,
+  measureMomentumBlend,
+  normalizeMomentum12to1ByDate,
+  resolveWindowRule,
+  runWalkForwardBacktest,
+  selectBlendWeight,
+  spearmanCorrelation,
+  summarizeCalendarWindows,
+  walkForwardStep,
+  windowRows,
   type BacktestDatasetQuality,
   type DailyBar,
   type HistoricalSample,
 } from './historicalBacktest'
+import {
+  fitBaggedGradientBoosting,
+  fitRidge,
+  pearsonCorrelation,
+  predictBaggedGradientBoosting,
+} from './quantMath'
+import {
+  DOLLAR_VOLUME_SIZE_PROXY,
+  SIZE_TIERED_BORROW_FEE_ANNUAL,
+  SIZE_TIERED_TRADING_COST,
+} from './quantConfig'
 
 type TestResult = { name: string; passed: boolean; detail?: string }
+
+/** Consecutive weekdays from `startIso`: a stand-in for the exchange calendar. */
+function weekdayCalendar(startIso: string, count: number): string[] {
+  const out: string[] = []
+  const cursor = new Date(`${startIso}T00:00:00Z`)
+  while (out.length < count) {
+    const weekday = cursor.getUTCDay()
+    if (weekday !== 0 && weekday !== 6) out.push(cursor.toISOString().slice(0, 10))
+    cursor.setUTCDate(cursor.getUTCDate() + 1)
+  }
+  return out
+}
+
+/**
+ * Rows for the window helper, which reads only ticker, asOf and labelEnd20d.
+ * One row per name on every `cadence`-th calendar day from `firstIndex` up
+ * to (not including) `lastIndexExclusive`; the label closes `labelBars`
+ * calendar days later. Returned sorted by date, as the walk-forward sees them.
+ */
+function windowFixtureRows(
+  tickers: readonly string[],
+  calendar: readonly string[],
+  spec: { firstIndex: number; lastIndexExclusive: number; cadence: number; labelBars: number },
+): HistoricalSample[] {
+  const rows: HistoricalSample[] = []
+  for (let i = spec.firstIndex; i < spec.lastIndexExclusive; i += spec.cadence) {
+    const labelEnd20d = calendar[Math.min(calendar.length - 1, i + spec.labelBars)]
+    for (const ticker of tickers) {
+      rows.push({ ticker, asOf: calendar[i], labelEnd20d } as unknown as HistoricalSample)
+    }
+  }
+  return rows
+}
+
+/** A full row the model can train on: three features, a target that
+ * follows the first one, and every label date the ensemble reads. */
+function trainableRow(
+  ticker: string,
+  calendar: readonly string[],
+  index: number,
+  nextRandom: () => number,
+): HistoricalSample {
+  const gaussian = () =>
+    Math.sqrt(-2 * Math.log(Math.max(1e-12, nextRandom()))) * Math.cos(2 * Math.PI * nextRandom())
+  const features = [gaussian(), gaussian(), gaussian()]
+  const target = 0.4 * features[0] + 0.6 * gaussian()
+  // A stand-in for the 12-1 momentum yardstick, already Z-scored: it shares
+  // part of the target's signal so the blend has something real to weigh.
+  const momentum12to1 = 0.5 * features[0] + 0.5 * gaussian()
+  const labelAt = (bars: number) => calendar[Math.min(calendar.length - 1, index + bars)]
+  return {
+    ticker,
+    asOf: calendar[index],
+    asOfIndex: index,
+    features: [...features],
+    rawFeatures: [...features],
+    momentum12to1Raw: momentum12to1,
+    momentum12to1,
+    forwardReturn5d: target / 2,
+    forwardReturn20d: target,
+    forwardReturn60d: target * 1.5,
+    forwardReturn120d: target * 2,
+    forwardReturn5dRel: target / 2,
+    forwardReturn20dRel: target,
+    forwardReturn60dRel: target * 1.5,
+    forwardReturn120dRel: target * 2,
+    labelEnd5d: labelAt(5),
+    labelEnd20d: labelAt(20),
+    labelEnd60d: labelAt(60),
+    labelEnd120d: labelAt(120),
+    logMarketCap: Math.log(5e10),
+  } as unknown as HistoricalSample
+}
+
+/** Seeded xorshift32 so the end-to-end window test never flakes. */
+function seededRandom(seed: number): () => number {
+  let state = seed >>> 0 || 1
+  return () => {
+    state ^= state << 13
+    state ^= state >>> 17
+    state ^= state << 5
+    return (state >>> 0) / 0x1_0000_0000
+  }
+}
 
 function overlapDates(index: number) {
   const start = new Date(Date.UTC(2020, 0, 1 + index * 7))
@@ -81,16 +194,30 @@ function completeQuality(): BacktestDatasetQuality {
   }
 }
 
+/** Twelve windows where the trees beat every yardstick under both
+ * correlations and both momentum definitions, with the ridge and blend
+ * alternatives filled in, so the record carries every optional field. */
+function strongEvidenceSteps() {
+  return Array.from({ length: 12 }, (_, index) => ({
+    informationCoefficient: 0.12 + index * 0.001,
+    spearmanIc: 0.11 + index * 0.001,
+    baselineRandomIc: 0.01 + index * 0.0002,
+    baselineMomentumIc: 0.04 + index * 0.0003,
+    baselineMomentumSpearmanIc: 0.035 + index * 0.0003,
+    baselineMomentum12to1Ic: 0.05 + index * 0.0003,
+    baselineMomentum12to1SpearmanIc: 0.045 + index * 0.0003,
+    ridgeIc: 0.06 + index * 0.0004,
+    ridgeSpearmanIc: 0.055 + index * 0.0004,
+    ridgeLambda: 30,
+    blendIc: 0.1 + index * 0.0005,
+    blendSpearmanIc: 0.09 + index * 0.0005,
+    blendWeight: 0.25,
+    ...overlapDates(index),
+  }))
+}
+
 function strongEvidence() {
-  return computeBaselineEvidence(
-    Array.from({ length: 12 }, (_, index) => ({
-      informationCoefficient: 0.12 + index * 0.001,
-      baselineRandomIc: 0.01 + index * 0.0002,
-      baselineMomentumIc: 0.04 + index * 0.0003,
-      ...overlapDates(index),
-    })),
-    1000,
-  )
+  return computeBaselineEvidence(strongEvidenceSteps(), 1000)
 }
 
 export async function runHistoricalBacktestQualityTests(): Promise<TestResult[]> {
@@ -129,6 +256,7 @@ export async function runHistoricalBacktestQualityTests(): Promise<TestResult[]>
         informationCoefficient: 0.01,
         baselineRandomIc: 0.03 + index * 0.001,
         baselineMomentumIc: Number.NaN,
+        baselineMomentum12to1Ic: Number.NaN,
         ...overlapDates(index),
       })),
       100,
@@ -791,6 +919,1124 @@ export async function runHistoricalBacktestQualityTests(): Promise<TestResult[]>
       detail: ok
         ? undefined
         : `observedZero=${observedZero} honestlyMissing=${honestlyMissing} imputed=${imputedHonestly}`,
+    })
+  }
+
+  // ---- Calendar-defined walk-forward windows ------------------------------
+  // The windows used to be slices of the row list by count (70 of them by a
+  // hard-coded target in the CLI, a floor of 60 rows in the app). They are
+  // now blocks of trading days, so the window count is a fact about the
+  // calendar and the two entry points agree.
+
+  // Three names on every weekday for 600 days, 20-day windows after a
+  // one-year burn-in. From 2015-01-05 the burn-in ends on 2016-01-05, which
+  // is the 262nd weekday, so 339 dates remain: 16 full windows of 20, and a
+  // 19-date remainder that is dropped so every window covers the same span.
+  const denseCalendar = weekdayCalendar('2015-01-05', 620)
+  const denseRows = windowFixtureRows(['AAA', 'BBB', 'CCC'], denseCalendar, {
+    firstIndex: 0,
+    lastIndexExclusive: 600,
+    cadence: 1,
+    labelBars: 20,
+  })
+  {
+    const windows = buildCalendarWindows(denseRows, { stepTradingDays: 20, burnInYears: 1 })
+    let contiguous = true
+    let allNames = true
+    let adjacent = true
+    windows.forEach((window, i) => {
+      const { test } = windowRows(denseRows, window)
+      const startIdx = denseCalendar.indexOf(window.testStartDate)
+      const expectedDates = denseCalendar.slice(startIdx, startIdx + 20)
+      const seenDates = [...new Set(test.map((row) => row.asOf))].sort()
+      if (JSON.stringify(seenDates) !== JSON.stringify(expectedDates)) contiguous = false
+      if (test.length !== 60 || new Set(test.map((row) => row.ticker)).size !== 3) allNames = false
+      if (window.testRowCount !== 60 || window.testNameCount !== 3) allNames = false
+      if (i > 0 && startIdx !== denseCalendar.indexOf(windows[i - 1].testEndDate) + 1) adjacent = false
+    })
+    const passed =
+      windows.length === 16 &&
+      windows[0].testStartDate === '2016-01-05' &&
+      windows[0].testEndDate === '2016-02-01' &&
+      windows[15].testEndDate === '2017-03-27' &&
+      contiguous &&
+      allNames &&
+      adjacent
+    results.push({
+      name: 'calendar windows: 3 names x 600 dates give 16 date-contiguous 20-day windows holding every name',
+      passed,
+      detail: passed
+        ? undefined
+        : `count=${windows.length} first=${windows[0]?.testStartDate}..${windows[0]?.testEndDate} ` +
+          `last=${windows[windows.length - 1]?.testEndDate} contiguous=${contiguous} allNames=${allNames} adjacent=${adjacent}`,
+    })
+  }
+
+  // Purge: no training row's 20-day label may close on or after the window
+  // opens. With 20-day labels and a 5-day embargo the purge is the binding
+  // cut, so the newest training row sits 21 trading days before the window.
+  {
+    const windows = buildCalendarWindows(denseRows, { stepTradingDays: 20, burnInYears: 1 })
+    let holds = true
+    let newestTrainingRowRight = true
+    let expanding = true
+    let previousTrainSize = 0
+    for (const window of windows) {
+      const { train } = windowRows(denseRows, window)
+      if (train.length === 0 || !train.every((row) => row.labelEnd20d < window.testStartDate)) holds = false
+      const startIdx = denseCalendar.indexOf(window.testStartDate)
+      const newest = train.reduce((latest, row) => (row.asOf > latest ? row.asOf : latest), '')
+      if (newest !== denseCalendar[startIdx - 21]) newestTrainingRowRight = false
+      if (train.length <= previousTrainSize) expanding = false
+      previousTrainSize = train.length
+    }
+    const passed = windows.length === 16 && holds && newestTrainingRowRight && expanding
+    results.push({
+      name: 'calendar windows: no training label reaches a window start, and training expands window by window',
+      passed,
+      detail: passed
+        ? undefined
+        : `holds=${holds} newestRight=${newestTrainingRowRight} expanding=${expanding}`,
+    })
+  }
+
+  // Embargo counted in trading days. Labels here close the next day so the
+  // purge only removes the row one day before the window; the embargo then
+  // decides the rest: with 5, the row exactly 5 trading days before the
+  // window is out and the row 6 days before is in. With 0, the 5-day row is
+  // back in and only the purge remains.
+  {
+    const shortLabelRows = windowFixtureRows(['AAA', 'BBB', 'CCC'], denseCalendar, {
+      firstIndex: 0,
+      lastIndexExclusive: 600,
+      cadence: 1,
+      labelBars: 1,
+    })
+    const embargoed = buildCalendarWindows(shortLabelRows, {
+      stepTradingDays: 20,
+      burnInYears: 1,
+      embargoTradingDays: 5,
+    })
+    const unembargoed = buildCalendarWindows(shortLabelRows, {
+      stepTradingDays: 20,
+      burnInYears: 1,
+      embargoTradingDays: 0,
+    })
+    const window = embargoed[3]
+    const startIdx = denseCalendar.indexOf(window.testStartDate)
+    const trainDates = new Set(windowRows(shortLabelRows, window).train.map((row) => row.asOf))
+    const fiveBefore = denseCalendar[startIdx - 5]
+    const sixBefore = denseCalendar[startIdx - 6]
+    const withoutEmbargo = new Set(windowRows(shortLabelRows, unembargoed[3]).train.map((row) => row.asOf))
+    const passed =
+      window.trainAsOfCutoff === sixBefore &&
+      !trainDates.has(fiveBefore) &&
+      trainDates.has(sixBefore) &&
+      withoutEmbargo.has(fiveBefore) &&
+      withoutEmbargo.has(denseCalendar[startIdx - 2]) &&
+      !withoutEmbargo.has(denseCalendar[startIdx - 1])
+    results.push({
+      name: 'calendar windows: the embargo is counted in trading days (5 before is out, 6 before is in)',
+      passed,
+      detail: passed
+        ? undefined
+        : `cutoff=${window.trainAsOfCutoff} sixBefore=${sixBefore} has5=${trainDates.has(fiveBefore)} ` +
+          `has6=${trainDates.has(sixBefore)} noEmbargoHas5=${withoutEmbargo.has(fiveBefore)}`,
+    })
+  }
+
+  // The 15-year, 224-name fixture, shaped like the real dataset: every name
+  // trimmed to the same 3,780 bars, sampled every 10th bar from bar 252 up
+  // to 120 bars before the end, 20-bar labels. The old CLI rule produced
+  // exactly 70 windows on this shape whatever the data said. With the
+  // trading calendar and the default rule (20 days, 10-year burn-in from the
+  // first sample date of 2011-12-21), the test period opens 2021-12-21 and
+  // closes with the block that holds the last sample date, 2025-01-01: 40
+  // windows, each holding all 224 names on two sample dates (448 rows).
+  // Without the calendar, the sample dates alone are one trading day in ten
+  // and the same rule gives only 4 windows of 200 trading days, which is why
+  // the dataset builder now hands the calendar over.
+  const fifteenYearCalendar = weekdayCalendar('2011-01-03', 3780)
+  const fifteenYearRows = windowFixtureRows(
+    Array.from({ length: 224 }, (_, i) => `N${String(i).padStart(3, '0')}`),
+    fifteenYearCalendar,
+    { firstIndex: 252, lastIndexExclusive: 3780 - 120, cadence: 10, labelBars: 20 },
+  )
+  {
+    const withCalendar = buildCalendarWindows(fifteenYearRows, { tradingDates: fifteenYearCalendar })
+    const withoutCalendar = buildCalendarWindows(fifteenYearRows)
+    const summary = summarizeCalendarWindows(fifteenYearRows, withCalendar, resolveWindowRule())
+    const passed =
+      withCalendar.length !== 70 &&
+      withoutCalendar.length !== 70 &&
+      withCalendar.length === 40 &&
+      withoutCalendar.length === 4 &&
+      withCalendar[0].testStartDate === '2021-12-21' &&
+      summary.windowsBuilt === 40 &&
+      summary.namesPerWindow.min === 224 &&
+      summary.namesPerWindow.max === 224 &&
+      summary.rowsPerWindow.min === 448 &&
+      summary.rowsPerWindow.max === 448 &&
+      summary.firstSampleDate === '2011-12-21' &&
+      summary.lastSampleDate === '2025-01-01' &&
+      summary.firstTestDate === '2021-12-21' &&
+      summary.lastTestDate === '2025-01-13'
+    results.push({
+      name: 'calendar windows: the 15-year, 224-name shape gives 40 windows, not the hard-coded 70',
+      passed,
+      detail: passed
+        ? undefined
+        : `withCalendar=${withCalendar.length} withoutCalendar=${withoutCalendar.length} ${JSON.stringify(summary)}`,
+    })
+  }
+
+  // The CLI resolves the rule from its flags (absent here, so undefined) and
+  // the worker resolves it with no overrides at all. Both must be the one
+  // published default and must cut identical windows on the same data.
+  {
+    const cliRule = resolveWindowRule({ stepTradingDays: undefined, burnInYears: undefined })
+    const workerRule = resolveWindowRule()
+    const cliWindows = buildCalendarWindows(fifteenYearRows, { ...cliRule, tradingDates: fifteenYearCalendar })
+    const workerWindows = buildCalendarWindows(fifteenYearRows, { ...workerRule, tradingDates: fifteenYearCalendar })
+    let rejectsBadFlag = false
+    try {
+      resolveWindowRule({ stepTradingDays: Number('twenty') })
+    } catch {
+      rejectsBadFlag = true
+    }
+    const passed =
+      JSON.stringify(cliRule) === JSON.stringify(workerRule) &&
+      JSON.stringify(cliRule) === JSON.stringify(DEFAULT_WINDOW_RULE) &&
+      DEFAULT_WINDOW_RULE.stepTradingDays === 20 &&
+      DEFAULT_WINDOW_RULE.burnInYears === 10 &&
+      DEFAULT_WINDOW_RULE.embargoTradingDays === 5 &&
+      cliWindows.length === 40 &&
+      JSON.stringify(cliWindows) === JSON.stringify(workerWindows) &&
+      rejectsBadFlag
+    results.push({
+      name: 'calendar windows: the CLI path and the worker path cut identical windows from the one default rule',
+      passed,
+      detail: passed
+        ? undefined
+        : `cli=${JSON.stringify(cliRule)} worker=${JSON.stringify(workerRule)} ` +
+          `cliWindows=${cliWindows.length} workerWindows=${workerWindows.length} rejectsBadFlag=${rejectsBadFlag}`,
+    })
+  }
+
+  // End to end through runWalkForwardBacktest, the function both the CLI
+  // and the worker call: the scored steps must line up one-to-one with the
+  // calendar windows, each holding all 60 rows (3 names x 20 days).
+  {
+    const nextRandom = seededRandom(0x5eed)
+    const rows: HistoricalSample[] = []
+    for (let i = 0; i < 600; i++) {
+      for (const ticker of ['AAA', 'BBB', 'CCC']) rows.push(trainableRow(ticker, denseCalendar, i, nextRandom))
+    }
+    const result = runWalkForwardBacktest(rows, {
+      stepTradingDays: 20,
+      burnInYears: 1,
+      modelOptions: { numTrees: 5, depth: 2, learningRate: 0.1 },
+      baselineMomentumFeatureIndex: 1,
+    })
+    const windows = buildCalendarWindows(rows, { stepTradingDays: 20, burnInYears: 1 })
+    const stepsMatchWindows =
+      result != null &&
+      result.steps.length === windows.length &&
+      result.steps.every(
+        (step, i) =>
+          step.testStartDate === windows[i].testStartDate &&
+          step.testEndDate === windows[i].testEndDate &&
+          step.testSize === 60,
+      )
+    const passed =
+      result != null &&
+      stepsMatchWindows &&
+      result.windowSummary.windowsBuilt === 16 &&
+      result.windowSummary.windowsScored === 16 &&
+      result.windowSummary.rule.embargoTradingDays === 5 &&
+      result.embargoDaysUsed === 5
+    results.push({
+      name: 'calendar windows: runWalkForwardBacktest scores one step per calendar window',
+      passed,
+      detail: passed
+        ? undefined
+        : `result=${result == null ? 'null' : `${result.steps.length} steps`} windows=${windows.length} ` +
+          `summary=${result ? JSON.stringify(result.windowSummary) : 'n/a'}`,
+    })
+  }
+
+  /* =====================================================================
+     Cost model, momentum definitions, and the alternative models
+     (added 2026-09-16)
+     ---------------------------------------------------------------------
+     One end-to-end run on the three-name fixture feeds several checks:
+     the round-trip cost, the paired intervals for every alternative model,
+     the out-of-bag blend weight, and the frozen hyperparameters.
+     ===================================================================== */
+
+  const alternativesRows: HistoricalSample[] = []
+  {
+    const nextRandom = seededRandom(0xa17e)
+    for (let i = 0; i < 600; i++) {
+      for (const ticker of ['AAA', 'BBB', 'CCC']) {
+        alternativesRows.push(trainableRow(ticker, denseCalendar, i, nextRandom))
+      }
+    }
+  }
+  const smallTrees = { numTrees: 5, depth: 2, learningRate: 0.1 }
+  const alternativesResult = runWalkForwardBacktest(alternativesRows, {
+    stepTradingDays: 20,
+    burnInYears: 1,
+    modelOptions: smallTrees,
+    baselineMomentumFeatureIndex: 1,
+  })
+
+  // Cost: every window rebalances the whole book, so each side pays the
+  // one-way cost on entry AND on exit. The fixture's names carry a log
+  // market cap of ln($50B), and exp(ln(5e10)) lands a hair BELOW the $50B
+  // mega line in floating point, so the tier lookup (quantConfig
+  // SIZE_TIERED_TRADING_COST) charges the large tier, 6 bps one way: four
+  // legs cost 24 bps, plus the general-collateral borrow fee of 30 bps a
+  // year pro-rated over 20 of 252 trading days. The entry-only figure the
+  // model charged until now was 12. The expected tier is read from the same
+  // table the model reads, so the check states the numbers rather than
+  // assuming a tier.
+  {
+    const cap = Math.exp(alternativesRows[0].logMarketCap)
+    const costTier =
+      SIZE_TIERED_TRADING_COST.find((tier) => cap >= tier.minMarketCapUsd) ??
+      SIZE_TIERED_TRADING_COST[SIZE_TIERED_TRADING_COST.length - 1]
+    const borrowTier =
+      SIZE_TIERED_BORROW_FEE_ANNUAL.find((tier) => cap >= tier.minMarketCapUsd) ??
+      SIZE_TIERED_BORROW_FEE_ANNUAL[SIZE_TIERED_BORROW_FEE_ANNUAL.length - 1]
+    const oneWay = costTier.oneWayBps
+    const borrow = (borrowTier.annualBps * 20) / 252
+    const steps = alternativesResult?.steps ?? []
+    const passed =
+      steps.length > 0 &&
+      steps.every((step) => {
+        const cost = step.costBreakdownBps
+        return (
+          cost != null &&
+          approx(cost.longEntry, oneWay) &&
+          approx(cost.longExit, oneWay) &&
+          approx(cost.shortEntry, oneWay) &&
+          approx(cost.shortExit, oneWay) &&
+          approx(cost.shortBorrow, borrow) &&
+          // The realized cost minus borrow is exactly twice the entry-only figure.
+          approx(step.realizedCostBps - cost.shortBorrow, 2 * (cost.longEntry + cost.shortEntry)) &&
+          approx(step.realizedCostBps, 4 * oneWay + borrow) &&
+          approx(step.longShortReturnNet, step.longShortReturnGross - step.realizedCostBps / 100)
+        )
+      })
+    results.push({
+      name: 'cost model: each window charges entry and exit on both sides, so cost minus borrow is twice the entry-only figure',
+      passed,
+      detail: passed
+        ? undefined
+        : `expected oneWay=${oneWay} borrow=${borrow} got ${JSON.stringify(steps[0]?.costBreakdownBps ?? 'no steps')}`,
+    })
+  }
+
+  // Momentum 12-1 versus 12-0 on price bars with a known last-month
+  // reversal. Ten names; the first bar of the yardstick's year is 100 for
+  // every name, a month before the sample each name has drifted to
+  // 100 x (1 + d), and by the sample date the move has fully reversed to
+  // 100 x (1 - d), with d running from -0.3 to +0.3 across names. The 12-1
+  // reading is d; the 12-0 reading, which includes the reversal month, is
+  // -d. So for the winner 12-0 sits BELOW 12-1, for the loser it sits ABOVE,
+  // and when the outcome continues the eleven-month trend the 12-1 baseline
+  // scores a positive IC while the 12-0 baseline scores a negative one.
+  {
+    const names = 10
+    const sampleIndex = 300
+    const yearStart = sampleIndex - 253 // bar 47: the close 252 bars before the last window bar
+    const monthBack = sampleIndex - 22 // bar 278: the close 21 bars before it
+    const drifts = Array.from({ length: names }, (_, k) => -0.3 + (0.6 * k) / (names - 1))
+    const barsFor = (drift: number): DailyBar[] => {
+      const bars: DailyBar[] = []
+      for (let i = 0; i < sampleIndex + 30; i++) {
+        let close = 100
+        if (i > yearStart && i <= monthBack) {
+          close = 100 * (1 + (drift * (i - yearStart)) / (monthBack - yearStart))
+        } else if (i > monthBack) {
+          const progress = Math.min(1, (i - monthBack) / (sampleIndex - 1 - monthBack))
+          close = 100 * (1 + drift) + (100 * (1 - drift) - 100 * (1 + drift)) * progress
+        }
+        bars.push({
+          date: new Date(Date.UTC(2015, 0, 1) + i * 86_400_000).toISOString().slice(0, 10),
+          open: close,
+          high: close * 1.01,
+          low: close * 0.99,
+          close,
+          volume: 1_000_000,
+          rawClose: close,
+          priceBasis: 'adjusted-total-return',
+          adjustmentSource: 'yahoo-chart-adjclose',
+        })
+      }
+      return bars
+    }
+    const momentumIndex = HISTORICAL_FEATURE_NAMES.indexOf('momentum_252d')
+    const twelveZero: number[] = []
+    const twelveOne: number[] = []
+    for (const drift of drifts) {
+      const bars = barsFor(drift)
+      const features = computeFeaturesAtDate(bars, sampleIndex, null)
+      twelveZero.push(features?.[momentumIndex] ?? Number.NaN)
+      twelveOne.push(computeMomentum12to1AtDate(bars, sampleIndex) ?? Number.NaN)
+    }
+    const winner = names - 1
+    const loser = 0
+    const continuation = drifts.map((drift) => drift * 100)
+    const icTwelveOne = pearsonCorrelation(twelveOne, continuation)
+    const icTwelveZero = pearsonCorrelation(twelveZero, continuation)
+    const passed =
+      approx(twelveOne[winner], 30, 1e-9) &&
+      approx(twelveZero[winner], -30, 1e-9) &&
+      twelveZero[winner] < twelveOne[winner] &&
+      twelveZero[loser] > twelveOne[loser] &&
+      icTwelveOne > 0.99 &&
+      icTwelveZero < -0.99 &&
+      computeMomentum12to1AtDate(barsFor(0.1), 251) === null
+    results.push({
+      name: 'momentum baselines: after a last-month reversal 12-1 keeps the trend and 12-0 flips against it',
+      passed,
+      detail: passed
+        ? undefined
+        : `winner 12-0=${twelveZero[winner]} 12-1=${twelveOne[winner]} loser 12-0=${twelveZero[loser]} ` +
+          `12-1=${twelveOne[loser]} IC(12-1)=${icTwelveOne} IC(12-0)=${icTwelveZero}`,
+    })
+  }
+
+  // The 12-1 yardstick is Z-scored within its date the way the feature
+  // columns are: a dense date over its own cross-section, a sparse date over
+  // the expanding pool. Hand-computed on the same numbers as the causal
+  // preprocessing check: dense {1..5} maps 5 to +1.414..., and the sparse
+  // {3} on the next date lands exactly on the pool mean, so 0.
+  {
+    const row = (asOf: string, raw: number): HistoricalSample =>
+      ({ asOf, momentum12to1Raw: raw, features: [], rawFeatures: [] }) as unknown as HistoricalSample
+    const rows = [1, 2, 3, 4, 5].map((value) => row('2020-01-01', value))
+    rows.push(row('2020-01-02', 3))
+    rows.push({ asOf: '2020-01-02', features: [], rawFeatures: [] } as unknown as HistoricalSample)
+    normalizeMomentum12to1ByDate(rows)
+    const passed =
+      approx(rows[4].momentum12to1 ?? Number.NaN, 2 / Math.SQRT2, 1e-6) &&
+      approx(rows[5].momentum12to1 ?? Number.NaN, 0, 1e-6) &&
+      rows[6].momentum12to1 === undefined
+    results.push({
+      name: 'momentum baselines: the 12-1 yardstick is Z-scored per date like a feature column, rows without it stay empty',
+      passed,
+      detail: passed ? undefined : `dense5=${rows[4].momentum12to1} sparse=${rows[5].momentum12to1} missing=${rows[6].momentum12to1}`,
+    })
+  }
+
+  // The gate baseline is selectable and both definitions are always
+  // reported. Trees at 0.05 every window; 12-0 momentum at -0.10 (the
+  // reversal month hurt it), 12-1 at +0.02. Under the default the gate slot
+  // says momentum_12_1 with a +0.03 edge and the 12-0 reading sits beside it
+  // at +0.15; asking for 12-0 swaps the two.
+  {
+    const steps = Array.from({ length: 12 }, (_, index) => ({
+      informationCoefficient: 0.05,
+      spearmanIc: 0.04,
+      baselineRandomIc: 0,
+      baselineMomentumIc: -0.1 + index * 0.0001,
+      baselineMomentum12to1Ic: 0.02 + index * 0.0001,
+      ...overlapDates(index),
+    }))
+    const byDefault = computeBaselineEvidence(steps, 200)
+    const twelveZero = computeBaselineEvidence(steps, 200, { momentumBaseline: '12-0' })
+    const passed =
+      DEFAULT_GATE_MOMENTUM_BASELINE === '12-1' &&
+      DEFAULT_GATE_CORRELATION === 'pearson' &&
+      byDefault.gate?.momentumBaseline === '12-1' &&
+      byDefault.gate?.correlation === 'pearson' &&
+      byDefault.momentum.baseline === 'momentum_12_1' &&
+      approx(byDefault.momentum.meanDifference ?? Number.NaN, 0.05 - 0.02 - 0.00055, 1e-9) &&
+      byDefault.momentumByDefinition?.['12-0'].baseline === 'momentum_252d' &&
+      approx(byDefault.momentumByDefinition?.['12-0'].meanDifference ?? Number.NaN, 0.05 + 0.1 - 0.00055, 1e-9) &&
+      byDefault.momentumByDefinition?.['12-1'] === byDefault.momentum &&
+      twelveZero.gate?.momentumBaseline === '12-0' &&
+      twelveZero.momentum.baseline === 'momentum_252d' &&
+      approx(twelveZero.momentum.meanDifference ?? Number.NaN, 0.05 + 0.1 - 0.00055, 1e-9) &&
+      twelveZero.momentumByDefinition?.['12-1'].baseline === 'momentum_12_1' &&
+      // Spearman on the trees is carried where asked, and the random
+      // comparison then reads the rank IC.
+      approx(
+        computeBaselineEvidence(steps, 200, { correlation: 'spearman' }).random.meanDifference ?? Number.NaN,
+        0.04,
+        1e-12,
+      )
+    results.push({
+      name: 'momentum baselines: the gate definition is selectable and both definitions are always reported',
+      passed,
+      detail: passed ? undefined : JSON.stringify({ byDefault: byDefault.momentum, other: byDefault.momentumByDefinition }),
+    })
+  }
+
+  // Alternative models: every window carries a ridge IC, a blend IC and both
+  // momentum ICs, and the paired block-bootstrap intervals exist for
+  // trees-minus-ridge, trees-minus-momentum and blend-minus-momentum under
+  // Pearson and Spearman, each over all 16 windows with a measured block.
+  {
+    const evidence = alternativesResult?.baselineEvidence
+    const comparisons = evidence?.alternatives?.comparisons ?? []
+    const expected = ['trees-minus-ridge', 'trees-minus-momentum', 'blend-minus-momentum']
+    const complete = (['pearson', 'spearman'] as const).every((correlation) =>
+      expected.every((label) => {
+        const found = comparisons.find((c) => c.comparison === label && c.correlation === correlation)
+        return (
+          found != null &&
+          found.ci95 != null &&
+          found.pairedStepCount === 16 &&
+          found.blockLength != null &&
+          found.blockLength >= 1 &&
+          found.blockLength < 16 &&
+          found.bootstrapIterations >= 1000 &&
+          Number.isFinite(found.ci95.lower) &&
+          found.ci95.lower <= found.ci95.mean &&
+          found.ci95.mean <= found.ci95.upper &&
+          (label === 'trees-minus-ridge' ? found.momentumBaseline === null : found.momentumBaseline === '12-1')
+        )
+      }),
+    )
+    const models = evidence?.alternatives?.models ?? []
+    const everyModelScored =
+      models.length === 5 &&
+      models.every(
+        (entry) =>
+          entry.windows === 16 &&
+          Number.isFinite(entry.meanPearsonIc ?? Number.NaN) &&
+          Number.isFinite(entry.meanSpearmanIc ?? Number.NaN),
+      )
+    const steps = alternativesResult?.steps ?? []
+    const everyStepComplete =
+      steps.length === 16 &&
+      steps.every(
+        (step) =>
+          Number.isFinite(step.ridgeIc) &&
+          Number.isFinite(step.ridgeSpearmanIc) &&
+          Number.isFinite(step.blendIc) &&
+          Number.isFinite(step.blendSpearmanIc) &&
+          Number.isFinite(step.baselineMomentum12to1Ic) &&
+          Number.isFinite(step.baselineMomentum12to1SpearmanIc) &&
+          Number.isFinite(step.baselineMomentumSpearmanIc) &&
+          step.ridgeFailure === undefined &&
+          step.blendWeightBasis === 'out-of-bag' &&
+          step.blendWeight != null &&
+          BLEND_MOMENTUM_WEIGHT_GRID.includes(step.blendWeight) &&
+          (step.blendWeightRows ?? 0) > 0,
+      )
+    const passed =
+      comparisons.length === 6 &&
+      complete &&
+      everyModelScored &&
+      everyStepComplete &&
+      evidence?.alternatives?.ridge.failedWindows === 0 &&
+      evidence?.alternatives?.blend.windowsWithWeight === 16 &&
+      Number.isFinite(alternativesResult?.meanRidgeIc) &&
+      Number.isFinite(alternativesResult?.meanBlendIc) &&
+      Number.isFinite(alternativesResult?.meanBaselineMomentum12to1Ic)
+    results.push({
+      name: 'alternative models: ridge, momentum and blend are scored every window with paired intervals for each comparison',
+      passed,
+      detail: passed
+        ? undefined
+        : `comparisons=${comparisons.length} complete=${complete} models=${everyModelScored} steps=${everyStepComplete} ` +
+          JSON.stringify(evidence?.alternatives?.ridge),
+    })
+  }
+
+  // The blend weight is measured on training rows only. Wreck the test
+  // window: scramble its features, flip its outcomes, and hand it a momentum
+  // reading that predicts those outcomes perfectly. A weight that peeked
+  // would jump to "all momentum"; the measured weight must not move at all,
+  // while the test-row ICs must, proving the perturbation reached the window.
+  {
+    const sorted = indexSamples(alternativesRows)
+    const windows = buildCalendarWindows(alternativesRows, { stepTradingDays: 20, burnInYears: 1 })
+    const window = windows[5]
+    const options = { modelOptions: smallTrees, baselineMomentumFeatureIndex: 1 }
+    const before = walkForwardStep(sorted, window, options)
+    const perturbed = sorted.map((sample) =>
+      sample.asOf >= window.testStartDate && sample.asOf <= window.testEndDate
+        ? {
+            ...sample,
+            features: sample.features.map((value, k) => (k === 0 ? -value : value * 3 + 1)),
+            forwardReturn20dRel: -sample.forwardReturn20dRel,
+            forwardReturn20d: -sample.forwardReturn20d,
+            momentum12to1: -sample.forwardReturn20dRel * 10,
+          }
+        : sample,
+    )
+    const after = walkForwardStep(perturbed, window, options)
+    const passed =
+      before != null &&
+      after != null &&
+      before.blendWeightBasis === 'out-of-bag' &&
+      before.blendWeight === after.blendWeight &&
+      before.blendWeightRows === after.blendWeightRows &&
+      before.trainSize === after.trainSize &&
+      before.informationCoefficient !== after.informationCoefficient &&
+      before.baselineMomentum12to1Ic !== after.baselineMomentum12to1Ic &&
+      approx(after.baselineMomentum12to1Ic ?? Number.NaN, 1, 1e-9)
+    results.push({
+      name: 'alternative models: the blend weight comes from training rows only (test rows perturbed, weight unchanged)',
+      passed,
+      detail: passed
+        ? undefined
+        : `before=${before?.blendWeight}/${before?.blendWeightRows}/${before?.blendWeightBasis} after=${after?.blendWeight}/${after?.blendWeightRows} ` +
+          `ic=${before?.informationCoefficient}->${after?.informationCoefficient} mom12-1=${after?.baselineMomentum12to1Ic}`,
+    })
+  }
+
+  // Spearman reads only the ordering. On a monotone but curved relation the
+  // rank correlation is exactly 1 while Pearson is not, and cubing one side
+  // (rank-preserving) leaves Spearman untouched while Pearson moves.
+  {
+    const x = Array.from({ length: 40 }, (_, i) => i + 1)
+    const y = x.map((value) => Math.exp(value / 8))
+    const yCubed = y.map((value) => value ** 3)
+    const passed =
+      approx(spearmanCorrelation(x, y), 1, 1e-12) &&
+      pearsonCorrelation(x, y) < 0.99 &&
+      approx(spearmanCorrelation(x, yCubed), spearmanCorrelation(x, y), 1e-12) &&
+      Math.abs(pearsonCorrelation(x, yCubed) - pearsonCorrelation(x, y)) > 0.05
+    results.push({
+      name: 'correlations: Spearman equals Pearson on a rank-preserving transform where Pearson does not',
+      passed,
+      detail: passed
+        ? undefined
+        : `spearman=${spearmanCorrelation(x, y)} pearson=${pearsonCorrelation(x, y)} pearsonCubed=${pearsonCorrelation(x, yCubed)}`,
+    })
+  }
+
+  // Hyperparameters are frozen at the pre-registered values unless the
+  // caller unfreezes them; the nested search stays available behind the flag.
+  {
+    const nextRandom = seededRandom(0xf20)
+    const rows: HistoricalSample[] = []
+    for (let i = 0; i < 420; i++) {
+      for (const ticker of ['AAA', 'BBB']) rows.push(trainableRow(ticker, denseCalendar, i, nextRandom))
+    }
+    const frozen = runWalkForwardBacktest(rows, { stepTradingDays: 20, burnInYears: 1, baselineMomentumFeatureIndex: 1 })
+    const searched = runWalkForwardBacktest(rows, {
+      stepTradingDays: 20,
+      burnInYears: 1,
+      baselineMomentumFeatureIndex: 1,
+      freezeHyperparameters: false,
+    })
+    const passed =
+      FROZEN_HYPERPARAMETERS.numTrees === 50 &&
+      FROZEN_HYPERPARAMETERS.depth === 3 &&
+      FROZEN_HYPERPARAMETERS.learningRate === 0.1 &&
+      frozen != null &&
+      frozen.hyperparameterSelection === 'frozen' &&
+      JSON.stringify(frozen.hyperparameters) === JSON.stringify(FROZEN_HYPERPARAMETERS) &&
+      frozen.gateMomentumBaseline === '12-1' &&
+      frozen.gateCorrelation === 'pearson' &&
+      searched != null &&
+      searched.hyperparameterSelection === 'nested-search' &&
+      alternativesResult?.hyperparameterSelection === 'caller-supplied'
+    results.push({
+      name: 'hyperparameters: frozen at 50 trees / depth 3 / rate 0.1 by default, nested search only behind the flag',
+      passed,
+      detail: passed
+        ? undefined
+        : `frozen=${JSON.stringify(frozen?.hyperparameters)}/${frozen?.hyperparameterSelection} searched=${searched?.hyperparameterSelection}`,
+    })
+  }
+
+  /* =====================================================================
+     Review defects D1 to D6 (2026-09-16)
+     ---------------------------------------------------------------------
+     Each block pins one thing a mutation of the model code slipped past:
+     the cost tier of a name with no filed cap, the ridge being fitted on
+     training rows, the block length the paired interval really uses, a
+     fixture that crosses 70 windows, the blend weight's out-of-bag mask
+     (and its tie rule), and listing age at the fetch boundary.
+     ===================================================================== */
+
+  // D1. A name with no filed market cap is sized by its trailing 20-day
+  // dollar volume and looked up in the same tier table, and every window
+  // reports how many charged names were sized that way. At the documented
+  // 1 percent daily turnover, $200M a day is a $20B cap equivalent: the
+  // LARGE tier ($10B to $50B), not the bottom tier the model charged until
+  // now. Withhold the stand-in and the same rows fall to the bottom tier
+  // again, while the IC does not move, because the tier only reaches the
+  // net return.
+  {
+    const proxyCap = 2e8 / DOLLAR_VOLUME_SIZE_PROXY.dailyTurnoverOfMarketCap
+    const largeTier =
+      SIZE_TIERED_TRADING_COST.find((tier) => proxyCap >= tier.minMarketCapUsd) ??
+      SIZE_TIERED_TRADING_COST[SIZE_TIERED_TRADING_COST.length - 1]
+    const largeBorrow =
+      SIZE_TIERED_BORROW_FEE_ANNUAL.find((tier) => proxyCap >= tier.minMarketCapUsd) ??
+      SIZE_TIERED_BORROW_FEE_ANNUAL[SIZE_TIERED_BORROW_FEE_ANNUAL.length - 1]
+    const bottomTier = SIZE_TIERED_TRADING_COST[SIZE_TIERED_TRADING_COST.length - 1]
+    const unit = {
+      proxied: costTierMarketCapUsd(Number.NaN, 2e8),
+      filed: costTierMarketCapUsd(5e10, 2e8),
+      neither: costTierMarketCapUsd(Number.NaN, undefined),
+      zeroVolume: costTierMarketCapUsd(Number.NaN, 0),
+    }
+    const nextRandom = seededRandom(0xd1)
+    const rows: HistoricalSample[] = []
+    for (let i = 0; i < 420; i++) {
+      for (const ticker of ['AAA', 'BBB', 'CCC']) {
+        rows.push({
+          ...trainableRow(ticker, denseCalendar, i, nextRandom),
+          logMarketCap: Number.NaN,
+          avgDollarVolume20d: 2e8,
+        })
+      }
+    }
+    const sorted = indexSamples(rows)
+    const windows = buildCalendarWindows(rows, { stepTradingDays: 20, burnInYears: 1 })
+    const window = windows[3]
+    const options = { modelOptions: smallTrees, baselineMomentumFeatureIndex: 1 }
+    const proxied = walkForwardStep(sorted, window, options)
+    const withheld = walkForwardStep(
+      sorted.map((sample) => ({ ...sample, avgDollarVolume20d: undefined })),
+      window,
+      options,
+    )
+    // One name filed, two proxied: the per-window counts must add up.
+    const mixed = walkForwardStep(
+      sorted.map((sample) =>
+        sample.ticker === 'AAA' ? { ...sample, logMarketCap: Math.log(5e10) } : sample,
+      ),
+      window,
+      options,
+    )
+    const cost = proxied?.costBreakdownBps
+    const basis = proxied?.costTierBasis
+    const mixedBasis = mixed?.costTierBasis
+    const passed =
+      unit.proxied.basis === 'dollar-volume-proxy' &&
+      approx(unit.proxied.capUsd, 2e10) &&
+      unit.filed.basis === 'filed-cap' &&
+      unit.filed.capUsd === 5e10 &&
+      unit.neither.basis === 'unavailable' &&
+      unit.zeroVolume.basis === 'unavailable' &&
+      largeTier.minMarketCapUsd === 10e9 &&
+      largeTier.oneWayBps === 6 &&
+      proxied != null &&
+      cost != null &&
+      basis != null &&
+      approx(cost.longEntry, largeTier.oneWayBps) &&
+      approx(cost.longExit, largeTier.oneWayBps) &&
+      approx(cost.shortEntry, largeTier.oneWayBps) &&
+      approx(cost.shortExit, largeTier.oneWayBps) &&
+      approx(cost.shortBorrow, (largeBorrow.annualBps * 20) / 252) &&
+      basis.chargedNames > 0 &&
+      basis.dollarVolumeProxy === basis.chargedNames &&
+      basis.filedCap === 0 &&
+      basis.unavailable === 0 &&
+      withheld?.costBreakdownBps != null &&
+      withheld.costTierBasis != null &&
+      approx(withheld.costBreakdownBps.longEntry, bottomTier.oneWayBps) &&
+      approx(withheld.costBreakdownBps.shortExit, bottomTier.oneWayBps) &&
+      withheld.costTierBasis.unavailable === withheld.costTierBasis.chargedNames &&
+      withheld.costTierBasis.dollarVolumeProxy === 0 &&
+      withheld.realizedCostBps > proxied.realizedCostBps &&
+      proxied.informationCoefficient === withheld.informationCoefficient &&
+      proxied.longShortReturnGross === withheld.longShortReturnGross &&
+      mixedBasis != null &&
+      mixedBasis.unavailable === 0 &&
+      mixedBasis.filedCap + mixedBasis.dollarVolumeProxy === mixedBasis.chargedNames &&
+      mixedBasis.chargedNames === basis.chargedNames
+    results.push({
+      name: 'cost model: no filed cap but $200M a day of volume is charged the large tier, and the proxied count is reported per window',
+      passed,
+      detail: passed
+        ? undefined
+        : `unit=${JSON.stringify(unit)} cost=${JSON.stringify(cost)} basis=${JSON.stringify(basis)} ` +
+          `withheld=${JSON.stringify(withheld?.costBreakdownBps)}/${JSON.stringify(withheld?.costTierBasis)} ` +
+          `mixed=${JSON.stringify(mixedBasis)}`,
+    })
+  }
+
+  // D2. The ridge is fitted on the window's TRAINING rows. The fixture's
+  // training rows keep their relation (the target rises with the first
+  // feature); the test rows are given the exact opposite. A ridge fitted
+  // on training rows then predicts the wrong way round on the test rows
+  // and scores a strongly negative IC. A ridge fitted on the test rows
+  // would score close to +1, so that mutation fails here.
+  {
+    const sorted = indexSamples(alternativesRows)
+    const windows = buildCalendarWindows(alternativesRows, { stepTradingDays: 20, burnInYears: 1 })
+    const window = windows[5]
+    const options = { modelOptions: smallTrees, baselineMomentumFeatureIndex: 1 }
+    const flipped = sorted.map((sample) =>
+      sample.asOf >= window.testStartDate && sample.asOf <= window.testEndDate
+        ? {
+            ...sample,
+            forwardReturn20dRel: -sample.features[0],
+            forwardReturn20d: -sample.features[0],
+          }
+        : sample,
+    )
+    const step = walkForwardStep(flipped, window, options)
+    // The two relations, read directly off the rows the window hands out.
+    const { train, test } = windowRows(flipped, window)
+    const trainedOnTrain = fitRidge(
+      train.map((sample) => sample.features),
+      train.map((sample) => sample.forwardReturn20dRel),
+    )
+    const trainedOnTest = fitRidge(
+      test.map((sample) => sample.features),
+      test.map((sample) => sample.forwardReturn20dRel),
+    )
+    const passed =
+      step != null &&
+      step.ridgeFailure == null &&
+      Number.isFinite(step.ridgeIc ?? Number.NaN) &&
+      (step.ridgeIc ?? 0) < -0.5 &&
+      (step.ridgeSpearmanIc ?? 0) < -0.5 &&
+      trainedOnTrain.coefficients[0] > 0 &&
+      trainedOnTest.coefficients[0] < 0
+    results.push({
+      name: 'alternative models: the ridge follows the TRAINING relation on test rows built with the opposite one',
+      passed,
+      detail: passed
+        ? undefined
+        : `ridgeIc=${step?.ridgeIc} spearman=${step?.ridgeSpearmanIc} failure=${step?.ridgeFailure} ` +
+          `trainSlope=${trainedOnTrain.coefficients[0]} testSlope=${trainedOnTest.coefficients[0]}`,
+    })
+  }
+
+  // D3. The paired interval really uses the measured block length. Sixty
+  // windows whose model-minus-random differences swing on a twelve-window
+  // cycle, so neighbours move together. On windows every 7 days with
+  // 20-day labels three consecutive windows share label space (k = 3); the
+  // same differences on windows 30 days apart share nothing (k = 1), and
+  // there the block bootstrap is the plain one-at-a-time bootstrap. The
+  // record must carry k, and the k = 3 interval must be wider, because
+  // resampling in blocks keeps the swing that one-at-a-time draws destroy.
+  {
+    const count = 60
+    const treesIc = Array.from(
+      { length: count },
+      (_, i) => 0.05 + 0.06 * Math.sin((2 * Math.PI * i) / 12),
+    )
+    const stepsOn = (dates: (i: number) => { testStartDate: string; testLabelEndDate: string }) =>
+      treesIc.map((ic, i) => ({
+        informationCoefficient: ic,
+        baselineRandomIc: 0,
+        baselineMomentumIc: Number.NaN,
+        baselineMomentum12to1Ic: Number.NaN,
+        ...dates(i),
+      }))
+    const spacedDates = (i: number) => {
+      const start = new Date(Date.UTC(2020, 0, 1 + i * 30))
+      const labelEnd = new Date(start.getTime() + 20 * 86_400_000)
+      return {
+        testStartDate: start.toISOString().slice(0, 10),
+        testLabelEndDate: labelEnd.toISOString().slice(0, 10),
+      }
+    }
+    const overlapping = computeBaselineEvidence(stepsOn(overlapDates), 1000)
+    const spaced = computeBaselineEvidence(stepsOn(spacedDates), 1000)
+    const width = (ci: { lower: number; upper: number } | null) =>
+      ci ? ci.upper - ci.lower : Number.NaN
+    const overlappingWidth = width(overlapping.random.ci95)
+    const spacedWidth = width(spaced.random.ci95)
+    const passed =
+      measuredOverlapBlockLength(stepsOn(overlapDates)) === 3 &&
+      measuredOverlapBlockLength(stepsOn(spacedDates)) === 1 &&
+      overlapping.random.blockLength === 3 &&
+      spaced.random.blockLength === 1 &&
+      overlapping.random.pairedStepCount === count &&
+      spaced.random.pairedStepCount === count &&
+      approx(overlapping.random.meanDifference ?? Number.NaN, spaced.random.meanDifference ?? 0) &&
+      Number.isFinite(overlappingWidth) &&
+      Number.isFinite(spacedWidth) &&
+      overlappingWidth > 1.2 * spacedWidth
+    results.push({
+      name: 'baseline evidence: the paired interval uses the measured block length (k = 3) and widens against the one-at-a-time bootstrap',
+      passed,
+      detail: passed
+        ? undefined
+        : `block=${overlapping.random.blockLength}/${spaced.random.blockLength} ` +
+          `width=${overlappingWidth} vs ${spacedWidth} mean=${overlapping.random.meanDifference}/${spaced.random.meanDifference}`,
+    })
+  }
+
+  // D4. A fixture that crosses 70 windows. Thirty years of weekdays, three
+  // names sampled every tenth day from bar 252 to 120 bars before the end,
+  // under the default rule (20-day windows, 10-year burn-in, 5-day
+  // embargo). The count is worked by hand from the rule: windows start on
+  // the first trading day ten years after the first sample date and follow
+  // every 20 trading days for as long as a window opens on or before the
+  // last sample date. That is 243 windows here; a cap at 70 fails.
+  {
+    const thirtyYearCalendar = weekdayCalendar('1990-01-01', 30 * 261)
+    const lastBar = thirtyYearCalendar.length
+    const rows = windowFixtureRows(['AAA', 'BBB', 'CCC'], thirtyYearCalendar, {
+      firstIndex: 252,
+      lastIndexExclusive: lastBar - 120,
+      cadence: 10,
+      labelBars: 20,
+    })
+    const rule = resolveWindowRule()
+    const windows = buildCalendarWindows(rows, { tradingDates: thirtyYearCalendar })
+    const firstSample = thirtyYearCalendar[252]
+    const burnInEnd = `${Number(firstSample.slice(0, 4)) + rule.burnInYears}${firstSample.slice(4)}`
+    const startIdx = thirtyYearCalendar.findIndex((date) => date >= burnInEnd)
+    const lastSampleIdx = 252 + 10 * Math.floor((lastBar - 120 - 1 - 252) / 10)
+    const expected = Math.floor((lastSampleIdx - startIdx) / rule.stepTradingDays) + 1
+    // Sample dates inside a window: every tenth bar from 252 that falls in
+    // its 20 days. Two for every window but possibly the last, which can
+    // open after the second-to-last sample date and hold only one.
+    const sampleDatesIn = (start: number) => {
+      let dates = 0
+      for (let i = start; i < start + rule.stepTradingDays; i++) {
+        if (i >= 252 && i <= lastSampleIdx && (i - 252) % 10 === 0) dates++
+      }
+      return dates
+    }
+    const passed =
+      rule.stepTradingDays === 20 &&
+      rule.burnInYears === 10 &&
+      expected === 243 &&
+      expected > 70 &&
+      windows.length === expected &&
+      windows[0].testStartDate === thirtyYearCalendar[startIdx] &&
+      windows.every(
+        (window, i) => window.testStartDate === thirtyYearCalendar[startIdx + i * rule.stepTradingDays],
+      ) &&
+      windows.every(
+        (window, i) =>
+          window.testNameCount === 3 &&
+          window.testRowCount === 3 * sampleDatesIn(startIdx + i * rule.stepTradingDays),
+      ) &&
+      windows.slice(0, -1).every((window) => window.testRowCount === 6) &&
+      windows[windows.length - 1].testStartDate <= thirtyYearCalendar[lastSampleIdx]
+    results.push({
+      name: 'calendar windows: a 30-year, 3-name fixture gives exactly 243 windows under the default rule, well past 70',
+      passed,
+      detail: passed
+        ? undefined
+        : `windows=${windows.length} expected=${expected} startIdx=${startIdx} lastSampleIdx=${lastSampleIdx} ` +
+          `first=${windows[0]?.testStartDate} last=${windows[windows.length - 1]?.testStartDate}`,
+    })
+  }
+
+  // D5. The blend weight is scored out-of-bag. Features here are pure
+  // noise and the target follows an independent momentum reading, so the
+  // trees have nothing real to learn. Scored on the rows they trained on
+  // they still look good, because boosted trees memorise their own rows,
+  // and an in-bag scoring would hand them part of the weight. Scored only
+  // by the members that never saw each row they look like the noise they
+  // are, and the weight goes to momentum. The same bag is rebuilt here
+  // from the window's seed, scored both ways, and the weight the step
+  // reports must be the out-of-bag one.
+  {
+    const nextRandom = seededRandom(0x0b0b)
+    const gaussian = () =>
+      Math.sqrt(-2 * Math.log(Math.max(1e-12, nextRandom()))) * Math.cos(2 * Math.PI * nextRandom())
+    const rows: HistoricalSample[] = []
+    for (let i = 0; i < 420; i++) {
+      for (const ticker of ['AAA', 'BBB', 'CCC']) {
+        const base = trainableRow(ticker, denseCalendar, i, nextRandom)
+        const features = [gaussian(), gaussian(), gaussian()]
+        const momentum = gaussian()
+        const target = 0.6 * momentum + 0.8 * gaussian()
+        rows.push({
+          ...base,
+          features: [...features],
+          rawFeatures: [...features],
+          momentum12to1Raw: momentum,
+          momentum12to1: momentum,
+          forwardReturn20dRel: target,
+          forwardReturn20d: target,
+        })
+      }
+    }
+    const overfitTrees = { numTrees: 30, depth: 3, learningRate: 0.1 }
+    const sorted = indexSamples(rows)
+    const windows = buildCalendarWindows(rows, { stepTradingDays: 20, burnInYears: 1 })
+    const window = windows[4]
+    const { train, test } = windowRows(sorted, window)
+    const trainFeatures = train.map((sample) => sample.features)
+    const trainTargets = train.map((sample) => sample.forwardReturn20dRel)
+    const seed = (Date.parse(window.testStartDate) / 86_400_000) | 0
+    const masks: Array<Uint8Array | null> = []
+    const bag = fitBaggedGradientBoosting(trainFeatures, trainTargets, {
+      ...overfitTrees,
+      bags: 5,
+      sampleFraction: 0.8,
+      seed,
+      onMemberRows: (memberIndex, rowIndices) => {
+        if (rowIndices == null) {
+          masks[memberIndex] = null
+          return
+        }
+        const mask = new Uint8Array(train.length)
+        for (const row of rowIndices) mask[row] = 1
+        masks[memberIndex] = mask
+      },
+    })
+    const shared = {
+      trainSamples: train,
+      trainTargets,
+      bag,
+      testSamples: test,
+      testTreePredictions: test.map((sample) => predictBaggedGradientBoosting(bag, sample.features)),
+      momentumOf: (sample: HistoricalSample) => sample.momentum12to1,
+      correlation: 'pearson' as const,
+      seedSalt: seed,
+    }
+    const outOfBag = measureMomentumBlend({ ...shared, memberRowMasks: masks })
+    // Masks that mark no row as in-bag: every member scores every row, which
+    // is what the 'in-bag members scored' and 'empty member index lists'
+    // mutations amount to.
+    const inBag = measureMomentumBlend({
+      ...shared,
+      memberRowMasks: masks.map((mask) => (mask ? new Uint8Array(mask.length) : null)),
+    })
+    const step = walkForwardStep(sorted, window, {
+      modelOptions: overfitTrees,
+      baselineMomentumFeatureIndex: 1,
+    })
+    const passed =
+      masks.length === 5 &&
+      masks.every((mask) => mask != null) &&
+      outOfBag.basis === 'out-of-bag' &&
+      inBag.basis === 'out-of-bag' &&
+      outOfBag.weight != null &&
+      inBag.weight != null &&
+      outOfBag.weight !== inBag.weight &&
+      outOfBag.weight > inBag.weight &&
+      step != null &&
+      step.blendWeightBasis === 'out-of-bag' &&
+      step.blendWeight === outOfBag.weight &&
+      step.blendWeightRows === outOfBag.rows
+    results.push({
+      name: 'alternative models: the blend weight is the out-of-bag one where in-bag scoring would choose differently',
+      passed,
+      detail: passed
+        ? undefined
+        : `outOfBag=${outOfBag.weight}/${outOfBag.rows} inBag=${inBag.weight}/${inBag.rows} ` +
+          `step=${step?.blendWeight}/${step?.blendWeightRows}/${step?.blendWeightBasis} masks=${masks.length}`,
+    })
+  }
+
+  // D5, tie rule. Two signals with the same ordering but different shapes:
+  // under Spearman every mix of them has identical ranks, so all five grid
+  // weights score exactly the same and the tie must go to MORE momentum
+  // (weight 1). Under Pearson the mixes differ and "all trees" wins
+  // outright, which shows the weight of 1 above came from the tie rule.
+  {
+    const x = Array.from({ length: 40 }, (_, i) => i + 1)
+    const standardize = (values: number[]) => {
+      const mean = values.reduce((sum, value) => sum + value, 0) / values.length
+      const std = Math.sqrt(values.reduce((sum, value) => sum + (value - mean) ** 2, 0) / values.length)
+      return values.map((value) => (value - mean) / std)
+    }
+    const zTree = standardize(x)
+    const zMomentum = standardize(x.map((value) => value * value))
+    const tied = selectBlendWeight(zTree, zMomentum, x, 'spearman')
+    const untied = selectBlendWeight(zTree, zMomentum, x, 'pearson')
+    const spearmanScores = BLEND_MOMENTUM_WEIGHT_GRID.map((weight) =>
+      spearmanCorrelation(
+        zTree.map((value, k) => (1 - weight) * value + weight * zMomentum[k]),
+        x,
+      ),
+    )
+    const passed =
+      tied != null &&
+      tied.weight === 1 &&
+      spearmanScores.every((score) => score === spearmanScores[0]) &&
+      untied != null &&
+      untied.weight === 0 &&
+      approx(untied.score, 1, 1e-12)
+    results.push({
+      name: 'alternative models: a blend-weight tie goes to more momentum (weight 1), and only a tie does',
+      passed,
+      detail: passed
+        ? undefined
+        : `tied=${JSON.stringify(tied)} untied=${JSON.stringify(untied)} spearman=${spearmanScores.join(',')}`,
+    })
+  }
+
+  // D6. Listing age at the fetch boundary. A name whose first bar sits on
+  // the start of the fetch window (or within the week after it, the room a
+  // weekend and a holiday need) had its history cut there, so its age
+  // reads as the missing sentinel; a name whose first bar comes later
+  // reads its true age; and without a boundary the first bar is taken at
+  // face value. Nothing else in the vector changes. The sentinel then
+  // flows through the causal imputation, which fills it from the names
+  // whose age is known and flags the cell in the imputed mask.
+  {
+    const dayMs = 86_400_000
+    const fetchWindowStartMs = Date.UTC(1986, 0, 6)
+    const barsFrom = (firstDayOffset: number, count: number): DailyBar[] =>
+      Array.from({ length: count }, (_, i) => {
+        const close = 100 + 5 * Math.sin(i / 7)
+        return {
+          date: new Date(fetchWindowStartMs + (firstDayOffset + i) * dayMs).toISOString().slice(0, 10),
+          open: close,
+          high: close * 1.01,
+          low: close * 0.99,
+          close,
+          volume: 1_000_000,
+          rawClose: close,
+          priceBasis: 'adjusted-total-return',
+          adjustmentSource: 'yahoo-chart-adjclose',
+        } as DailyBar
+      })
+    const ageIdx = HISTORICAL_FEATURE_NAMES.indexOf('listing_age_years')
+    const sampleAt = 300
+    const featuresOf = (bars: DailyBar[], withBoundary: boolean) =>
+      computeFeaturesAtDate(bars, sampleAt, null, {
+        firstBarDateMs: Date.parse(bars[0].date),
+        ...(withBoundary ? { fetchWindowStartMs } : {}),
+      })
+    const onBoundary = featuresOf(barsFrom(0, 400), true)
+    const justAfter = featuresOf(barsFrom(3, 400), true)
+    const pastTolerance = featuresOf(barsFrom(8, 400), true)
+    const listedLater = featuresOf(barsFrom(730, 400), true)
+    const noBoundary = featuresOf(barsFrom(0, 400), false)
+    const trueAge = sampleAt / 365.25
+    const sampleOf = (features: number[] | null, ticker: string) =>
+      ({
+        ticker,
+        asOf: '2000-01-03',
+        features: [...(features ?? [])],
+        rawFeatures: [...(features ?? [])],
+      }) as unknown as HistoricalSample
+    const samples = [sampleOf(onBoundary, 'CUT'), sampleOf(listedLater, 'NEW')]
+    imputeMissingWithDateMedians(samples)
+    const passed =
+      ageIdx >= 0 &&
+      onBoundary != null &&
+      justAfter != null &&
+      pastTolerance != null &&
+      listedLater != null &&
+      noBoundary != null &&
+      Number.isNaN(onBoundary[ageIdx]) &&
+      Number.isNaN(justAfter[ageIdx]) &&
+      approx(pastTolerance[ageIdx], trueAge) &&
+      approx(listedLater[ageIdx], trueAge) &&
+      approx(noBoundary[ageIdx], trueAge) &&
+      onBoundary.length === noBoundary.length &&
+      onBoundary.every((value, k) => (k === ageIdx ? Number.isNaN(value) : Object.is(value, noBoundary[k]))) &&
+      samples[0].imputedMask?.[ageIdx] === true &&
+      samples[1].imputedMask?.[ageIdx] !== true &&
+      approx(samples[0].rawFeatures[ageIdx], trueAge) &&
+      approx(samples[0].features[ageIdx], trueAge)
+    results.push({
+      name: 'listing age: a first bar on the fetch boundary reads missing (then imputed and flagged), a later listing reads its true age',
+      passed,
+      detail: passed
+        ? undefined
+        : `onBoundary=${onBoundary?.[ageIdx]} justAfter=${justAfter?.[ageIdx]} pastTolerance=${pastTolerance?.[ageIdx]} ` +
+          `listedLater=${listedLater?.[ageIdx]} noBoundary=${noBoundary?.[ageIdx]} expected=${trueAge} ` +
+          `imputed=${samples[0].imputedMask?.[ageIdx]}/${samples[1].imputedMask?.[ageIdx]} filled=${samples[0].rawFeatures[ageIdx]}`,
     })
   }
 

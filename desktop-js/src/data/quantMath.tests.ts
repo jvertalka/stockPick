@@ -25,6 +25,7 @@ import {
   fitGradientBoosting,
   fitHarRv,
   fitMarkovRegime,
+  fitRidge,
   garchVolatilityForecast,
   gjrGarchVolatilityForecast,
   harRvForecast,
@@ -33,8 +34,10 @@ import {
   inverseNormalCdf,
   normalCdf,
   predictGradientBoosting,
+  predictRidge,
   putGreeks,
   quasiUniform,
+  RIDGE_LAMBDA_GRID_MULTIPLIERS,
   riskNeutralProbAbove,
   riskParityWeights,
   sampleExcessKurtosis,
@@ -56,6 +59,21 @@ function testRandom(): number {
   testRandomState ^= testRandomState >>> 17
   testRandomState ^= testRandomState << 5
   return (testRandomState >>> 0) / 0x1_0000_0000
+}
+
+// Deterministic ridge fixture: three quasi-random features on [-1, 1] and a
+// noise-free linear target, y = 1.5 + 2 x0 - 3 x1 + 0.5 x2.
+function ridgeFixture(rows = 200): { features: number[][]; targets: number[] } {
+  const features: number[][] = []
+  const targets: number[] = []
+  for (let i = 0; i < rows; i++) {
+    const x0 = quasiUniform(i * 3 + 1) * 2 - 1
+    const x1 = quasiUniform(i * 3 + 2) * 2 - 1
+    const x2 = quasiUniform(i * 3 + 3) * 2 - 1
+    features.push([x0, x1, x2])
+    targets.push(1.5 + 2 * x0 - 3 * x1 + 0.5 * x2)
+  }
+  return { features, targets }
 }
 
 const tests: Array<() => TestResult> = [
@@ -485,6 +503,165 @@ const tests: Array<() => TestResult> = [
       name: 'GBT recovers linear signal (r > 0.9) with ordered quantile heads',
       passed: correlation > 0.9 && orderedShare > 0.9,
       detail: `r=${correlation.toFixed(3)}, quantile-ordered=${(orderedShare * 100).toFixed(0)}%`,
+    }
+  },
+  () => {
+    // Ridge at lambda = 0 is ordinary least squares, so a noise-free linear
+    // target must return its generating coefficients (Hoerl and Kennard
+    // 1970 reduces to OLS at zero penalty).
+    const { features, targets } = ridgeFixture()
+    const model = fitRidge(features, targets, 0)
+    const maxError = Math.max(
+      Math.abs(model.intercept - 1.5),
+      Math.abs(model.coefficients[0] - 2),
+      Math.abs(model.coefficients[1] + 3),
+      Math.abs(model.coefficients[2] - 0.5),
+    )
+    const prediction = model.predict([0.2, -0.4, 0.6])
+    const serialisedPrediction = predictRidge(model, [0.2, -0.4, 0.6])
+    const expected = 1.5 + 2 * 0.2 - 3 * -0.4 + 0.5 * 0.6
+    return {
+      name: 'Ridge at lambda=0 recovers known coefficients (OLS limit)',
+      passed: maxError < 1e-9 && approx(prediction, expected, 1e-9) && serialisedPrediction === prediction,
+      detail: `max coefficient error=${maxError.toExponential(2)}, predict=${prediction.toFixed(6)} vs ${expected.toFixed(6)}`,
+    }
+  },
+
+  () => {
+    // The ridge coefficient norm falls monotonically as lambda rises and is
+    // driven almost to zero by a very large penalty (Hoerl and Kennard 1970).
+    const { features, targets } = ridgeFixture()
+    const lambdas = [0, 1, 10, 100, 1e4, 1e7]
+    const norms = lambdas.map((lambda) => Math.hypot(...fitRidge(features, targets, lambda).coefficients))
+    const strictlyDecreasing = norms.every((norm, i) => i === 0 || norm < norms[i - 1])
+    return {
+      name: 'Ridge coefficients shrink toward zero as lambda grows',
+      passed: strictlyDecreasing && norms[norms.length - 1] < 1e-3 * norms[0],
+      detail: `norms=${norms.map((norm) => norm.toFixed(5)).join(' > ')}`,
+    }
+  },
+
+  () => {
+    // Centring keeps the intercept out of the penalty (ESL section 3.4.1):
+    // adding a constant to every target moves the intercept by exactly that
+    // constant and leaves the slopes untouched, and under a crushing penalty
+    // the intercept is simply the target mean.
+    const { features, targets } = ridgeFixture()
+    const shift = 7
+    const base = fitRidge(features, targets, 10)
+    const shifted = fitRidge(features, targets.map((t) => t + shift), 10)
+    const slopeDrift = Math.max(...base.coefficients.map((c, j) => Math.abs(c - shifted.coefficients[j])))
+    const interceptMove = shifted.intercept - base.intercept
+    const crushed = fitRidge(features, targets, 1e12)
+    const targetMean = targets.reduce((s, v) => s + v, 0) / targets.length
+    const crushedSlopeNorm = Math.hypot(...crushed.coefficients)
+    return {
+      name: 'Ridge intercept is unpenalised (target shift moves only the intercept)',
+      passed:
+        slopeDrift < 1e-9 &&
+        approx(interceptMove, shift, 1e-9) &&
+        approx(crushed.intercept, targetMean, 1e-6) &&
+        crushedSlopeNorm < 1e-6,
+      detail: `slope drift=${slopeDrift.toExponential(2)}, intercept moved ${interceptMove.toFixed(9)}, crushed intercept minus mean=${(crushed.intercept - targetMean).toExponential(2)}`,
+    }
+  },
+
+  () => {
+    // A duplicated column and an all-zero column make the Gram matrix
+    // singular (rank 3 of 5). With lambda > 0 the penalised system is still
+    // positive definite, so the fit must be finite, the two identical
+    // columns must share the weight equally (the ridge minimiser is unique
+    // and symmetric in them), and a column with no variation must get zero
+    // weight. At lambda = 0 the pivoted fallback must still return a finite
+    // fit that reproduces the noise-free target.
+    const { features, targets } = ridgeFixture()
+    const singular = features.map(([x0, x1, x2]) => [x0, x1, x2, x0, 0])
+    const model = fitRidge(singular, targets, 1)
+    const finite = Number.isFinite(model.intercept) && model.coefficients.every(Number.isFinite)
+    const duplicatesShare = approx(model.coefficients[0], model.coefficients[3], 1e-9)
+    const flatColumnZero = approx(model.coefficients[4], 0, 1e-12)
+    const inSampleError = Math.max(...singular.map((row, i) => Math.abs(model.predict(row) - targets[i])))
+    const unpenalised = fitRidge(singular, targets, 0)
+    const fallbackFinite = Number.isFinite(unpenalised.intercept) && unpenalised.coefficients.every(Number.isFinite)
+    const fallbackError = Math.max(...singular.map((row, i) => Math.abs(unpenalised.predict(row) - targets[i])))
+    return {
+      name: 'Ridge handles a singular Gram matrix: finite at lambda>0, pivoted fallback at lambda=0',
+      passed: finite && duplicatesShare && flatColumnZero && inSampleError < 0.25 && fallbackFinite && fallbackError < 1e-8,
+      detail: `lambda=1 coefficients=[${model.coefficients.map((c) => c.toFixed(4)).join(', ')}], max in-sample error=${inSampleError.toFixed(4)}; lambda=0 coefficients=[${unpenalised.coefficients.map((c) => c.toFixed(4)).join(', ')}], max error=${fallbackError.toExponential(2)}`,
+    }
+  },
+
+  () => {
+    // The hat-matrix leave-one-out shortcut (Allen 1974; ESL equation 7.64)
+    // must agree with brute-force refits that drop one row at a time,
+    // including the intercept's 1/n share of the leverage. The chosen
+    // lambda must be a grid point with the lowest held-out error, and the
+    // returned model must equal a direct fit at that lambda.
+    const n = 40
+    const features: number[][] = []
+    const targets: number[] = []
+    for (let i = 0; i < n; i++) {
+      const x0 = quasiUniform(i * 3 + 1) * 2 - 1
+      const x1 = quasiUniform(i * 3 + 2) * 2 - 1
+      const x2 = quasiUniform(i * 3 + 3) * 2 - 1
+      const noise = (quasiUniform(i, 1) - 0.5) * 2
+      features.push([x0, x1, x2])
+      targets.push(0.5 * x0 - 0.3 * x1 + noise)
+    }
+    const model = fitRidge(features, targets)
+    const selection = model.lambdaSelection
+    const name = 'Ridge leave-one-out matches brute-force refits and picks the grid minimum'
+    if (selection.method !== 'leave-one-out') {
+      return { name, passed: false, detail: `lambda selection method was ${selection.method}` }
+    }
+    let maxRelativeGap = 0
+    for (const point of selection.grid) {
+      let press = 0
+      for (let holdOut = 0; holdOut < n; holdOut++) {
+        const trainX = features.filter((_, i) => i !== holdOut)
+        const trainY = targets.filter((_, i) => i !== holdOut)
+        const refit = fitRidge(trainX, trainY, point.lambda)
+        press += (refit.predict(features[holdOut]) - targets[holdOut]) ** 2
+      }
+      const bruteForce = press / n
+      maxRelativeGap = Math.max(maxRelativeGap, Math.abs(bruteForce - point.leaveOneOutMse) / bruteForce)
+    }
+    const chosen = selection.grid.find((point) => point.lambda === model.lambda)
+    const onGrid = chosen !== undefined && RIDGE_LAMBDA_GRID_MULTIPLIERS.some((m) => m * 3 === model.lambda)
+    const isMinimum = chosen !== undefined && selection.grid.every((point) => point.leaveOneOutMse >= chosen.leaveOneOutMse)
+    const direct = fitRidge(features, targets, model.lambda)
+    const sameFit =
+      approx(direct.intercept, model.intercept, 1e-12) &&
+      direct.coefficients.every((c, j) => approx(c, model.coefficients[j], 1e-12))
+    return {
+      name,
+      passed: maxRelativeGap < 1e-8 && onGrid && isMinimum && sameFit,
+      detail: `max relative gap vs brute force=${maxRelativeGap.toExponential(2)}, chosen lambda=${model.lambda}, grid=${selection.grid.map((point) => `${point.lambda}:${point.leaveOneOutMse.toFixed(4)}`).join(' ')}`,
+    }
+  },
+
+  () => {
+    // Two cases where the leave-one-out choice is forced by construction. A
+    // noise-free linear target has bias as its only held-out error, and that
+    // bias grows with lambda, so the smallest grid point must win. A target
+    // the centred features cannot explain at all (noise residualised against
+    // them, so Xc'y = 0) has ridge coefficients of zero at every lambda and a
+    // held-out error of y_i / (1 - S_ii), which falls as lambda shrinks the
+    // leverage S_ii, so the largest grid point must win.
+    const { features, targets } = ridgeFixture()
+    const clean = fitRidge(features, targets)
+    const noise = targets.map((_, i) => (quasiUniform(i, 1) - 0.5) * 4)
+    const noiseFit = fitRidge(features, noise, 0)
+    const unexplainable = noise.map((value, i) => value - noiseFit.predict(features[i]))
+    const hopeless = fitRidge(features, unexplainable)
+    const p = 3
+    const smallestOnGrid = RIDGE_LAMBDA_GRID_MULTIPLIERS[0] * p
+    const largestOnGrid = RIDGE_LAMBDA_GRID_MULTIPLIERS[RIDGE_LAMBDA_GRID_MULTIPLIERS.length - 1] * p
+    const hopelessSlopeNorm = Math.hypot(...hopeless.coefficients)
+    return {
+      name: 'Ridge leave-one-out picks least shrinkage for a clean signal and most for an unexplainable target',
+      passed: clean.lambda === smallestOnGrid && hopeless.lambda === largestOnGrid && hopelessSlopeNorm < 1e-9,
+      detail: `clean lambda=${clean.lambda}, unexplainable lambda=${hopeless.lambda}, its slope norm=${hopelessSlopeNorm.toExponential(2)}`,
     }
   },
 ]
